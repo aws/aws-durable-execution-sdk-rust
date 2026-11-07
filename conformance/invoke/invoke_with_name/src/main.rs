@@ -18,7 +18,7 @@ async fn handler(
     let target = std::env::var("TARGET_FUNCTION_NAME")
         .map_err(|e| -> durable::BoxError { e.to_string().into() })?;
     let result = ctx
-        .invoke::<serde_json::Value, _>(&target, event.payload)
+        .invoke::<serde_json::Value>(&target, event.payload)
         .name(event.name)
         .await?;
     Ok(result)

@@ -54,7 +54,7 @@ async fn handler(
     let target = std::env::var("TARGET_FUNCTION_NAME")
         .map_err(|e| -> durable::BoxError { e.to_string().into() })?;
     let echoed = ctx
-        .invoke::<serde_json::Value, _>(&target, serde_json::json!({"from": "comprehensive"}))
+        .invoke::<serde_json::Value>(&target, serde_json::json!({"from": "comprehensive"}))
         .name("delegate")
         .await?;
 

@@ -10,7 +10,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         ctx.wait(Duration::from_secs(1)).await?;
         let _: String = ctx.step(|_| async { Ok("fixed-data".to_owned()) }).await?;
         let result: String = ctx
-            .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+            .wait_for_callback::<String>(|_step_ctx, _cb_id| async { Ok(()) })
             .name(&name)
             .await?;
         Ok(result)

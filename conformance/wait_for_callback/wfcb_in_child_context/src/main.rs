@@ -9,7 +9,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let result: String = ctx
             .run_in_child_context(|child_ctx| async move {
                 let val: String = child_ctx
-                    .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+                    .wait_for_callback::<String>(|_step_ctx, _cb_id| async { Ok(()) })
                     .name(&name)
                     .await?;
                 Ok(val)

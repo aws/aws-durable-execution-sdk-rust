@@ -15,7 +15,7 @@ use crate::Serdes;
 use crate::context::DurableContext;
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{InvokeError, InvokeErrorKind, OperationError, OperationErrorKind};
-use crate::serdes::{PayloadOrigin, SerdesContext};
+use crate::serdes::{PayloadOrigin, PayloadSerializer, SerdesContext};
 
 /// Wire sub-type for chained invoke operations.
 pub(crate) const CHAINED_INVOKE_SUB_TYPE: &str = "ChainedInvoke";
@@ -41,8 +41,8 @@ pub(crate) struct InvokeExecution<O, I, PS, RS> {
 impl<O, I, PS, RS> InvokeExecution<O, I, PS, RS>
 where
     O: Send + 'static,
-    I: Send + 'static,
-    PS: Serdes<I>,
+    I: serde::Serialize + Send + 'static,
+    PS: PayloadSerializer,
     RS: Serdes<O>,
 {
     /// Executes the invoke operation: replay path or live path.
@@ -295,15 +295,19 @@ fn invoke_info(
 /// A marked error ends the invocation
 /// ([`DurableContext::route_serdes_error`]); any other error becomes
 /// `SerializationFailed`.
-async fn serialize_invoke_input<I, PS: Serdes<I>>(
+async fn serialize_invoke_input<I, PS>(
     ctx: &DurableContext,
     name: Option<&str>,
     payload_serdes: &PS,
     input: I,
     serdes_ctx: &SerdesContext,
-) -> Result<String, OperationError> {
+) -> Result<String, OperationError>
+where
+    I: serde::Serialize + Send + 'static,
+    PS: PayloadSerializer,
+{
     match ctx
-        .hold_activity(payload_serdes.serialize(input, serdes_ctx.clone()))
+        .hold_activity(payload_serdes.serialize_payload(input, serdes_ctx.clone()))
         .await
     {
         Ok(serialized) => Ok(serialized),
@@ -504,7 +508,7 @@ mod tests {
                 ctx.clone(),
                 Arc::clone(ctx.task_ownership()),
                 signal,
-                ctx.invoke::<u32, _>("target", 1_u32).name("call"),
+                ctx.invoke::<u32>("target", 1_u32).name("call"),
             )
             .await;
             assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
@@ -571,7 +575,7 @@ mod tests {
             Some(hooks.plugins()),
         );
         let err = ctx
-            .invoke::<u32, _>("target", 1_u32)
+            .invoke::<u32>("target", 1_u32)
             .name("call")
             .await
             .expect_err("the record did not succeed");
@@ -1018,8 +1022,22 @@ mod tests {
                 Ok(serde_json::from_str(&wire.to_lowercase())?)
             }
         }
+        impl PayloadSerializer for Upper {
+            // reason: exercises the async-fn impl form user code writes
+            #[expect(clippy::unused_async_trait_impl)]
+            async fn serialize_payload<T>(
+                &self,
+                value: T,
+                _context: SerdesContext,
+            ) -> Result<String, crate::BoxError>
+            where
+                T: serde::Serialize + Send + 'static,
+            {
+                Ok(serde_json::to_string(&value)?.to_uppercase())
+            }
+        }
 
-        // Test payload serialization: the serdes receives the typed input.
+        // Test payload serialization: the serializer receives the input.
         let ctx = SerdesContext::new("op-1", "arn:test");
         let dctx = DurableContext::new_root(
             "arn:test".to_owned(),
@@ -1095,7 +1113,7 @@ mod tests {
         // Use the public API: ctx.invoke().spawn() should succeed on a blessed task.
         let signal = Arc::clone(ctx.coordinator());
         let handle = ctx
-            .invoke::<serde_json::Value, _>("fn-arn", "input".to_owned())
+            .invoke::<serde_json::Value>("fn-arn", "input".to_owned())
             .name("spawned-invoke")
             .spawn();
         // Blessed spawn: the op suspends (no ownership error), so the driver
@@ -1214,24 +1232,18 @@ mod tests {
 
         // Custom payload serdes uppercases the input on serialization.
         struct UpperPayload;
-        impl Serdes<String> for UpperPayload {
+        impl PayloadSerializer for UpperPayload {
             // reason: exercises the async-fn impl form user code writes
             #[expect(clippy::unused_async_trait_impl)]
-            async fn serialize(
+            async fn serialize_payload<T>(
                 &self,
-                value: String,
+                value: T,
                 _context: SerdesContext,
-            ) -> Result<String, crate::BoxError> {
+            ) -> Result<String, crate::BoxError>
+            where
+                T: serde::Serialize + Send + 'static,
+            {
                 Ok(serde_json::to_string(&value)?.to_uppercase())
-            }
-            // reason: exercises the async-fn impl form user code writes
-            #[expect(clippy::unused_async_trait_impl)]
-            async fn deserialize(
-                &self,
-                wire: String,
-                _context: SerdesContext,
-            ) -> Result<String, crate::BoxError> {
-                Ok(serde_json::from_str(&wire)?)
             }
         }
 
@@ -1369,11 +1381,6 @@ mod tests {
                 Err(S::Error::custom("boom: cannot serialize"))
             }
         }
-        impl<'de> serde::Deserialize<'de> for FailingSerialize {
-            fn deserialize<D: serde::Deserializer<'de>>(_d: D) -> Result<Self, D::Error> {
-                Ok(Self)
-            }
-        }
 
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let log = Arc::new(CheckpointLog::empty());
@@ -1386,7 +1393,7 @@ mod tests {
         );
 
         let result = ctx
-            .invoke::<serde_json::Value, _>("target-fn", FailingSerialize)
+            .invoke::<serde_json::Value>("target-fn", FailingSerialize)
             .name("charge")
             .await;
 
@@ -1442,6 +1449,21 @@ mod tests {
             _wire: String,
             _context: SerdesContext,
         ) -> Result<T, crate::BoxError> {
+            Err(crate::serdes::RetryableSerdesError::new("injected failure").into())
+        }
+    }
+
+    impl PayloadSerializer for MarkedFailure {
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize_payload<T>(
+            &self,
+            _value: T,
+            _context: SerdesContext,
+        ) -> Result<String, crate::BoxError>
+        where
+            T: serde::Serialize + Send + 'static,
+        {
             Err(crate::serdes::RetryableSerdesError::new("injected failure").into())
         }
     }
@@ -1601,7 +1623,7 @@ mod tests {
         let ctx = trace_ctx(&client, CheckpointLog::empty(), plugins);
         run_until_pending(
             &ctx,
-            ctx.invoke::<u32, _>("target-fn", 1_u32)
+            ctx.invoke::<u32>("target-fn", 1_u32)
                 .name("call")
                 .tenant_id("tenant-1".to_owned())
                 .into_future(),
@@ -1666,7 +1688,7 @@ mod tests {
         );
         run_until_pending(
             &ctx,
-            ctx.invoke::<u32, _>("target-fn", 1_u32)
+            ctx.invoke::<u32>("target-fn", 1_u32)
                 .name("call")
                 .into_future(),
         )
@@ -1691,10 +1713,7 @@ mod tests {
         run_until_pending(
             &ctx,
             ctx.run_in_child_context(|child| async move {
-                Ok(child
-                    .invoke::<u32, _>("target-fn", 1_u32)
-                    .name("call")
-                    .await?)
+                Ok(child.invoke::<u32>("target-fn", 1_u32).name("call").await?)
             })
             .name("outer")
             .into_future(),
@@ -1723,24 +1742,18 @@ mod tests {
     async fn invoke_serialize_failure_skips_trace_hook() {
         /// A payload serdes whose serialization fails.
         struct FailingSerdes;
-        impl Serdes<u32> for FailingSerdes {
+        impl PayloadSerializer for FailingSerdes {
             // reason: exercises the async-fn impl form user code writes
             #[expect(clippy::unused_async_trait_impl)]
-            async fn serialize(
+            async fn serialize_payload<T>(
                 &self,
-                _value: u32,
+                _value: T,
                 _context: SerdesContext,
-            ) -> Result<String, crate::BoxError> {
+            ) -> Result<String, crate::BoxError>
+            where
+                T: serde::Serialize + Send + 'static,
+            {
                 Err("boom: cannot serialize".into())
-            }
-            // reason: exercises the async-fn impl form user code writes
-            #[expect(clippy::unused_async_trait_impl)]
-            async fn deserialize(
-                &self,
-                _wire: String,
-                _context: SerdesContext,
-            ) -> Result<u32, crate::BoxError> {
-                Ok(0)
             }
         }
 
@@ -1752,7 +1765,7 @@ mod tests {
             Some(trace_plugins(std::slice::from_ref(&hook))),
         );
         let err = ctx
-            .invoke::<u32, _>("target-fn", 1_u32)
+            .invoke::<u32>("target-fn", 1_u32)
             .name("charge")
             .payload_serdes(FailingSerdes)
             .await
@@ -1803,7 +1816,7 @@ mod coordinator_tests {
         let ctx = scripted_ctx(&client);
         let body_client = Arc::clone(&client);
         let outcome = drive_handler(ctx, None, |ctx| async move {
-            let inv = ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn();
+            let inv = ctx.invoke::<u32>("target", 1_u32).name("inv").spawn();
             ctx.step(move |_| async move {
                 for _ in 0..1000 {
                     if body_client.received("inv", &OperationAction::Start) {
@@ -1871,7 +1884,7 @@ mod refresh_tests {
             Some(hooks.plugins()),
         );
         let outcome = drive_handler(ctx, None, |ctx| async move {
-            let invoke = ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn();
+            let invoke = ctx.invoke::<u32>("target", 1_u32).name("inv").spawn();
             let step = ctx
                 .step(|_| async {
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1955,7 +1968,7 @@ mod refresh_tests {
             let seen = Arc::new(std::sync::Mutex::new(None));
             let handler_seen = Arc::clone(&seen);
             let outcome = drive_handler(ctx, None, move |ctx| async move {
-                let invoke = ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn();
+                let invoke = ctx.invoke::<u32>("target", 1_u32).name("inv").spawn();
                 let step = ctx
                     .step(|_| async {
                         tokio::time::sleep(Duration::from_secs(3)).await;

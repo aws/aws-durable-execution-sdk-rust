@@ -18,7 +18,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     durable::init_default_subscriber()?;
     durable::run(|name: String, ctx: durable::DurableContext| async move {
         let result: String = ctx
-            .wait_for_callback::<String, _, _>(|_step_ctx, cb_id| async move {
+            .wait_for_callback::<String>(|_step_ctx, cb_id| async move {
                 // Deliver the token to the external system. Logged here.
                 tracing::info!(callback_id = %cb_id, "submitted callback token");
                 Ok(())

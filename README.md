@@ -644,12 +644,12 @@ other work runs continues in the same invocation.
 
 ### invoke
 
-`invoke` calls another durable function and resolves with its result. The
-output type parameter comes first so you can turbofish it.
+`invoke` calls another durable function and resolves with its result.
+Name the output type with `::<O>`.
 
 ```rust ignore
 let receipt = ctx
-    .invoke::<serde_json::Value, _>(&target_function_name, event)
+    .invoke::<serde_json::Value>(&target_function_name, event)
     .name("delegate")
     .await?;
 ```
@@ -719,8 +719,8 @@ The submitter receives the ID as an owned `String`, so move it straight into
 the async block.
 
 ```rust ignore
-let approval: String = ctx
-    .wait_for_callback::<String, _, _>(|_step_ctx, callback_id| async move {
+let approval = ctx
+    .wait_for_callback::<String>(|_step_ctx, callback_id| async move {
         publish_approval_request(callback_id).await?;
         Ok(())
     })
@@ -1360,6 +1360,12 @@ builder's wait-strategy state: changing the serdes neither satisfies nor
 removes the requirement to set a wait strategy. `WaitBuilder` and the
 combinator builders carry no serdes
 method because their payloads are structural, not user-typed.
+
+`.payload_serdes(...)` on `InvokeBuilder` serializes the invoke's input
+and takes a `PayloadSerializer`, which `JsonSerdes` and `Arc<S>`
+implement. A `Box<serde_json::value::RawValue>` input sends JSON text
+unchanged.
+
 `MapBuilder`, `ParallelBuilder` and `ParallelMixedBuilder` also carry a
 result serdes, set with `.result_serdes(...)`, which defaults to
 `PassthroughSerdes`, not `JsonSerdes`.

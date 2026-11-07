@@ -361,7 +361,7 @@ async fn example_2_span_reaches_wait_for_callback_body_and_submitter() {
         LocalRunner::new().callback_for("w", CallbackReply::success(&"ok").expect("encodes"));
     let result = run(TraceIdFactory, runner, |(), ctx| async move {
         Ok(ctx
-            .wait_for_callback::<String, _, _>(|_step_ctx, _callback_id| async move {
+            .wait_for_callback::<String>(|_step_ctx, _callback_id| async move {
                 tracing::info!("submitter body");
                 Ok(())
             })

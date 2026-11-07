@@ -14,7 +14,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::BoxError;
 use crate::builders::{
     ChildBuilder, CreateCallbackBuilder, InvokeBuilder, JoinAllBuilder, MapBuilder,
-    ParallelBuilder, ParallelMixedBuilder, RaceBuilder, SelectOkBuilder, StepBuilder,
+    ParallelBuilder, ParallelMixedBuilder, RaceBuilder, SelectOkBuilder, StepBuilder, Submitter,
     TryJoinAllBuilder, WaitBuilder, WaitForCallbackBuilder, WaitForConditionBuilder,
     WithRetryBuilder,
 };
@@ -3228,8 +3228,10 @@ impl DurableContext {
 
     /// Creates a durable invoke operation to call another durable function.
     ///
-    /// The output type parameter `O` comes first so callers can turbofish:
-    /// `ctx.invoke::<Receipt, _>(...)`.
+    /// The output type `O` is the only type parameter: name it with
+    /// `ctx.invoke::<Receipt>(...)`, or let a typed binding or the
+    /// function's return type set it. The input needs only
+    /// `Serialize + Send + 'static`.
     ///
     /// # Examples
     ///
@@ -3237,7 +3239,7 @@ impl DurableContext {
     /// use aws_durable_execution_sdk as durable;
     /// use serde::{Deserialize, Serialize};
     ///
-    /// #[derive(Serialize, Deserialize)]
+    /// #[derive(Serialize)]
     /// struct ChargeInput { amount: u64 }
     ///
     /// #[derive(Serialize, Deserialize)]
@@ -3247,15 +3249,43 @@ impl DurableContext {
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<String, durable::BoxError> {
-    ///     let receipt = ctx.invoke::<Receipt, _>("payment-fn", ChargeInput { amount: 100 })
+    ///     let receipt = ctx.invoke::<Receipt>("payment-fn", ChargeInput { amount: 100 })
     ///         .name("charge")
     ///         .await?;
     ///     Ok(receipt.id)
     /// }
     /// ```
-    pub fn invoke<O, I>(&self, function_id: impl Into<String>, input: I) -> InvokeBuilder<O, I>
+    ///
+    /// The returned builder's input type is opaque and borrows nothing, so a
+    /// builder stored in a binding works after the context it came from is
+    /// moved or dropped. The opaque type still names the `&self` lifetime,
+    /// so a function that takes the context by value cannot return the
+    /// un-awaited builder:
+    ///
+    /// ```compile_fail,E0597
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::builders::InvokeBuilder;
+    ///
+    /// fn charge(ctx: durable::DurableContext) -> InvokeBuilder<u32, impl serde::Serialize + Send + 'static> {
+    ///     ctx.invoke::<u32>("payment-fn", 100_u32)
+    /// }
+    /// ```
+    ///
+    /// Such a function returns `.future()` instead:
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// fn charge(ctx: durable::DurableContext) -> durable::DurableFuture<u32> {
+    ///     ctx.invoke::<u32>("payment-fn", 100_u32).future()
+    /// }
+    /// ```
+    pub fn invoke<O>(
+        &self,
+        function_id: impl Into<String>,
+        input: impl Serialize + Send + 'static,
+    ) -> InvokeBuilder<O, impl Serialize + Send + 'static>
     where
-        I: Send + 'static,
         O: Send + 'static,
     {
         let op_id = self.claim_operation_id("invoke");
@@ -3520,6 +3550,11 @@ impl DurableContext {
     /// its type's `Clone` implementation: a cloned `Vec` or `String` has its
     /// own contents, and a cloned `Arc` shares its allocation.
     ///
+    /// The output type `O` is the only type parameter: name it with
+    /// `ctx.wait_for_callback::<Approval>(..)`, or let a typed binding or the
+    /// function's return type set it. Every closure this method accepts
+    /// implements [`Submitter`](crate::builders::Submitter).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -3533,7 +3568,7 @@ impl DurableContext {
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<bool, durable::BoxError> {
-    ///     let approval = ctx.wait_for_callback::<Approval, _, _>(
+    ///     let approval = ctx.wait_for_callback::<Approval>(
     ///         |_step_ctx, callback_id| async move {
     ///             // e.g., send callback_id to an approval queue
     ///             Ok(())
@@ -3543,10 +3578,37 @@ impl DurableContext {
     ///     Ok(approval.ok)
     /// }
     /// ```
-    pub fn wait_for_callback<O, F, Fut>(&self, submitter: F) -> WaitForCallbackBuilder<O, F, Fut>
+    ///
+    /// The returned builder's submitter type is opaque and borrows nothing,
+    /// so a builder stored in a binding works after the context it came from
+    /// is moved or dropped. The opaque type still names the `&self`
+    /// lifetime, so a function that takes the context by value cannot return
+    /// the un-awaited builder:
+    ///
+    /// ```compile_fail,E0597
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::builders::{Submitter, WaitForCallbackBuilder};
+    ///
+    /// fn approval(ctx: durable::DurableContext) -> WaitForCallbackBuilder<String, impl Submitter> {
+    ///     ctx.wait_for_callback::<String>(|_step_ctx, _callback_id| async { Ok(()) })
+    /// }
+    /// ```
+    ///
+    /// Such a function returns `.future()` instead:
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// fn approval(ctx: durable::DurableContext) -> durable::DurableFuture<String> {
+    ///     ctx.wait_for_callback::<String>(|_step_ctx, _callback_id| async { Ok(()) })
+    ///         .future()
+    /// }
+    /// ```
+    pub fn wait_for_callback<O>(
+        &self,
+        submitter: impl Submitter,
+    ) -> WaitForCallbackBuilder<O, impl Submitter>
     where
-        F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
-        Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
         O: Send + 'static,
     {
         let op_id = self.claim_operation_id("wait_for_callback");

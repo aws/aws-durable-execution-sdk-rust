@@ -45,7 +45,7 @@ async fn plain_target_result_survives_replay() {
         })
         .run(
             |n: i32, ctx: DurableContext| async move {
-                let doubled = ctx.invoke::<i32, _>("double", n).name("double").await?;
+                let doubled = ctx.invoke::<i32>("double", n).name("double").await?;
                 ctx.wait(Duration::from_secs(1)).name("pause").await?;
                 let plus = ctx
                     .step(move |_| async move { Ok(doubled + 1) })
@@ -81,7 +81,7 @@ async fn plain_target_typed_error_reaches_caller() {
         .run(
             |(): (), ctx: DurableContext| async move {
                 let err = ctx
-                    .invoke::<(), _>("pay", ())
+                    .invoke::<()>("pay", ())
                     .await
                     .expect_err("the invoke fails");
                 let wire = err.wire();
@@ -126,7 +126,7 @@ async fn durable_target_runs_as_its_own_execution() {
         })
         .run(
             |n: u32, ctx: DurableContext| async move {
-                let out = ctx.invoke::<u32, _>("workflow", n).await?;
+                let out = ctx.invoke::<u32>("workflow", n).await?;
                 Ok::<_, BoxError>(out)
             },
             1_u32,
@@ -154,7 +154,7 @@ async fn suspended_durable_target_names_the_pending_invoke() {
         })
         .run(
             |(): (), ctx: DurableContext| async move {
-                let approved = ctx.invoke::<bool, _>("approval", ()).await?;
+                let approved = ctx.invoke::<bool>("approval", ()).await?;
                 Ok::<_, BoxError>(approved)
             },
             (),
@@ -181,7 +181,7 @@ async fn unregistered_target_fails_the_run() {
     let result = LocalRunner::new()
         .run(
             |(): (), ctx: DurableContext| async move {
-                ctx.invoke::<(), _>("child-fn", ()).await?;
+                ctx.invoke::<()>("child-fn", ()).await?;
                 Ok::<_, BoxError>(())
             },
             (),

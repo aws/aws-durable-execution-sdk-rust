@@ -33,7 +33,7 @@ use durable::test_util::{LocalRunner, TestResult};
 use durable::{
     BoxError, CheckpointOutput, DurableContext, DurableFuture, ExecutionClient,
     ExecutionClientError, ExecutionClientErrorScope, GetStateOutput, InvocationPayload, Options,
-    RetryDecision, Serdes, lambda_runtime,
+    PayloadSerializer, RetryDecision, lambda_runtime,
 };
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -685,7 +685,7 @@ async fn unclaimed_input_start_failure_is_unrecoverable() {
     assert!(failures.is_empty(), "failed cases: {failures:#?}");
 }
 
-/// A payload serdes that logs `serialize <name>` when it is entered, then
+/// A payload serializer that logs `serialize <name>` when it is entered, then
 /// waits for its gate before it serializes.
 struct GatedSerdes {
     name: &'static str,
@@ -693,19 +693,18 @@ struct GatedSerdes {
     gate: Gate,
 }
 
-impl Serdes<String> for GatedSerdes {
-    async fn serialize(&self, value: String, _context: SerdesContext) -> Result<String, BoxError> {
+impl PayloadSerializer for GatedSerdes {
+    async fn serialize_payload<T>(
+        &self,
+        value: T,
+        _context: SerdesContext,
+    ) -> Result<String, BoxError>
+    where
+        T: serde::Serialize + Send + 'static,
+    {
         self.log.push(format!("serialize {}", self.name));
         self.gate.pass().await;
         Ok(serde_json::to_string(&value)?)
-    }
-
-    fn deserialize(
-        &self,
-        wire: String,
-        _context: SerdesContext,
-    ) -> impl Future<Output = Result<String, BoxError>> + Send {
-        std::future::ready(serde_json::from_str(&wire).map_err(BoxError::from))
     }
 }
 
@@ -734,7 +733,7 @@ async fn invoke_inputs_first_poll_before_combinator_start_hook() {
             let (log, gate_a, gate_b) = (handler_log.clone(), handler_a.clone(), handler_b.clone());
             async move {
                 let a = ctx
-                    .invoke::<String, String>("target-a", "in".to_owned())
+                    .invoke::<String>("target-a", "in".to_owned())
                     .name("a")
                     .payload_serdes(GatedSerdes {
                         name: "a",
@@ -743,7 +742,7 @@ async fn invoke_inputs_first_poll_before_combinator_start_hook() {
                     })
                     .future();
                 let b = ctx
-                    .invoke::<String, String>("target-b", "in".to_owned())
+                    .invoke::<String>("target-b", "in".to_owned())
                     .name("b")
                     .payload_serdes(GatedSerdes {
                         name: "b",

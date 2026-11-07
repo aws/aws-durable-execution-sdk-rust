@@ -2080,7 +2080,7 @@ async fn invoke_hooks() {
         .register_function("double", |x: u32| async move { Ok(x * 2) })
         .run(
             |_e: (), ctx: DurableContext| async move {
-                let value = ctx.invoke::<u32, _>("double", 21_u32).name("call").await?;
+                let value = ctx.invoke::<u32>("double", 21_u32).name("call").await?;
                 ctx.wait(Duration::from_secs(1)).await?;
                 Ok::<_, BoxError>(value)
             },
@@ -2121,7 +2121,7 @@ async fn invoke_failure_hooks() {
         })
         .run(
             |_e: (), ctx: DurableContext| async move {
-                ctx.invoke::<(), _>("fails", ()).name("call").await?;
+                ctx.invoke::<()>("fails", ()).name("call").await?;
                 Ok::<_, BoxError>(())
             },
             (),
@@ -2464,7 +2464,7 @@ async fn run_wait_for_callback(
     runner
         .run(
             move |_e: (), ctx: DurableContext| async move {
-                let mut wfcb = ctx.wait_for_callback::<String, _, _>(|_step, _id| async { Ok(()) });
+                let mut wfcb = ctx.wait_for_callback::<String>(|_step, _id| async { Ok(()) });
                 if let Some(name) = name {
                     wfcb = wfcb.name(name);
                 }
@@ -2595,7 +2595,7 @@ async fn callback_custom_sub_type_reaches_plugin() {
                     .await?;
                 let first = cb.result().await?;
                 let second = ctx
-                    .wait_for_callback::<String, _, _>(|_step, _id| async { Ok(()) })
+                    .wait_for_callback::<String>(|_step, _id| async { Ok(()) })
                     .name("approve")
                     .await?;
                 Ok::<_, BoxError>(format!("{first}/{second}"))
@@ -4722,7 +4722,7 @@ async fn terminal_replay_fires_no_user_function_hook() {
                     .name("w")
                     .await?;
                 let approval: String = ctx
-                    .wait_for_callback::<String, _, _>(|_step, _id| async { Ok(()) })
+                    .wait_for_callback::<String>(|_step, _id| async { Ok(()) })
                     .name("cb")
                     .await?;
                 ctx.wait(Duration::from_secs(1)).name("pause").await?;
@@ -6083,7 +6083,7 @@ async fn preserved_wait_for_callback_has_flag() {
         .run(
             |_event: (), ctx: DurableContext| async move {
                 let value: String = ctx
-                    .wait_for_callback::<String, _, _>(|_step, _id| async { Ok(()) })
+                    .wait_for_callback::<String>(|_step, _id| async { Ok(()) })
                     .name("approve")
                     .await?;
                 ctx.wait(Duration::from_secs(1)).name("w").await?;

@@ -365,6 +365,124 @@ where
     }
 }
 
+/// Serializes the input of an invoke, the payload its target receives.
+///
+/// [`InvokeBuilder::payload_serdes`](crate::builders::InvokeBuilder::payload_serdes)
+/// takes a `PayloadSerializer`. The SDK only serializes an invoke input, so
+/// the trait has one method and no deserializer. [`DurableContext::invoke`](crate::DurableContext::invoke)
+/// names only the output type, so the builder it returns does not name the
+/// input's type, and a payload serializer receives the input as any
+/// `T: Serialize + Send + 'static`. An encoding specific to one input type
+/// is that type's [`Serialize`] impl. A `Box<serde_json::value::RawValue>`
+/// input sends the JSON text it holds unchanged.
+///
+/// [`JsonSerdes`], the default, writes `serde_json::to_string(&value)`, the
+/// bytes its [`Serdes::serialize`] writes. `Arc<S>` forwards to `S`.
+/// [`PassthroughSerdes`] and [`FileSystemSerdes`] do not implement the
+/// trait: the first handles only strings, and the target does not resolve
+/// the second's storage envelope.
+///
+/// The SDK awaits the returned future on the executor thread, as it does a
+/// [`Serdes`] future, so the implementation must not block it. An error is
+/// permanent unless it is marked with [`RetryableSerdesError`]; see
+/// [Failures](self#failures).
+///
+/// # Examples
+///
+/// A serializer that uppercases the JSON of its input. `async fn` in the
+/// implementation satisfies the `impl Future` return type:
+///
+/// ```no_run
+/// use aws_durable_execution_sdk as durable;
+/// use durable::serdes::SerdesContext;
+/// use durable::{BoxError, PayloadSerializer};
+///
+/// struct UppercaseJson;
+///
+/// impl PayloadSerializer for UppercaseJson {
+///     async fn serialize_payload<T>(
+///         &self,
+///         value: T,
+///         _context: SerdesContext,
+///     ) -> Result<String, BoxError>
+///     where
+///         T: serde::Serialize + Send + 'static,
+///     {
+///         Ok(serde_json::to_string(&value)?.to_uppercase())
+///     }
+/// }
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<String, BoxError> {
+///     let echoed = ctx
+///         .invoke::<String>("echo-fn", "hello")
+///         .payload_serdes(UppercaseJson)
+///         .await?;
+///     Ok(echoed)
+/// }
+/// ```
+///
+/// A `Box<RawValue>` input reaches the target as the JSON value it holds:
+///
+/// ```no_run
+/// use aws_durable_execution_sdk as durable;
+/// use serde_json::value::RawValue;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<serde_json::Value, durable::BoxError> {
+///     let input: Box<RawValue> = RawValue::from_string(r#"{"amount":100}"#.to_owned())?;
+///     let echoed = ctx.invoke::<serde_json::Value>("echo-fn", input).await?;
+///     Ok(echoed)
+/// }
+/// ```
+pub trait PayloadSerializer: Send + Sync + 'static {
+    /// Serializes an owned invoke input to the payload the target receives.
+    ///
+    /// `context` carries the invoke's wire ID and the execution ARN.
+    fn serialize_payload<T>(
+        &self,
+        value: T,
+        context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send
+    where
+        T: Serialize + Send + 'static;
+}
+
+impl PayloadSerializer for JsonSerdes {
+    fn serialize_payload<T>(
+        &self,
+        value: T,
+        _context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send
+    where
+        T: Serialize + Send + 'static,
+    {
+        std::future::ready(serde_json::to_string(&value).map_err(Into::into))
+    }
+}
+
+/// Forwards to the inner payload serializer, so one instance can be shared
+/// across invokes.
+impl<S> PayloadSerializer for std::sync::Arc<S>
+where
+    S: PayloadSerializer + ?Sized,
+{
+    fn serialize_payload<T>(
+        &self,
+        value: T,
+        context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send
+    where
+        T: Serialize + Send + 'static,
+    {
+        self.as_ref().serialize_payload(value, context)
+    }
+}
+
 /// Passes a payload string through unchanged in both directions.
 ///
 /// Implements [`Serdes<String>`]. It is the default result serdes of
@@ -377,7 +495,7 @@ where
 /// Use it to read a callback payload as the raw string the external
 /// caller sent, which is the JS SDK's default callback decoding:
 /// `.serdes(PassthroughSerdes)` on `create_callback::<String>()` or
-/// `wait_for_callback::<String, _, _>(..)`.
+/// `wait_for_callback::<String>(..)`.
 ///
 /// An operation whose record has no payload passes `"null"` to every
 /// serdes, so `PassthroughSerdes` returns the string `"null"` for a
@@ -386,6 +504,12 @@ where
 /// `undefined` there.
 ///
 /// Both methods run inline in the returned future.
+///
+/// `PassthroughSerdes` is not a [`PayloadSerializer`], so
+/// [`InvokeBuilder::payload_serdes`](crate::builders::InvokeBuilder::payload_serdes)
+/// does not accept it: an invoke input can be any `Serialize` type, and
+/// `PassthroughSerdes` handles only strings. A
+/// `Box<serde_json::value::RawValue>` input sends JSON text unchanged.
 ///
 /// # Examples
 ///
@@ -832,6 +956,14 @@ impl FileSystemSerdesConfigBuilder {
 /// while no Tokio runtime is running. A containment check guards against path
 /// traversal, so a retry must never turn its rejection into a different
 /// outcome.
+///
+/// # Invoke payloads
+///
+/// `FileSystemSerdes` is not a [`PayloadSerializer`], so
+/// [`InvokeBuilder::payload_serdes`](crate::builders::InvokeBuilder::payload_serdes)
+/// does not accept it. The invoke sends the payload serializer's output as
+/// the target's input, and the target parses that input as the event
+/// itself, so it would receive the envelope in place of the value.
 ///
 /// # Examples
 ///
@@ -1745,7 +1877,7 @@ fn path_clean(path: &str) -> String {
 /// now that all of them hand the serdes the operation's typed value directly.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{Serdes, SerdesContext};
+    use super::{PayloadSerializer, Serdes, SerdesContext};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use std::sync::{Arc, Mutex};
@@ -1894,12 +2026,76 @@ pub(crate) mod test_support {
             Ok(serde_json::from_str(&json)?)
         }
     }
+
+    impl PayloadSerializer for RecordingSerdes {
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize_payload<T>(
+            &self,
+            value: T,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError>
+        where
+            T: Serialize + Send + 'static,
+        {
+            let json = serde_json::to_string(&value)?;
+            if let Ok(mut seen) = self.serialize_inputs.lock() {
+                seen.push(serde_json::from_str(&json)?);
+            }
+            Ok(hex_envelope(&json))
+        }
+    }
 }
 
 #[cfg(test)]
 #[expect(clippy::indexing_slicing)] // reason: test code with known-good structures
 mod tests {
     use super::*;
+
+    /// A type that implements `Serialize` and no `Deserialize`.
+    #[derive(Serialize)]
+    struct SerializeOnly {
+        amount: u32,
+    }
+
+    /// `JsonSerdes`'s payload serializer writes the bytes its
+    /// `Serdes::serialize` writes, and encodes a value whose type implements
+    /// only `Serialize`.
+    #[tokio::test]
+    async fn json_payload_serializer_matches_json_serdes() {
+        let context = SerdesContext::new("invoke-1", "arn:test");
+        let value = serde_json::json!({"b": [1, 2], "a": "x"});
+        let payload = JsonSerdes
+            .serialize_payload(value.clone(), context.clone())
+            .await
+            .unwrap();
+        let serdes = Serdes::serialize(&JsonSerdes, value, context.clone())
+            .await
+            .unwrap();
+        assert_eq!(payload, serdes);
+
+        let only = JsonSerdes
+            .serialize_payload(SerializeOnly { amount: 100 }, context)
+            .await
+            .unwrap();
+        assert_eq!(only, r#"{"amount":100}"#);
+    }
+
+    /// `Arc<S>` forwards `serialize_payload` to `S`.
+    #[tokio::test]
+    async fn arc_forwards_payload_serializer() {
+        let context = SerdesContext::new("invoke-1", "arn:test");
+        let shared = std::sync::Arc::new(JsonSerdes);
+        let forwarded = shared
+            .serialize_payload(SerializeOnly { amount: 7 }, context.clone())
+            .await
+            .unwrap();
+        let direct = JsonSerdes
+            .serialize_payload(SerializeOnly { amount: 7 }, context)
+            .await
+            .unwrap();
+        assert_eq!(forwarded, direct);
+    }
 
     #[test]
     fn percent_encode_basic() {

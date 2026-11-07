@@ -696,7 +696,7 @@ async fn spawned_wait_for_callback_start_precedes_next_operation() {
     );
     let result = run_runner(runner, |_, ctx| async move {
         let wcb = ctx
-            .wait_for_callback::<String, _, _>(|_, _id| async { Ok(()) })
+            .wait_for_callback::<String>(|_, _id| async { Ok(()) })
             .name("wcb")
             .spawn();
         s1(&ctx).await?;
@@ -911,7 +911,7 @@ async fn wait_for_callback_start_hook_fires_before_start_response() {
     let log = Log::default();
     let status = invoke_unbatched(&log, |_, ctx| async move {
         let value = ctx
-            .wait_for_callback::<String, _, _>(|_, _id| async { Ok(()) })
+            .wait_for_callback::<String>(|_, _id| async { Ok(()) })
             .name("wcb")
             .await?;
         Ok(value)
@@ -1308,7 +1308,7 @@ impl ChildBacked {
             }
             Self::WaitForCallback => {
                 return Ok(ctx
-                    .wait_for_callback::<String, _, _>(|_, _id| async { Ok(()) })
+                    .wait_for_callback::<String>(|_, _id| async { Ok(()) })
                     .name("wcb")
                     .await?);
             }

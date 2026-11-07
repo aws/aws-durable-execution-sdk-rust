@@ -19,7 +19,7 @@ async fn handler(
     let large = Payload {
         data: "x".repeat(200_000),
     };
-    let result = ctx.invoke::<serde_json::Value, _>(&target, large).await?;
+    let result = ctx.invoke::<serde_json::Value>(&target, large).await?;
     Ok(result)
 }
 

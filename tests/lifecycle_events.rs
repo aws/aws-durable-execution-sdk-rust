@@ -502,9 +502,7 @@ async fn replayed_events_cover_child_condition_and_callback() {
                     .await?;
 
                 let approval: String = ctx
-                    .wait_for_callback::<String, _, _>(
-                        |_step_ctx, _callback_id| async move { Ok(()) },
-                    )
+                    .wait_for_callback::<String>(|_step_ctx, _callback_id| async move { Ok(()) })
                     .name("approve")
                     .await?;
 
@@ -842,9 +840,9 @@ async fn failed_wait_for_callback_replay_decode_emits_no_operation_replayed() {
                     let decode_calls = Arc::clone(&decode_calls);
                     async move {
                         let value: u32 = ctx
-                            .wait_for_callback::<u32, _, _>(|_step_ctx, _callback_id| async move {
-                                Ok(())
-                            })
+                            .wait_for_callback::<u32>(
+                                |_step_ctx, _callback_id| async move { Ok(()) },
+                            )
                             .name("decays-on-replay")
                             .serdes(FailOnReplayDeserializeSerdes(decode_calls))
                             .await?;

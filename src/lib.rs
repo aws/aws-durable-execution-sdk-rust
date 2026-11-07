@@ -170,7 +170,7 @@ pub use self::future::{Branch, BranchHandle, BranchKey, BranchSet, BranchValue, 
 pub use self::operation::{InvocationStatus, OperationKind, OperationStatus};
 pub use self::operation_sub_type::{InvalidOperationSubType, OperationSubType};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
-pub use self::serdes::{JsonSerdes, PassthroughSerdes, Serdes};
+pub use self::serdes::{JsonSerdes, PassthroughSerdes, PayloadSerializer, Serdes};
 pub use self::step::StepSemantics;
 
 // Re-export rule: every foreign type in the public surface is re-exported.

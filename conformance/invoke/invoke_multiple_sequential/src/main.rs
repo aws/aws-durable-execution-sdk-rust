@@ -11,8 +11,8 @@ async fn handler(
         .map_err(|e| -> durable::BoxError { e.to_string().into() })?;
     let target2 = std::env::var("TARGET_FUNCTION_NAME_2")
         .map_err(|e| -> durable::BoxError { e.to_string().into() })?;
-    let first = ctx.invoke::<serde_json::Value, _>(&target1, event).await?;
-    let second = ctx.invoke::<serde_json::Value, _>(&target2, first).await?;
+    let first = ctx.invoke::<serde_json::Value>(&target1, event).await?;
+    let second = ctx.invoke::<serde_json::Value>(&target2, first).await?;
     Ok(second)
 }
 

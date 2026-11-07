@@ -12,7 +12,7 @@ async fn handler(
     let step_result = ctx
         .step(|_| async move { Ok("step result".to_owned()) })
         .await?;
-    let invoke_result = ctx.invoke::<String, _>(&target, step_result).await?;
+    let invoke_result = ctx.invoke::<String>(&target, step_result).await?;
     Ok(invoke_result)
 }
 

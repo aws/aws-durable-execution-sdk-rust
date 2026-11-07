@@ -14,7 +14,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     durable::init_default_subscriber()?;
     durable::run(|name: String, ctx: durable::DurableContext| async move {
         let outcome: Result<String, _> = ctx
-            .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+            .wait_for_callback::<String>(|_step_ctx, _cb_id| async { Ok(()) })
             .name(&name)
             .timeout(Duration::from_secs(3))
             .await;

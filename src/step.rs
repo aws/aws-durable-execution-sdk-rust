@@ -2091,7 +2091,7 @@ mod tests {
         let (ctx, client) = uf_context(&hooks, Vec::new());
         let body_dc = dc.clone();
         let err = ctx
-            .wait_for_callback::<String, _, _>(move |_step_ctx, _callback_id| async move {
+            .wait_for_callback::<String>(move |_step_ctx, _callback_id| async move {
                 Err(body_dc.boxed())
             })
             .name("cb")

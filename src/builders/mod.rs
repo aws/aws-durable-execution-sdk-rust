@@ -31,6 +31,8 @@
 //!   root because retry shaping is shared by three operations
 //!   ([`StepBuilder`], [`WithRetryBuilder`], and
 //!   [`WaitForCallbackBuilder`]).
+//! - [`Submitter`], the trait every `wait_for_callback` submitter closure
+//!   implements, lives at this module's root too.
 //!
 //! Builders are constructed through the [`DurableContext`](crate::DurableContext)
 //! methods (for example [`DurableContext::step`](crate::DurableContext::step)),
@@ -179,7 +181,7 @@ pub mod wait;
 pub mod wait_for_condition;
 pub mod with_retry;
 
-pub use self::callback::{CreateCallbackBuilder, WaitForCallbackBuilder};
+pub use self::callback::{CreateCallbackBuilder, Submitter, WaitForCallbackBuilder};
 pub use self::child::ChildBuilder;
 pub use self::combinator::{JoinAllBuilder, RaceBuilder, SelectOkBuilder, TryJoinAllBuilder};
 pub use self::invoke::InvokeBuilder;
@@ -856,7 +858,7 @@ mod tests {
             3 => (
                 "wait_for_callback",
                 erase(
-                    ctx.wait_for_callback::<String, _, _>(|_, _id| async { Ok(()) })
+                    ctx.wait_for_callback::<String>(|_, _id| async { Ok(()) })
                         .name("a")
                         .spawn(),
                 ),
@@ -1110,7 +1112,7 @@ mod tests {
     async fn spawn_of_invoke_and_condition_queues_no_start_before_returning() {
         let (ctx, _client) = recording_context(Some(Duration::from_hours(1)));
         let invoke = ctx
-            .invoke::<serde_json::Value, _>("target", serde_json::json!({}))
+            .invoke::<serde_json::Value>("target", serde_json::json!({}))
             .name("i")
             .spawn();
         let condition = ctx
@@ -1395,14 +1397,8 @@ mod tests {
         let _wait_s = ctx.wait(Duration::from_secs(1)).name("wait").spawn();
 
         // InvokeBuilder
-        let _invoke_f = ctx
-            .invoke::<i32, i32>("target-fn", 1)
-            .name("invoke")
-            .future();
-        let _invoke_s = ctx
-            .invoke::<i32, i32>("target-fn", 1)
-            .name("invoke")
-            .spawn();
+        let _invoke_f = ctx.invoke::<i32>("target-fn", 1).name("invoke").future();
+        let _invoke_s = ctx.invoke::<i32>("target-fn", 1).name("invoke").spawn();
 
         // ChildBuilder
         let _child_f = ctx
@@ -1445,11 +1441,11 @@ mod tests {
 
         // WaitForCallbackBuilder
         let _wfcb_f = ctx
-            .wait_for_callback::<i32, _, _>(|_sc, _id| async { Ok(()) })
+            .wait_for_callback::<i32>(|_sc, _id| async { Ok(()) })
             .name("wait-for-callback")
             .future();
         let _wfcb_s = ctx
-            .wait_for_callback::<i32, _, _>(|_sc, _id| async { Ok(()) })
+            .wait_for_callback::<i32>(|_sc, _id| async { Ok(()) })
             .name("wait-for-callback")
             .spawn();
 

@@ -17,6 +17,7 @@ use std::time::Duration;
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 
 use crate::BoxError;
+use crate::builders::Submitter;
 use crate::checkpoint_coalescer::ScopeClose;
 use crate::context::{DurableContext, StepContext, SubmittedWrite, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
@@ -428,8 +429,7 @@ fn timed_out_callback_error(
 
 /// Internal state for `wait_for_callback` execution passed from the builder.
 ///
-/// Generic over the submitter closure `F` (and, through `F`'s output, its
-/// future), so the submitter runs **without type erasure**. The one
+/// Generic over the submitter `F` (whose future is `F::Fut`), so the submitter runs **without type erasure**. The one
 /// erasure point is the builder's `.future()` / `into_future`, which boxes
 /// the whole execution future once inside
 /// [`DurableFuture`](crate::DurableFuture).
@@ -445,11 +445,10 @@ pub(crate) struct WaitForCallbackExecution<O, F, S> {
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
 
-impl<O, F, Fut, S> WaitForCallbackExecution<O, F, S>
+impl<O, F, S> WaitForCallbackExecution<O, F, S>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    F: Submitter,
     S: Serdes<O>,
 {
     /// Executes the wait-for-callback operation: replay or live path.
@@ -987,7 +986,7 @@ impl WfcbAfter {
 /// returns the raw callback payload: the inner callback decodes it with
 /// [`PassthroughSerdes`], and the caller applies the user serdes once the
 /// outer context has recorded it.
-async fn run_wfcb_body<F, Fut>(
+async fn run_wfcb_body<F>(
     child_ctx: DurableContext,
     plugin_names: InnerPluginNames,
     timeout: Option<Duration>,
@@ -996,8 +995,7 @@ async fn run_wfcb_body<F, Fut>(
     submitter_retry: Option<crate::RetryStrategy>,
 ) -> Result<String, OperationError>
 where
-    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    F: Submitter,
 {
     // Step 1: create the inner callback (no name, per wire spec). It reads
     // the payload as the raw string the external caller sent.
@@ -3902,7 +3900,7 @@ mod tests {
         for (depth, flag) in [(1, Some(true)), (0, None)] {
             let (ctx, client) = DurableContext::test_context_with_depth(depth);
             let result = ctx
-                .wait_for_callback::<String, _, _>(|_step, _callback_id| async {
+                .wait_for_callback::<String>(|_step, _callback_id| async {
                     Err("cannot submit".into())
                 })
                 .name("approve")
@@ -4058,7 +4056,7 @@ mod coordinator_tests {
         let ctx = scripted_ctx(&client);
         let outcome = drive_handler(ctx, None, |ctx| async move {
             let value = ctx
-                .wait_for_callback::<String, _, _>(|_step, _callback_id| async { Ok(()) })
+                .wait_for_callback::<String>(|_step, _callback_id| async { Ok(()) })
                 .name("w")
                 .heartbeat_timeout(std::time::Duration::from_secs(90))
                 .await
@@ -4126,7 +4124,7 @@ mod coordinator_tests {
         let seen = Seen::default();
         let submitter_seen = Arc::clone(&seen);
         let outcome = drive_handler(ctx, None, move |ctx| async move {
-            ctx.wait_for_callback::<String, _, _>(move |_step, _callback_id| {
+            ctx.wait_for_callback::<String>(move |_step, _callback_id| {
                 let seen = Arc::clone(&submitter_seen);
                 async move {
                     see_active_body(&seen);
@@ -4207,7 +4205,7 @@ mod coordinator_tests {
         let seen = Seen::default();
         let strategy_seen = Arc::clone(&seen);
         let outcome = drive_handler(ctx, None, move |ctx| async move {
-            ctx.wait_for_callback::<String, _, _>(|_step, _callback_id| async {
+            ctx.wait_for_callback::<String>(|_step, _callback_id| async {
                 Err("cannot submit".into())
             })
             .name("approve")
@@ -4255,7 +4253,7 @@ mod coordinator_tests {
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
         );
         let outcome = drive_handler(ctx, None, |ctx| async move {
-            ctx.wait_for_callback::<String, _, _>(|_step, _callback_id| async { Ok(()) })
+            ctx.wait_for_callback::<String>(|_step, _callback_id| async { Ok(()) })
                 .name("approve")
                 .await
                 .map_err(wire_err)
@@ -4775,7 +4773,7 @@ mod coordinator_tests {
         let submitter_runs = Arc::clone(&runs);
         let outcome = drive_handler(ctx, None, move |ctx| async move {
             let wfcb = ctx
-                .wait_for_callback::<String, _, _>(move |_, _callback_id| {
+                .wait_for_callback::<String>(move |_, _callback_id| {
                     let runs = Arc::clone(&submitter_runs);
                     async move {
                         if runs.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -5224,7 +5222,7 @@ mod start_order_tests {
                 .then(|| Arc::clone(&held))
         }));
         let operation = ctx
-            .wait_for_callback::<String, _, _>(|_, _id| async { Ok(()) })
+            .wait_for_callback::<String>(|_, _id| async { Ok(()) })
             .name("wcb")
             .into_future();
         let marker = "inner callback START submitted";

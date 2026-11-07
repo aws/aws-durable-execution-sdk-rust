@@ -239,7 +239,7 @@ async fn callback_failure_event_carries_error() {
         )))
         .run(
             |(): (), ctx: DurableContext| async move {
-                ctx.wait_for_callback::<String, _, _>(|_step, _id| async move { Ok(()) })
+                ctx.wait_for_callback::<String>(|_step, _id| async move { Ok(()) })
                     .name("approval")
                     .await?;
                 Ok::<_, BoxError>(())

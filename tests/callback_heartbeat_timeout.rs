@@ -38,7 +38,7 @@ async fn heartbeat_timeout_reply_gives_heartbeat_timed_out() {
                     .await
                     .expect_err("no heartbeat arrived for the created callback");
                 let waited = ctx
-                    .wait_for_callback::<String, _, _>(|_step, _callback_id| async { Ok(()) })
+                    .wait_for_callback::<String>(|_step, _callback_id| async { Ok(()) })
                     .name("wcb")
                     .heartbeat_timeout(Duration::from_secs(90))
                     .await

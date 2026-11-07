@@ -262,7 +262,7 @@ async fn context_used_inside_submitter_capture_clone_fails() {
             |_event: (), ctx: DurableContext| async move {
                 let capture = CloneCallsWait(ctx.clone());
                 let value: String = ctx
-                    .wait_for_callback::<String, _, _>(move |_step_ctx, _callback_id| async move {
+                    .wait_for_callback::<String>(move |_step_ctx, _callback_id| async move {
                         let _capture = capture;
                         Ok(())
                     })
@@ -318,7 +318,7 @@ async fn context_used_inside_submitter_fails() {
             |_event: (), ctx: DurableContext| async move {
                 let cloned = ctx.clone();
                 let value: String = ctx
-                    .wait_for_callback::<String, _, _>(move |_step_ctx, _callback_id| async move {
+                    .wait_for_callback::<String>(move |_step_ctx, _callback_id| async move {
                         cloned.step(|_| async { Ok(1_u32) }).name("inner").await?;
                         Ok(())
                     })
@@ -545,9 +545,7 @@ async fn composites_inside_child_body_succeed() {
                 let value = ctx
                     .run_in_child_context(|child| async move {
                         let approval: String = child
-                            .wait_for_callback::<String, _, _>(|_step_ctx, _callback_id| async {
-                                Ok(())
-                            })
+                            .wait_for_callback::<String>(|_step_ctx, _callback_id| async { Ok(()) })
                             .name("approval")
                             .await?;
                         let mapped = child

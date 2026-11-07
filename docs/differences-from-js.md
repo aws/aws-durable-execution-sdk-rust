@@ -414,6 +414,14 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Rust language and Decision (2026-08-20, [Rust SDK #37: Redesign Serdes with typed values and implementation-controlled async work](https://github.com/aws/aws-durable-execution-sdk-rust/issues/37)): a typed serdes per operation.
 - **Where:** `src/serdes.rs`, `Serdes`.
 
+### Invoke payload serializer
+
+- **JavaScript:** `payloadSerdes` is a `Serdes<I>` for the input type `I`, and the SDK calls only its `serialize`.
+- **Rust:** `InvokeBuilder::payload_serdes` takes a `PayloadSerializer`, whose one method serializes any input that implements `Serialize`. An encoding for one input type is that type's `Serialize` impl, and a `Box<serde_json::value::RawValue>` input sends JSON text unchanged.
+- **Why:** `invoke::<O>` names only the output type, so the builder it returns does not name the input type, and a serializer cannot be paired with one input type.
+- **Decision:** Rust language and Decision (2026-11-07): callers write only the output type.
+- **Where:** `src/serdes.rs`, `PayloadSerializer`; `src/builders/invoke.rs`, `InvokeBuilder::payload_serdes`.
+
 ### `FileSystemSerdes`
 
 - **JavaScript:** Reuses one file name per operation and reads any file reference.

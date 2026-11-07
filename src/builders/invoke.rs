@@ -7,24 +7,29 @@
 use std::future::IntoFuture;
 use std::marker::PhantomData;
 
+use serde::Serialize;
+
 use crate::Serdes;
 use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
 use crate::serdes::JsonSerdes;
+use crate::serdes::PayloadSerializer;
 
 /// Builder for a durable invoke operation.
 ///
 /// Created by [`DurableContext::invoke`]. Configure with `.name()` and
 /// custom serialization before awaiting.
 ///
-/// The builder carries the typed input `I` and two serdes implementations
-/// as generic parameters, both defaulting to
-/// [`JsonSerdes`]: `PS` serializes the input
-/// payload ([`payload_serdes`](Self::payload_serdes)) and `RS`
+/// The builder carries the input `I` and two serializers as generic
+/// parameters, both defaulting to [`JsonSerdes`]: the
+/// [`PayloadSerializer`] `PS` serializes the input payload
+/// ([`payload_serdes`](Self::payload_serdes)) and the [`Serdes<O>`] `RS`
 /// deserializes the target function's result ([`serdes`](Self::serdes)).
-/// Whatever the serdes types, the finalized future is [`DurableFuture<O>`].
+/// [`DurableContext::invoke`] returns the input type as an opaque
+/// `impl Serialize`, so callers write only the output type. Whatever the
+/// serializer types, the finalized future is [`DurableFuture<O>`].
 ///
 /// # Examples
 ///
@@ -32,7 +37,7 @@ use crate::serdes::JsonSerdes;
 /// use aws_durable_execution_sdk as durable;
 /// use serde::{Deserialize, Serialize};
 ///
-/// #[derive(Serialize, Deserialize)]
+/// #[derive(Serialize)]
 /// struct Input { id: u64 }
 ///
 /// #[derive(Serialize, Deserialize)]
@@ -42,7 +47,7 @@ use crate::serdes::JsonSerdes;
 ///     _event: serde_json::Value,
 ///     ctx: durable::DurableContext,
 /// ) -> Result<String, durable::BoxError> {
-///     let out = ctx.invoke::<Output, _>("target-fn", Input { id: 1 })
+///     let out = ctx.invoke::<Output>("target-fn", Input { id: 1 })
 ///         .name("call-target")
 ///         .await?;
 ///     Ok(out.status)
@@ -134,15 +139,13 @@ where
         }
     }
 
-    /// Sets a custom serializer for this invoke's input payload
-    /// serialization.
+    /// Sets the serializer for this invoke's input payload.
     ///
-    /// The serdes is applied when serializing the input payload before
-    /// sending it to the target function; the owned input transfers to the
-    /// serdes directly (a write-only payload has no round-trip to
-    /// preserve). It must implement [`Serdes<I>`](crate::Serdes) for the
-    /// input's type. This is independent of the result serdes set via
-    /// [`.serdes()`](Self::serdes).
+    /// The serializer runs when the invoke sends its input to the target
+    /// function, and receives the owned input. It must implement
+    /// [`PayloadSerializer`], which [`JsonSerdes`], the default, and
+    /// `Arc<S>` of a payload serializer `S` implement. This is independent
+    /// of the result serdes set via [`.serdes()`](Self::serdes).
     ///
     /// # Examples
     ///
@@ -150,25 +153,108 @@ where
     /// use aws_durable_execution_sdk as durable;
     /// use durable::serdes::SerdesContext;
     ///
-    /// # struct UpperSerdes;
-    /// # impl durable::Serdes<String> for UpperSerdes {
-    /// #     async fn serialize(&self, v: String, _c: SerdesContext) -> Result<String, durable::BoxError> { Ok(v.to_uppercase()) }
-    /// #     async fn deserialize(&self, w: String, _c: SerdesContext) -> Result<String, durable::BoxError> { Ok(w.to_lowercase()) }
-    /// # }
+    /// struct UpperJson;
+    ///
+    /// impl durable::PayloadSerializer for UpperJson {
+    ///     async fn serialize_payload<T>(
+    ///         &self,
+    ///         value: T,
+    ///         _context: SerdesContext,
+    ///     ) -> Result<String, durable::BoxError>
+    ///     where
+    ///         T: serde::Serialize + Send + 'static,
+    ///     {
+    ///         Ok(serde_json::to_string(&value)?.to_uppercase())
+    ///     }
+    /// }
+    ///
     /// async fn handler(
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<String, durable::BoxError> {
-    ///     let result = ctx.invoke::<String, _>("target-fn", "hello".to_owned())
-    ///         .payload_serdes(UpperSerdes)
+    ///     let result = ctx.invoke::<String>("target-fn", "hello".to_owned())
+    ///         .payload_serdes(UpperJson)
     ///         .await?;
     ///     Ok(result)
     /// }
     /// ```
-    pub fn payload_serdes<PS2>(self, serdes: PS2) -> InvokeBuilder<O, I, PS2, RS>
-    where
-        PS2: Serdes<I>,
-    {
+    ///
+    /// [`PassthroughSerdes`](crate::PassthroughSerdes) handles only strings,
+    /// so it is not a payload serializer:
+    ///
+    /// ```compile_fail,E0277
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     Ok(ctx
+    ///         .invoke::<String>("target-fn", "hello".to_owned())
+    ///         .payload_serdes(durable::PassthroughSerdes)
+    ///         .await?)
+    /// }
+    /// ```
+    ///
+    /// The target does not resolve the storage envelope of
+    /// [`FileSystemSerdes`](crate::serdes::FileSystemSerdes), so it is not a
+    /// payload serializer either:
+    ///
+    /// ```compile_fail,E0277
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::serdes::FileSystemSerdes;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     Ok(ctx
+    ///         .invoke::<String>("target-fn", "hello".to_owned())
+    ///         .payload_serdes(FileSystemSerdes::new("payloads"))
+    ///         .await?)
+    /// }
+    /// ```
+    ///
+    /// Nor is a type that implements only [`Serdes<String>`]:
+    ///
+    /// ```compile_fail,E0277
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::serdes::{Serdes, SerdesContext};
+    ///
+    /// struct Upper;
+    ///
+    /// impl Serdes<String> for Upper {
+    ///     async fn serialize(
+    ///         &self,
+    ///         value: String,
+    ///         _context: SerdesContext,
+    ///     ) -> Result<String, durable::BoxError> {
+    ///         Ok(value.to_uppercase())
+    ///     }
+    ///
+    ///     async fn deserialize(
+    ///         &self,
+    ///         wire: String,
+    ///         _context: SerdesContext,
+    ///     ) -> Result<String, durable::BoxError> {
+    ///         Ok(wire)
+    ///     }
+    /// }
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     Ok(ctx
+    ///         .invoke::<String>("target-fn", "hello".to_owned())
+    ///         .payload_serdes(Upper)
+    ///         .await?)
+    /// }
+    /// ```
+    pub fn payload_serdes<PS2: PayloadSerializer>(
+        self,
+        serdes: PS2,
+    ) -> InvokeBuilder<O, I, PS2, RS> {
         InvokeBuilder {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -195,8 +281,8 @@ where
 impl<O, I, PS, RS> InvokeBuilder<O, I, PS, RS>
 where
     O: Send + 'static,
-    I: Send + 'static,
-    PS: Serdes<I>,
+    I: Serialize + Send + 'static,
+    PS: PayloadSerializer,
     RS: Serdes<O>,
 {
     /// Converts this builder into a [`DurableFuture`] without starting it.
@@ -264,7 +350,7 @@ where
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<(), durable::BoxError> {
-    ///     let handle = ctx.invoke::<String, _>("fn", "input".to_owned())
+    ///     let handle = ctx.invoke::<String>("fn", "input".to_owned())
     ///         .name("bg-call")
     ///         .spawn();
     ///     let _result = handle.await?;
@@ -279,8 +365,8 @@ where
 impl<O, I, PS, RS> IntoFuture for InvokeBuilder<O, I, PS, RS>
 where
     O: Send + 'static,
-    I: Send + 'static,
-    PS: Serdes<I>,
+    I: Serialize + Send + 'static,
+    PS: PayloadSerializer,
     RS: Serdes<O>,
 {
     type Output = Result<O, OperationError>;

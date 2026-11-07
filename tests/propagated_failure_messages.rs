@@ -342,7 +342,7 @@ async fn assert_propagated_cases(typed: bool) {
     // `TypedError` when `typed`.
     let result = run(move |ctx| async move {
         Ok::<_, BoxError>(
-            ctx.wait_for_callback::<String, _, _>(move |_step_ctx, _callback_id| async move {
+            ctx.wait_for_callback::<String>(move |_step_ctx, _callback_id| async move {
                 Err::<(), BoxError>(failure(typed))
             })
             .name("cb")
@@ -765,7 +765,7 @@ async fn typed_invoke_target_failure_records_the_wrapped_message() {
         .run(
             |(): (), ctx: DurableContext| async move {
                 let err = ctx
-                    .invoke::<u32, _>("target", ())
+                    .invoke::<u32>("target", ())
                     .name("call")
                     .await
                     .expect_err("the target fails");

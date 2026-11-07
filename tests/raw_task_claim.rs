@@ -378,7 +378,7 @@ async fn handler_invoke_spawned_on_raw_task_is_refused() {
     let runner = LocalRunner::new()
         .register_function("target", |n: u32| async move { Ok::<u32, BoxError>(n) });
     let result = run_on(runner, |(), ctx: DurableContext| async move {
-        let builder = ctx.invoke::<u32, _>("target", 1_u32).name("foreign");
+        let builder = ctx.invoke::<u32>("target", 1_u32).name("foreign");
         let _ = tokio::spawn(async move { builder.spawn().await }).await?;
         after(&ctx).await
     })
@@ -556,7 +556,7 @@ async fn handler_invoke_spawned_on_raw_task_with_replay_mismatch_is_refused() {
     let runner = LocalRunner::new()
         .register_function("target", |n: u32| async move { Ok::<u32, BoxError>(n) });
     let result = run_contradicted_spawn(runner, |ctx: &DurableContext| {
-        let builder = ctx.invoke::<u32, _>("target", 1_u32).name("foreign");
+        let builder = ctx.invoke::<u32>("target", 1_u32).name("foreign");
         Box::new(move || builder.spawn())
     })
     .await;

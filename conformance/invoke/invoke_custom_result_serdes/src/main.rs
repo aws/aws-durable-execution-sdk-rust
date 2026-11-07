@@ -37,7 +37,7 @@ async fn handler(event: String, ctx: durable::DurableContext) -> Result<String, 
     let target = std::env::var("TARGET_FUNCTION_NAME")
         .map_err(|e| -> durable::BoxError { e.to_string().into() })?;
     let result = ctx
-        .invoke::<String, _>(&target, event)
+        .invoke::<String>(&target, event)
         .serdes(UppercaseResultSerdes)
         .await?;
     Ok(result)

@@ -14,7 +14,7 @@ struct ApprovalResult {
 async fn main() -> Result<(), lambda_runtime::Error> {
     durable::run(|name: String, ctx: durable::DurableContext| async move {
         let result: ApprovalResult = ctx
-            .wait_for_callback::<ApprovalResult, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+            .wait_for_callback::<ApprovalResult>(|_step_ctx, _cb_id| async { Ok(()) })
             .name(&name)
             .await?;
         Ok(result.status)

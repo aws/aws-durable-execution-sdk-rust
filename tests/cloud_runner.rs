@@ -26,7 +26,7 @@ async fn cloud_answers_a_callback_while_running() {
     let run = CloudRunner::new(function)
         .invocation_type(InvocationType::Event)
         .poll_interval(Duration::from_secs(2))
-        .run::<_, String>(CALLBACK_NAME);
+        .run::<String>(CALLBACK_NAME);
     let callback = run.operation(CALLBACK_NAME);
     callback
         .wait_for_data(WaitingStatus::Started)

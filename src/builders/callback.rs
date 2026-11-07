@@ -308,6 +308,76 @@ where
     }
 }
 
+/// The submitter of a [`DurableContext::wait_for_callback`]: a closure that
+/// receives the step context and the callback ID and delivers the ID to the
+/// external system.
+///
+/// Every closure that `wait_for_callback` accepts implements `Submitter`:
+/// an `FnOnce(StepContext, String) -> Fut + Clone + Send + 'static` whose
+/// future `Fut` is `Send + 'static` and returns `Result<(), BoxError>`.
+/// The trait exists so that `wait_for_callback` names only its output type.
+/// Callers name `Submitter` only as the bound of a generic helper that
+/// takes a submitter.
+///
+/// # Examples
+///
+/// A helper that takes any submitter:
+///
+/// ```no_run
+/// use aws_durable_execution_sdk as durable;
+/// use durable::builders::Submitter;
+/// use durable::{DurableContext, DurableFuture};
+///
+/// fn approval<F: Submitter>(ctx: &DurableContext, submitter: F) -> DurableFuture<String> {
+///     ctx.wait_for_callback::<String>(submitter).name("approval").future()
+/// }
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: DurableContext,
+/// ) -> Result<String, durable::BoxError> {
+///     let answer = approval(&ctx, |_step_ctx, callback_id| async move {
+///         // send callback_id to the approver
+///         let _ = callback_id;
+///         Ok(())
+///     })
+///     .await?;
+///     Ok(answer)
+/// }
+/// ```
+///
+/// A submitter whose future returns something other than
+/// `Result<(), BoxError>` is not a `Submitter`:
+///
+/// ```compile_fail,E0271
+/// use aws_durable_execution_sdk as durable;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<String, durable::BoxError> {
+///     Ok(ctx
+///         .wait_for_callback::<String>(|_step_ctx, _callback_id| async {
+///             Ok::<u32, durable::BoxError>(1)
+///         })
+///         .await?)
+/// }
+/// ```
+pub trait Submitter:
+    FnOnce(StepContext, String) -> <Self as Submitter>::Fut + Clone + Send + 'static
+{
+    /// The future the submitter returns.
+    type Fut: Future<Output = Result<(), BoxError>> + Send + 'static;
+}
+
+impl<F, Fut> Submitter for F
+where
+    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+{
+    type Fut = Fut;
+}
+
 /// Builder for a combined callback creation + wait operation.
 ///
 /// Created by [`DurableContext::wait_for_callback`]. Registers the callback
@@ -318,9 +388,8 @@ where
 /// the outer result, live or on replay, decodes the payload once with the
 /// serdes, and never asks it to serialize.
 ///
-/// The builder is generic over the submitter closure `F` and its future
-/// `Fut`; both parameters are inferred at the call site and never written
-/// by users.
+/// The builder is generic over the submitter `F`, a [`Submitter`] that is
+/// inferred at the call site and never written by users.
 ///
 /// # Examples
 ///
@@ -335,7 +404,7 @@ where
 ///     _event: serde_json::Value,
 ///     ctx: durable::DurableContext,
 /// ) -> Result<(), durable::BoxError> {
-///     let _outcome: Outcome = ctx.wait_for_callback::<Outcome, _, _>(
+///     let _outcome: Outcome = ctx.wait_for_callback::<Outcome>(
 ///         |_step_ctx, cb_id| async move {
 ///             // send cb_id to external system
 ///             Ok(())
@@ -347,7 +416,7 @@ where
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
 #[non_exhaustive]
-pub struct WaitForCallbackBuilder<O, F, Fut, S = JsonSerdes> {
+pub struct WaitForCallbackBuilder<O, F, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
@@ -356,10 +425,10 @@ pub struct WaitForCallbackBuilder<O, F, Fut, S = JsonSerdes> {
     submitter: F,
     submitter_retry: Option<RetryStrategy>,
     serdes: S,
-    _marker: PhantomData<fn() -> (O, Fut)>,
+    _marker: PhantomData<fn() -> O>,
 }
 
-impl<O, F, Fut, S> std::fmt::Debug for WaitForCallbackBuilder<O, F, Fut, S> {
+impl<O, F, S> std::fmt::Debug for WaitForCallbackBuilder<O, F, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaitForCallbackBuilder")
             .field("name", &self.name)
@@ -367,11 +436,10 @@ impl<O, F, Fut, S> std::fmt::Debug for WaitForCallbackBuilder<O, F, Fut, S> {
     }
 }
 
-impl<O, F, Fut> WaitForCallbackBuilder<O, F, Fut>
+impl<O, F> WaitForCallbackBuilder<O, F>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    F: Submitter,
 {
     /// Creates a new builder (internal). Taking the submitter here keeps
     /// the field non-optional: a builder without a submitter is
@@ -391,11 +459,10 @@ where
     }
 }
 
-impl<O, F, Fut, S> WaitForCallbackBuilder<O, F, Fut, S>
+impl<O, F, S> WaitForCallbackBuilder<O, F, S>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    F: Submitter,
 {
     /// Sets a human-readable name for this operation.
     pub fn name(mut self, name: impl Into<String>) -> Self {
@@ -421,7 +488,7 @@ where
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<String, durable::BoxError> {
-    ///     let result = ctx.wait_for_callback::<String, _, _>(
+    ///     let result = ctx.wait_for_callback::<String>(
     ///         |_step_ctx, _cb_id| async { Ok(()) }
     ///     ).name("with-retry")
     ///      .submitter_retry(|_err, attempt| {
@@ -465,7 +532,7 @@ where
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<String, durable::BoxError> {
-    ///     let result = ctx.wait_for_callback::<String, _, _>(
+    ///     let result = ctx.wait_for_callback::<String>(
     ///         |_step_ctx, _cb_id| async { Ok(()) }
     ///     ).name("with-retry")
     ///      .submitter_retry_config(
@@ -507,7 +574,7 @@ where
     /// attaching a serdes for a different type fails at compile time, and
     /// `O` needs no `serde` traits. The default is [`JsonSerdes`].
     ///
-    /// `.serdes(PassthroughSerdes)` on a `wait_for_callback::<String, _, _>`
+    /// `.serdes(PassthroughSerdes)` on a `wait_for_callback::<String>`
     /// returns the raw payload the external caller sent, as JS does by
     /// default. The Rust default is [`JsonSerdes`], so a typed `O` decodes
     /// without configuration.
@@ -547,7 +614,7 @@ where
     ///     ctx: durable::DurableContext,
     /// ) -> Result<String, durable::BoxError> {
     ///     let token = ctx
-    ///         .wait_for_callback::<Token, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+    ///         .wait_for_callback::<Token>(|_step_ctx, _callback_id| async { Ok(()) })
     ///         .name("token")
     ///         .serdes(TokenSerdes)
     ///         .await?;
@@ -556,7 +623,7 @@ where
     /// ```
     ///
     /// [`PassthroughSerdes`]: crate::PassthroughSerdes
-    pub fn serdes<S2>(self, serdes: S2) -> WaitForCallbackBuilder<O, F, Fut, S2>
+    pub fn serdes<S2>(self, serdes: S2) -> WaitForCallbackBuilder<O, F, S2>
     where
         S2: Serdes<O>,
     {
@@ -574,11 +641,10 @@ where
     }
 }
 
-impl<O, F, Fut, S> WaitForCallbackBuilder<O, F, Fut, S>
+impl<O, F, S> WaitForCallbackBuilder<O, F, S>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    F: Submitter,
     S: Serdes<O>,
 {
     /// Converts this builder into a [`DurableFuture`] without starting it.
@@ -685,11 +751,10 @@ where
     }
 }
 
-impl<O, F, Fut, S> IntoFuture for WaitForCallbackBuilder<O, F, Fut, S>
+impl<O, F, S> IntoFuture for WaitForCallbackBuilder<O, F, S>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    F: Submitter,
     S: Serdes<O>,
 {
     type Output = Result<O, OperationError>;
@@ -738,7 +803,7 @@ mod tests {
         assert_eq!(create.heartbeat_timeout, Some(Duration::from_secs(90)));
 
         let wait = ctx
-            .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+            .wait_for_callback::<String>(|_step_ctx, _cb_id| async { Ok(()) })
             .heartbeat_timeout(Duration::from_secs(30))
             .heartbeat_timeout(Duration::from_secs(90))
             .serdes(crate::PassthroughSerdes);
@@ -751,7 +816,7 @@ mod tests {
         let ctx = DurableContext::test_context();
 
         let builder = ctx
-            .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+            .wait_for_callback::<String>(|_step_ctx, _cb_id| async { Ok(()) })
             .submitter_retry(|_err, _attempt| crate::RetryDecision::Stop);
 
         let strategy = builder

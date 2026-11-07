@@ -6,7 +6,7 @@ use aws_durable_execution_sdk as durable;
 async fn main() -> Result<(), lambda_runtime::Error> {
     durable::run(|name: String, ctx: durable::DurableContext| async move {
         let result: String = ctx
-            .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+            .wait_for_callback::<String>(|_step_ctx, _cb_id| async { Ok(()) })
             .name(&name)
             .await?;
         Ok(result)

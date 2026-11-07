@@ -7,7 +7,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     durable::run(
         |_input: serde_json::Value, ctx: durable::DurableContext| async move {
             let result: String = ctx
-                .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+                .wait_for_callback::<String>(|_step_ctx, _cb_id| async { Ok(()) })
                 .name("approval")
                 .await?;
             Ok(result)

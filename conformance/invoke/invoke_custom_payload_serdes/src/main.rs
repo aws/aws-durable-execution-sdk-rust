@@ -1,30 +1,25 @@
 //! Conformance requirement 5-15: invoke with custom payload serdes.
 //!
-//! The custom payload serdes uppercases string payloads before sending
+//! The custom payload serializer uppercases string payloads before sending
 //! to the target.
 
 use aws_durable_execution_sdk as durable;
 
-/// Custom serdes that uppercases string payloads on serialization.
+/// Custom payload serializer that uppercases the JSON of the payload.
 #[derive(Debug)]
 struct UppercasePayloadSerdes;
 
-impl durable::Serdes<serde_json::Value> for UppercasePayloadSerdes {
-    async fn serialize(
+impl durable::PayloadSerializer for UppercasePayloadSerdes {
+    async fn serialize_payload<T>(
         &self,
-        value: serde_json::Value,
+        value: T,
         _context: durable::serdes::SerdesContext,
-    ) -> Result<String, durable::BoxError> {
+    ) -> Result<String, durable::BoxError>
+    where
+        T: serde::Serialize + Send + 'static,
+    {
         // Uppercase the JSON rendering of the payload value.
-        Ok(value.to_string().to_uppercase())
-    }
-
-    async fn deserialize(
-        &self,
-        wire: String,
-        _context: durable::serdes::SerdesContext,
-    ) -> Result<serde_json::Value, durable::BoxError> {
-        Ok(serde_json::from_str(&wire)?)
+        Ok(serde_json::to_string(&value)?.to_uppercase())
     }
 }
 
@@ -36,7 +31,7 @@ async fn handler(
     let target = std::env::var("TARGET_FUNCTION_NAME")
         .map_err(|e| -> durable::BoxError { e.to_string().into() })?;
     let result = ctx
-        .invoke::<serde_json::Value, _>(&target, event)
+        .invoke::<serde_json::Value>(&target, event)
         .payload_serdes(UppercasePayloadSerdes)
         .await?;
     Ok(result)

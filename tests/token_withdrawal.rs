@@ -178,7 +178,7 @@ async fn nested_run_does_not_withdraw() {
         })
         .run(
             |_event: (), ctx: DurableContext| async move {
-                let value = ctx.invoke::<u32, _>("target", ()).name("call").await?;
+                let value = ctx.invoke::<u32>("target", ()).name("call").await?;
                 Ok::<u32, BoxError>(value)
             },
             (),

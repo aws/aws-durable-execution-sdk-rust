@@ -1959,7 +1959,7 @@ mod suspension_containment_and_task_ownership {
             ctx.clone(),
             async move {
                 let _ = ctx_h
-                    .invoke::<serde_json::Value, _>("target-fn", "input".to_owned())
+                    .invoke::<serde_json::Value>("target-fn", "input".to_owned())
                     .await;
                 ran_c.store(true, Ordering::SeqCst);
                 Ok::<_, crate::error::WireError>("done".to_owned())
@@ -4508,7 +4508,7 @@ mod refresh_scheduler {
     async fn invoke_beside_step(client: &Arc<RefreshClient>) -> InvocationOutcome {
         let ctx = refresh_ctx(client);
         drive_handler(ctx, None, |ctx| async move {
-            let mut h = std::pin::pin!(ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn());
+            let mut h = std::pin::pin!(ctx.invoke::<u32>("target", 1_u32).name("inv").spawn());
             poll_once(h.as_mut()).await;
             sleeping_step(&ctx, "s", secs(5)).await.map_err(wire_err)?;
             let value = h.await.map_err(wire_err)?;
@@ -5498,7 +5498,7 @@ mod refresh_scheduler {
                     cb.spawn_result()
                 }
                 Self::Invoke => {
-                    let h = ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn();
+                    let h = ctx.invoke::<u32>("target", 1_u32).name("inv").spawn();
                     crate::DurableFuture::from_async(async move { h.await.map(|v| v.to_string()) })
                 }
                 Self::Condition => {

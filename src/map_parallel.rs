@@ -9361,7 +9361,7 @@ mod tests {
         let (invoke_ctx, _invoke_client) = test_ctx_with_client(CheckpointLog::empty());
         let signal = Arc::clone(invoke_ctx.coordinator());
         let invoke_fut = invoke_ctx
-            .invoke::<String, String>("target-fn", value.clone())
+            .invoke::<String>("target-fn", value.clone())
             .payload_serdes(invoke_rec.clone());
         let outcome = crate::driver::test_support::outcome_of(
             invoke_ctx.clone(),

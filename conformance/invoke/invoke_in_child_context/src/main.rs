@@ -13,7 +13,7 @@ async fn handler(
     let result: serde_json::Value = ctx
         .run_in_child_context(move |child_ctx| async move {
             let r: serde_json::Value = child_ctx
-                .invoke::<serde_json::Value, _>(&target, serde_json::Value::Null)
+                .invoke::<serde_json::Value>(&target, serde_json::Value::Null)
                 .await?;
             Ok(r)
         })

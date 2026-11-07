@@ -208,7 +208,7 @@
 //!         .name("reserve-stock")
 //!         .await?;
 //!     let approval = ctx
-//!         .wait_for_callback::<String, _, _>(|_step_ctx, _callback_id| async {
+//!         .wait_for_callback::<String>(|_step_ctx, _callback_id| async {
 //!             // In a real workflow, the callback ID would be sent to an
 //!             // approver here.
 //!             Ok(())
@@ -1792,7 +1792,7 @@ impl NestedOutcome {
 ///     .run(
 ///         |_e: (), ctx: durable::DurableContext| async move {
 ///             let value = ctx
-///                 .wait_for_callback::<u32, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+///                 .wait_for_callback::<u32>(|_step_ctx, _callback_id| async { Ok(()) })
 ///                 .name("approve")
 ///                 .await?;
 ///             Ok::<_, durable::BoxError>(value)
@@ -2214,7 +2214,7 @@ impl LocalRunner {
     ///     .register_function("double", |x: i32| async move { Ok(x * 2) })
     ///     .run(
     ///         |n: i32, ctx: durable::DurableContext| async move {
-    ///             let doubled = ctx.invoke::<i32, _>("double", n).await?;
+    ///             let doubled = ctx.invoke::<i32>("double", n).await?;
     ///             Ok::<_, durable::BoxError>(doubled)
     ///         },
     ///         21_i32,
@@ -2302,7 +2302,7 @@ impl LocalRunner {
     ///     })
     ///     .run(
     ///         |n: u32, ctx: durable::DurableContext| async move {
-    ///             let out = ctx.invoke::<u32, _>("workflow", n).await?;
+    ///             let out = ctx.invoke::<u32>("workflow", n).await?;
     ///             Ok::<_, durable::BoxError>(out)
     ///         },
     ///         1_u32,
@@ -3199,7 +3199,7 @@ fn aws_error(err: BoxError) -> TestRunnerError {
 /// let result = CloudRunner::new("my-durable-function")
 ///     .region("us-west-2")
 ///     .poll_interval(Duration::from_secs(3))
-///     .run::<_, i32>(21_i32)
+///     .run::<i32>(21_i32)
 ///     .await?;
 ///
 /// if result.is_success() {
@@ -3385,7 +3385,8 @@ impl CloudRunner {
     /// answer its callback before that, through [`RunHandle::operation`].
     ///
     /// The event is serialized to JSON and delivered as the invocation
-    /// payload. The handler output (on success) is deserialized into `O`.
+    /// payload. The handler output (on success) is deserialized into `O`,
+    /// the only type parameter: name it with `run::<O>(event)`.
     ///
     /// # Errors
     ///
@@ -3410,15 +3411,14 @@ impl CloudRunner {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), durable::BoxError> {
     /// let result = CloudRunner::new("echo-fn")
-    ///     .run::<_, String>("hello".to_owned())
+    ///     .run::<String>("hello".to_owned())
     ///     .await?;
     /// assert!(result.is_success() || result.is_failure() || result.is_suspended());
     /// # Ok(())
     /// # }
     /// ```
-    pub fn run<E, O>(&self, event: E) -> RunHandle<O>
+    pub fn run<O>(&self, event: impl Serialize) -> RunHandle<O>
     where
-        E: Serialize,
         O: DeserializeOwned + Send + 'static,
     {
         let runner = self.clone();
@@ -6786,7 +6786,7 @@ mod tests {
                             .retry_if(|_| false)
                             .build();
                         let outcome = ctx
-                            .wait_for_callback::<u32, _, _>(move |_step_ctx, _callback_id| {
+                            .wait_for_callback::<u32>(move |_step_ctx, _callback_id| {
                                 let submits_seen = Arc::clone(&submits_seen);
                                 async move {
                                     if submits_seen.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -7824,9 +7824,7 @@ mod tests {
             .run(
                 |(), ctx: DurableContext| async move {
                     let outcome = ctx
-                        .wait_for_callback::<String, _, _>(|_step_ctx, _callback_id| async {
-                            Ok(())
-                        })
+                        .wait_for_callback::<String>(|_step_ctx, _callback_id| async { Ok(()) })
                         .name("approve")
                         .await;
                     let Err(err) = outcome else {
@@ -7900,7 +7898,7 @@ mod tests {
                     let (seen, live_source) = (Arc::clone(&seen_in), Arc::clone(&live_in));
                     async move {
                         let outcome = ctx
-                            .wait_for_callback::<String, _, _>(move |_step_ctx, _id| async move {
+                            .wait_for_callback::<String>(move |_step_ctx, _id| async move {
                                 match submitter {
                                     Submitter::Succeeds => Ok(()),
                                     Submitter::FailsUntyped => Err("submission failed".into()),
@@ -8112,7 +8110,7 @@ mod tests {
             .run(
                 |(), ctx: DurableContext| async move {
                     let approval = ctx
-                        .wait_for_callback::<String, _, _>(|_step_ctx, _id| async { Ok(()) })
+                        .wait_for_callback::<String>(|_step_ctx, _id| async { Ok(()) })
                         .name("approve")
                         .serdes(crate::PassthroughSerdes)
                         .await?;
@@ -8191,7 +8189,7 @@ mod tests {
                         .await?;
                     let b = cb.result().await?;
                     let c = ctx
-                        .wait_for_callback::<u32, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+                        .wait_for_callback::<u32>(|_step_ctx, _callback_id| async { Ok(()) })
                         .name("wfcb")
                         .await?;
                     Ok::<_, BoxError>(plain + paid + a + b + c)
@@ -8356,9 +8354,9 @@ mod tests {
                         .map(|name| {
                             crate::Branch::new(name, move |child: DurableContext| async move {
                                 let value = child
-                                    .wait_for_callback::<u32, _, _>(
-                                        |_step_ctx, _callback_id| async { Ok(()) },
-                                    )
+                                    .wait_for_callback::<u32>(|_step_ctx, _callback_id| async {
+                                        Ok(())
+                                    })
                                     .name(name)
                                     .await?;
                                 Ok(value)
@@ -12980,7 +12978,7 @@ mod tests {
             .register_function("double", |x: i32| async move { Ok(x * 2) })
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    let doubled = ctx.invoke::<i32, _>("double", 21).await?;
+                    let doubled = ctx.invoke::<i32>("double", 21).await?;
                     Ok::<_, BoxError>(doubled)
                 },
                 (),
@@ -13003,7 +13001,7 @@ mod tests {
             .run(
                 |(): (), ctx: DurableContext| async move {
                     let err = ctx
-                        .invoke::<(), _>("pay", ())
+                        .invoke::<()>("pay", ())
                         .await
                         .expect_err("the invoke fails");
                     Ok::<_, BoxError>(wire_type_and_message(&err))
@@ -13034,7 +13032,7 @@ mod tests {
             .run(
                 |(): (), ctx: DurableContext| async move {
                     let err = ctx
-                        .invoke::<(), _>("pay", ())
+                        .invoke::<()>("pay", ())
                         .await
                         .expect_err("the invoke fails");
                     Ok::<_, BoxError>(wire_type_and_message(&err))
@@ -13057,7 +13055,7 @@ mod tests {
             .register_function("notify", |_: i32| async move { Ok(()) })
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    ctx.invoke::<(), _>("notify", 1).await?;
+                    ctx.invoke::<()>("notify", 1).await?;
                     Ok::<_, BoxError>(())
                 },
                 (),
@@ -13075,7 +13073,7 @@ mod tests {
         let result = LocalRunner::new()
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    ctx.invoke::<(), _>("child-fn", ()).await?;
+                    ctx.invoke::<()>("child-fn", ()).await?;
                     Ok::<_, BoxError>(())
                 },
                 (),
@@ -13099,7 +13097,7 @@ mod tests {
             .run(
                 |(): (), ctx: DurableContext| async move {
                     let err = ctx
-                        .invoke::<usize, _>("len", 5_i32)
+                        .invoke::<usize>("len", 5_i32)
                         .await
                         .expect_err("the invoke fails");
                     Ok::<_, BoxError>(wire_type_and_message(&err))
@@ -13124,7 +13122,7 @@ mod tests {
             .run(
                 |(): (), ctx: DurableContext| async move {
                     let err = ctx
-                        .invoke::<serde_json::Value, _>("map", ())
+                        .invoke::<serde_json::Value>("map", ())
                         .await
                         .expect_err("the invoke fails");
                     Ok::<_, BoxError>(wire_type_and_message(&err).1)
@@ -13151,7 +13149,7 @@ mod tests {
             })
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    let count = ctx.invoke::<u32, _>("count", ()).await?;
+                    let count = ctx.invoke::<u32>("count", ()).await?;
                     ctx.wait(std::time::Duration::from_secs(1)).await?;
                     ctx.step(|_| async { Ok(()) }).await?;
                     Ok::<_, BoxError>(count)
@@ -13178,7 +13176,7 @@ mod tests {
                         .future();
                     let invoked = ctx
                         .run_in_child_context(|child| async move {
-                            Ok(child.invoke::<String, _>("fast", ()).await?)
+                            Ok(child.invoke::<String>("fast", ()).await?)
                         })
                         .future();
                     let winner = ctx.race([waited, invoked]).await?;
@@ -13207,7 +13205,7 @@ mod tests {
             })
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    let out = ctx.invoke::<u32, _>("workflow", 1).await?;
+                    let out = ctx.invoke::<u32>("workflow", 1).await?;
                     Ok::<_, BoxError>(out)
                 },
                 (),
@@ -13234,7 +13232,7 @@ mod tests {
             .run(
                 |(): (), ctx: DurableContext| async move {
                     let err = ctx
-                        .invoke::<(), _>("pay", ())
+                        .invoke::<()>("pay", ())
                         .await
                         .expect_err("the invoke fails");
                     let wire = err.wire();
@@ -13273,7 +13271,7 @@ mod tests {
 
     /// A caller that invokes `"slow"`.
     async fn invoke_slow((): (), ctx: DurableContext) -> Result<(), BoxError> {
-        ctx.invoke::<(), _>("slow", ()).await?;
+        ctx.invoke::<()>("slow", ()).await?;
         Ok(())
     }
 
@@ -13300,7 +13298,7 @@ mod tests {
             })
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    ctx.invoke::<(), _>("count", ()).await?;
+                    ctx.invoke::<()>("count", ()).await?;
                     ctx.wait(std::time::Duration::from_secs(1)).await?;
                     Ok::<_, BoxError>(())
                 },
@@ -13323,7 +13321,7 @@ mod tests {
             })
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    let approved = ctx.invoke::<bool, _>("approval", ()).await?;
+                    let approved = ctx.invoke::<bool>("approval", ()).await?;
                     Ok::<_, BoxError>(approved)
                 },
                 (),
@@ -13356,7 +13354,7 @@ mod tests {
             })
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    let approval = ctx.invoke::<bool, _>("approval", ()).spawn();
+                    let approval = ctx.invoke::<bool>("approval", ()).spawn();
                     ctx.wait(std::time::Duration::from_secs(1)).await?;
                     let approved = approval.await?;
                     Ok::<_, BoxError>(approved)
@@ -13375,13 +13373,13 @@ mod tests {
         let result = LocalRunner::new()
             .register_function("leaf", |(): ()| async move { Ok(1_u32) })
             .register_durable_function("mid", |(): (), ctx: DurableContext| async move {
-                let leaf = ctx.invoke::<u32, _>("leaf", ()).await?;
+                let leaf = ctx.invoke::<u32>("leaf", ()).await?;
                 Ok::<_, BoxError>(leaf)
             })
             .run(
                 |(): (), ctx: DurableContext| async move {
                     let err = ctx
-                        .invoke::<u32, _>("mid", ())
+                        .invoke::<u32>("mid", ())
                         .await
                         .expect_err("the invoke fails");
                     Ok::<_, BoxError>(wire_type_and_message(&err).1)
@@ -13434,7 +13432,7 @@ mod tests {
             })
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    let millis = ctx.invoke::<u64, _>("timed", ()).await?;
+                    let millis = ctx.invoke::<u64>("timed", ()).await?;
                     Ok::<_, BoxError>(millis)
                 },
                 (),
@@ -13453,7 +13451,7 @@ mod tests {
             })
             .run(
                 |(): (), ctx: DurableContext| async move {
-                    let out = ctx.invoke::<u32, _>("t", ()).await?;
+                    let out = ctx.invoke::<u32>("t", ()).await?;
                     Ok::<_, BoxError>(out)
                 },
                 (),
@@ -13486,7 +13484,7 @@ mod tests {
         ctx: DurableContext,
     ) -> Result<(Option<String>, Option<String>, Vec<String>), BoxError> {
         let err = ctx
-            .invoke::<(), _>("fail", ())
+            .invoke::<()>("fail", ())
             .await
             .expect_err("the invoke fails");
         let wire = err.wire().cloned().unwrap_or_default();
@@ -15015,7 +15013,7 @@ mod tests {
         // `run` serializes the event before it resolves a client, so this
         // test makes no Lambda call.
         let err = CloudRunner::new("f")
-            .run::<_, u32>(Unserializable)
+            .run::<u32>(Unserializable)
             .await
             .expect_err("a runner error");
         let e = match &err {
@@ -15374,7 +15372,7 @@ mod tests {
             .invocation_type(InvocationType::Event)
             .poll_interval(std::time::Duration::ZERO)
             .lambda_client(client)
-            .run::<_, u32>(serde_json::json!({ "x": 1 }))
+            .run::<u32>(serde_json::json!({ "x": 1 }))
             .await
             .expect("runner");
         assert_eq!(result.output(), Some(&6));
@@ -15395,7 +15393,7 @@ mod tests {
         });
         let err = CloudRunner::new("f")
             .lambda_client(mock_client!(aws_sdk_lambda, [&invoke]))
-            .run::<_, u32>(())
+            .run::<u32>(())
             .await
             .expect_err("a runner error");
         assert!(matches!(err, TestRunnerError::Aws(_)), "{err:?}");
@@ -15432,7 +15430,7 @@ mod tests {
         );
         let err = CloudRunner::new("f")
             .lambda_client(client)
-            .run::<_, u32>(())
+            .run::<u32>(())
             .await
             .expect_err("a runner error");
         assert!(matches!(err, TestRunnerError::Aws(_)), "{err:?}");
@@ -15486,7 +15484,7 @@ mod tests {
         );
         let err = CloudRunner::new("f")
             .lambda_client(client)
-            .run::<_, u32>(())
+            .run::<u32>(())
             .await
             .expect_err("a runner error");
         assert!(matches!(err, TestRunnerError::Aws(_)), "{err:?}");
@@ -15756,7 +15754,7 @@ mod tests {
             .callback_for("approval", CallbackReply::success(&"ok").expect("encodes"));
         assert_flat_item_records_batch_parent(runner, "approval", |child| async move {
             child
-                .wait_for_callback::<String, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+                .wait_for_callback::<String>(|_step_ctx, _callback_id| async { Ok(()) })
                 .name("approval")
                 .await
                 .map_err(BoxError::from)
@@ -15972,7 +15970,7 @@ mod tests {
                         .await?;
                     let cb = ctx.create_callback::<bool>().name("cb").await?;
                     cb.result().await?;
-                    ctx.invoke::<serde_json::Value, _>("target", serde_json::json!(0))
+                    ctx.invoke::<serde_json::Value>("target", serde_json::json!(0))
                         .name("call")
                         .await?;
                     Ok::<_, BoxError>(())
@@ -17502,7 +17500,7 @@ mod tests {
                             })
                             .run(
                                 |(): (), ctx: DurableContext| async move {
-                                    Ok(ctx.invoke::<i32, _>("target", 5).name("call").await?)
+                                    Ok(ctx.invoke::<i32>("target", 5).name("call").await?)
                                 },
                                 (),
                             )
@@ -17542,7 +17540,7 @@ mod tests {
                             })
                             .run(
                                 |(): (), ctx: DurableContext| async move {
-                                    Ok(ctx.invoke::<i32, _>("target", 5).name("call").await?)
+                                    Ok(ctx.invoke::<i32>("target", 5).name("call").await?)
                                 },
                                 (),
                             )
@@ -18110,7 +18108,7 @@ mod tests {
             .name("reserve-stock")
             .await?;
         let approval = ctx
-            .wait_for_callback::<String, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+            .wait_for_callback::<String>(|_step_ctx, _callback_id| async { Ok(()) })
             .name("manager-approval")
             .await?;
         let shipment = ctx
@@ -18176,7 +18174,7 @@ mod tests {
     /// nothing.
     async fn wait_for_approve((): (), ctx: DurableContext) -> Result<u32, BoxError> {
         Ok(ctx
-            .wait_for_callback::<u32, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+            .wait_for_callback::<u32>(|_step_ctx, _callback_id| async { Ok(()) })
             .name("approve")
             .await?)
     }

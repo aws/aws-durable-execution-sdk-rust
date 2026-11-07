@@ -31,7 +31,7 @@ async fn pause_resume_handler(
         .name("reserve-stock")
         .await?;
     let approval = ctx
-        .wait_for_callback::<String, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+        .wait_for_callback::<String>(|_step_ctx, _callback_id| async { Ok(()) })
         .name("manager-approval")
         .await?;
     let shipment = ctx

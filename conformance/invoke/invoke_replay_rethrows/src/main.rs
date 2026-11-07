@@ -10,7 +10,7 @@ async fn handler(
 ) -> Result<String, durable::BoxError> {
     let target = std::env::var("TARGET_FUNCTION_NAME")
         .map_err(|e| -> durable::BoxError { e.to_string().into() })?;
-    let result = ctx.invoke::<String, _>(&target, event).await;
+    let result = ctx.invoke::<String>(&target, event).await;
     match result {
         Ok(v) => Ok(v),
         Err(err) => {
