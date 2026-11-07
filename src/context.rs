@@ -468,15 +468,16 @@ async fn run_direct_writer(queue: Arc<DirectWriteQueue>) {
     }
 }
 
-/// The fatal error a failed checkpoint write of `op_wire_id` records: a
-/// retryable failure fails the invocation, and a non-retryable failure
-/// fails the execution with the record of
+/// The fatal error a failed checkpoint write records: a retryable failure
+/// fails the invocation with the message of
+/// [`checkpoint_invocation_failure_message`](crate::error::checkpoint_invocation_failure_message),
+/// and a non-retryable failure fails the execution with the record of
 /// [`checkpoint_execution_failure_wire`](crate::error::checkpoint_execution_failure_wire).
-fn checkpoint_failure_fatal(op_wire_id: &str, err: &ExecutionClientError) -> FatalError {
+fn checkpoint_failure_fatal(err: &ExecutionClientError) -> FatalError {
     if err.is_retryable() {
         FatalError {
             error_type: crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE.to_owned(),
-            error_message: format!("checkpoint write failed for operation {op_wire_id}: {err}"),
+            error_message: crate::error::checkpoint_invocation_failure_message(err),
             severity: FatalSeverity::FailInvocation,
         }
     } else {
@@ -1999,7 +2000,7 @@ impl DurableContext {
         }
         self.inner
             .coordinator
-            .fail_write(checkpoint_failure_fatal(op_wire_id, err), || {
+            .fail_write(checkpoint_failure_fatal(err), || {
                 self.abandon_queued_writes();
             });
     }
@@ -6423,7 +6424,26 @@ mod tests {
             first.error_type,
             crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE
         );
-        assert!(first.error_message.contains("op-a"), "{first:?}");
+        assert_eq!(
+            first.error_message,
+            "[Unrecoverable Invocation] Checkpoint failed: injected retryable checkpoint failure"
+        );
+    }
+
+    /// A retryable checkpoint failure records the fault JS gives it: the
+    /// type `CheckpointUnrecoverableInvocationError` and the message
+    /// `[Unrecoverable Invocation] Checkpoint failed: {m}`, and fails the
+    /// invocation.
+    #[test]
+    fn checkpoint_failure_fatal_of_a_retryable_error() {
+        let err = ExecutionClientError::new(ExecutionClientErrorScope::Invocation, "throttled");
+        let fatal = checkpoint_failure_fatal(&err);
+        assert_eq!(fatal.error_type, "CheckpointUnrecoverableInvocationError");
+        assert_eq!(
+            fatal.error_message,
+            "[Unrecoverable Invocation] Checkpoint failed: throttled"
+        );
+        assert!(matches!(fatal.severity, FatalSeverity::FailInvocation));
     }
 
     /// A fan-out exceeding one request's operation-count limit is split

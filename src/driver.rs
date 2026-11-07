@@ -4787,13 +4787,9 @@ mod refresh_scheduler {
         let InvocationOutcome::Fault { message, .. } = &outcome else {
             panic!("expected a fault, got {outcome:?}");
         };
-        assert!(message.contains("throttled refresh"), "got {message}");
-        // The refresh sends no update, so the failure names the wire ID of
-        // its first due registration, the callback's.
-        let cb = crate::engine::compute_wire_id_public("1");
-        assert!(
-            message.contains(&format!("operation {cb}:")),
-            "got {message}"
+        assert_eq!(
+            message,
+            "[Unrecoverable Invocation] Checkpoint failed: throttled refresh"
         );
         assert_eq!(client.empty_calls().len(), 1, "no refresh after a failure");
 
@@ -4863,11 +4859,9 @@ mod refresh_scheduler {
         let InvocationOutcome::Fault { message, .. } = &outcome else {
             panic!("expected a fault, got {outcome:?}");
         };
-        assert!(message.contains("throttled refresh"), "got {message}");
-        let cb = crate::engine::compute_wire_id_public("1");
-        assert!(
-            message.contains(&format!("operation {cb}:")),
-            "got {message}"
+        assert_eq!(
+            message,
+            "[Unrecoverable Invocation] Checkpoint failed: throttled refresh"
         );
 
         // A non-retryable failure fails the execution.

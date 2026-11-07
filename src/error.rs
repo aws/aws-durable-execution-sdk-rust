@@ -604,6 +604,21 @@ pub(crate) fn checkpoint_execution_failure_wire(
     )
 }
 
+/// The message of the fault that a retryable checkpoint failure records:
+/// `[Unrecoverable Invocation] Checkpoint failed: {m}`, as JS gives its
+/// `CheckpointUnrecoverableInvocationError`. `{m}` is the record message
+/// of [`client_error_record_message`](crate::client::client_error_record_message),
+/// the text the non-retryable record of
+/// [`checkpoint_execution_failure_wire`] uses.
+pub(crate) fn checkpoint_invocation_failure_message(
+    err: &crate::client::ExecutionClientError,
+) -> String {
+    format!(
+        "[Unrecoverable Invocation] Checkpoint failed: {}",
+        crate::client::client_error_record_message(err)
+    )
+}
+
 /// Returns the wire record carried by `err`, when `err` is one of the
 /// SDK's own wire-record-carrying types.
 fn wire_identity<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a WireError> {
@@ -1956,6 +1971,21 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retryable checkpoint failure's message is JS's: the prefix
+    /// `[Unrecoverable Invocation] Checkpoint failed: ` and the error's
+    /// record message.
+    #[test]
+    fn checkpoint_invocation_failure_message_is_js_form() {
+        let err = crate::client::ExecutionClientError::new(
+            crate::client::ExecutionClientErrorScope::Invocation,
+            "throttled",
+        );
+        assert_eq!(
+            checkpoint_invocation_failure_message(&err),
+            "[Unrecoverable Invocation] Checkpoint failed: throttled"
+        );
+    }
     /// A concrete user error type for downcast tests.
     #[derive(Debug)]
     struct UserBoom {

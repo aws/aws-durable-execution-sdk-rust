@@ -173,6 +173,15 @@ async fn invoke(
     transport: Arc<ScriptedTransport>,
     paginated: bool,
 ) -> (Result<serde_json::Value, lambda_runtime::Error>, bool) {
+    invoke_with(transport, paginated, None).await
+}
+
+/// [`invoke`], with `recorder` registered as a plugin when it is set.
+async fn invoke_with(
+    transport: Arc<ScriptedTransport>,
+    paginated: bool,
+    recorder: Option<EndRecorder>,
+) -> (Result<serde_json::Value, lambda_runtime::Error>, bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let ran = Arc::new(AtomicBool::new(false));
@@ -185,10 +194,15 @@ async fn invoke(
                 Ok::<u32, BoxError>(value)
             }
         },
-        Options::builder()
-            .execution_client(transport)
+        {
+            let builder = Options::builder().execution_client(transport);
+            match recorder {
+                Some(recorder) => builder.plugin(recorder),
+                None => builder,
+            }
             .build()
-            .expect("execution_client alone is valid"),
+            .expect("execution_client alone is valid")
+        },
     );
     let event =
         lambda_runtime::LambdaEvent::new(payload(paginated), lambda_runtime::Context::default());
@@ -265,11 +279,21 @@ async fn invocation_scoped_checkpoint_error_fails_the_invocation() {
         ExecutionClientError::new(ExecutionClientErrorScope::Invocation, "throttled"),
         None,
     ));
-    let (result, _) = invoke(transport, false).await;
+    let recorder = EndRecorder::default();
+    let (result, _) = invoke_with(transport, false, Some(recorder.clone())).await;
 
-    assert!(
-        result.is_err(),
-        "an invocation-scoped error fails the invocation: {result:?}"
+    let err = result.expect_err("an invocation-scoped error fails the invocation");
+    let message = "[Unrecoverable Invocation] Checkpoint failed: throttled";
+    assert_eq!(err.to_string(), message);
+    assert_eq!(
+        recorder.ends_with_messages(),
+        vec![(
+            (
+                InvocationStatus::Retrying,
+                Some("CheckpointUnrecoverableInvocationError".to_owned())
+            ),
+            Some(message.to_owned())
+        )]
     );
 }
 
@@ -520,12 +544,22 @@ fn has(updates: &[OperationUpdate], name: &str, action: &OperationAction) -> boo
 /// The status and the error type of one `on_invocation_end`.
 type End = (InvocationStatus, Option<String>);
 
-/// Records every `on_invocation_end`.
+/// One `on_invocation_end` and its error message.
+type EndWithMessage = (End, Option<String>);
+
+/// Records every `on_invocation_end`, with its error message.
 #[derive(Clone, Default)]
-struct EndRecorder(Arc<Mutex<Vec<End>>>);
+struct EndRecorder(Arc<Mutex<Vec<EndWithMessage>>>);
 
 impl EndRecorder {
     fn ends(&self) -> Vec<End> {
+        self.ends_with_messages()
+            .into_iter()
+            .map(|(end, _)| end)
+            .collect()
+    }
+
+    fn ends_with_messages(&self) -> Vec<EndWithMessage> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -545,9 +579,14 @@ impl Plugin for EndRecorder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((
-                info.status(),
+                (
+                    info.status(),
+                    info.execution_error()
+                        .and_then(aws_durable_execution_sdk::WireError::error_type)
+                        .map(str::to_owned),
+                ),
                 info.execution_error()
-                    .and_then(aws_durable_execution_sdk::WireError::error_type)
+                    .and_then(aws_durable_execution_sdk::WireError::error_message)
                     .map(str::to_owned),
             ));
         Box::pin(std::future::ready(Ok(())))

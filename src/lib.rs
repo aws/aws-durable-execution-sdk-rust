@@ -1865,9 +1865,10 @@ const LAMBDA_RESPONSE_SIZE_LIMIT: usize = 6 * 1024 * 1024 - 50;
 ///
 /// - Accepted: `{"Status":"SUCCEEDED","Result":""}`, and the end
 ///   `Succeeded` with the full result.
-/// - A retryable failure fails the invocation with
-///   `failed to checkpoint the execution result: <error>`, and the end is
-///   `Retrying`.
+/// - A retryable failure fails the invocation with the message of
+///   [`checkpoint_invocation_failure_message`](error::checkpoint_invocation_failure_message),
+///   `[Unrecoverable Invocation] Checkpoint failed: <message>`, and the end
+///   is `Retrying` with that message.
 /// - A non-retryable failure answers `FAILED` with the record of
 ///   [`checkpoint_execution_failure_wire`](error::checkpoint_execution_failure_wire),
 ///   and the end is `Failed` with the same error.
@@ -1910,7 +1911,7 @@ async fn checkpoint_oversized_result(
             },
         ),
         Err(context::WriteError::Failed(e)) if e.is_retryable() => {
-            let message = format!("failed to checkpoint the execution result: {e}");
+            let message = error::checkpoint_invocation_failure_message(&e);
             (
                 Err(lambda_runtime::Error::from(message.clone())),
                 InvocationEnd::retrying(error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE, message),
@@ -5006,12 +5007,10 @@ mod tests {
         ));
         let (response, ends) = run_sized_result(n, std::sync::Arc::clone(&client)).await;
         let err = response.expect_err("the invocation fails");
-        assert!(
-            err.to_string()
-                .starts_with("failed to checkpoint the execution result: "),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "[Unrecoverable Invocation] Checkpoint failed: throttled"
         );
-        assert!(err.to_string().contains("throttled"), "{err}");
         let [end] = ends.as_slice() else {
             unreachable!("one end, got {}", ends.len());
         };
@@ -5021,12 +5020,9 @@ mod tests {
             end.execution_error().and_then(WireError::error_type),
             Some(error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
         );
-        assert!(
-            end.execution_error()
-                .and_then(WireError::error_message)
-                .is_some_and(|m| m.contains("failed to checkpoint the execution result")),
-            "{:?}",
-            end.execution_error()
+        assert_eq!(
+            end.execution_error().and_then(WireError::error_message),
+            Some("[Unrecoverable Invocation] Checkpoint failed: throttled")
         );
     }
 
