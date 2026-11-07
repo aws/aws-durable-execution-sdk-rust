@@ -930,7 +930,11 @@ impl<O: Send + 'static> Callback<O> {
     ///
     /// Awaiting the future yields `Result<O, OperationError>`: an
     /// [`OperationError`] is returned if the callback failed (timeout,
-    /// heartbeat timeout, or external failure). Awaiting the result of a
+    /// heartbeat timeout, or external failure), or if its payload could not
+    /// be decoded with a permanent failure
+    /// ([`CallbackErrorKind::DeserializationFailed`](crate::CallbackErrorKind::DeserializationFailed)),
+    /// whether the record was terminal when the callback was created or
+    /// settled while this future waited. Awaiting the result of a
     /// pending callback on a task or thread that does not own the context
     /// fails the execution with a context usage error.
     ///
@@ -987,7 +991,9 @@ impl<O: Send + 'static> Callback<O> {
     ///
     /// For a settled callback (replay) it returns the same future as
     /// [`result()`](Self::result), which resolves with the stored outcome
-    /// and starts no task.
+    /// and starts no task. In both its settled and pending forms it returns
+    /// the same callback outcomes and errors as `result()`, a permanent
+    /// payload decode failure included.
     ///
     /// # Errors
     ///

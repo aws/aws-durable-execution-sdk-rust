@@ -322,9 +322,12 @@ pub(crate) fn callback_info(
 /// (`emit_replayed` true) and the result of a pending callback whose record
 /// settled during the invocation (`emit_replayed` false).
 ///
-/// The outer error fails the operation that reads the record (a payload
-/// the serdes cannot decode, an unexpected status); the inner result is the
-/// callback's own outcome.
+/// The outer error fails the operation that reads the record: a status a
+/// callback cannot have. The inner result is the callback's own outcome: its
+/// value, an external failure, a timeout, or a permanent failure to decode
+/// its payload. A decode failure marked
+/// [`RetryableSerdesError`](crate::serdes::RetryableSerdesError) ends the
+/// invocation here and returns nothing.
 async fn callback_outcome<O, S: Serdes<O>>(
     ctx: &DurableContext,
     positional_id: &str,
@@ -350,13 +353,22 @@ where
             // acts on it. Decode FIRST, then emit `operation_replayed`: a
             // corrupt payload or failing serdes surfaces as an error without
             // claiming a recorded outcome was returned.
+            //
+            // A failure that `deserialize_callback_result` returns is
+            // permanent (a marked one ends the invocation inside it), so it
+            // is the callback's own outcome: `result()` returns it whether
+            // the record was terminal at creation or settled while
+            // `result()` waited.
             let payload = ctx.checkpoint_result_payload(positional_id);
             let result_str = payload.unwrap_or_else(|| "null".to_owned());
             let serdes_ctx = SerdesContext::new(&wire_id, ctx.execution_arn());
-            let value: O =
-                deserialize_callback_result(ctx, name, serdes, result_str, serdes_ctx).await?;
-            emit();
-            Ok(Ok(value))
+            match deserialize_callback_result(ctx, name, serdes, result_str, serdes_ctx).await {
+                Ok(value) => {
+                    emit();
+                    Ok(Ok(value))
+                }
+                Err(error) => Ok(Err(error)),
+            }
         }
         CheckpointStatus::Failed | CheckpointStatus::Cancelled | CheckpointStatus::Stopped => {
             // Callback failed externally, or the service cancelled or
@@ -2751,12 +2763,99 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
-        let err = exec.execute().await.unwrap_err();
+        let callback = exec.execute().await.expect("creation succeeds");
+        let err = callback.result().await.unwrap_err();
         assert!(matches!(
             err.kind(),
             OperationErrorKind::Callback(e)
                 if matches!(e.kind(), CallbackErrorKind::DeserializationFailed)
         ));
+    }
+
+    /// A `SUCCEEDED` record without a payload passes `"null"` to
+    /// `JsonSerdes`, which cannot decode it as a `String`: creation
+    /// succeeds and `result()` returns the decode failure.
+    #[tokio::test]
+    async fn absent_callback_payload_decode_failure_comes_from_result() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let callback = create_from(callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            None,
+            None,
+            None,
+            Some("cb-1"),
+        ))
+        .await
+        .expect("creation succeeds");
+        let err = callback.result().await.expect_err("null is not a String");
+        assert!(
+            matches!(
+                callback_kind(&err),
+                Some(CallbackErrorKind::DeserializationFailed)
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A serdes that counts its `deserialize` calls and fails each one with
+    /// an unmarked error.
+    #[derive(Clone, Default)]
+    pub(super) struct CountingFailingSerdes(pub(super) Arc<std::sync::atomic::AtomicUsize>);
+
+    impl CountingFailingSerdes {
+        fn decodes(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Serdes<String> for CountingFailingSerdes {
+        fn serialize(
+            &self,
+            value: String,
+            _context: SerdesContext,
+        ) -> impl Future<Output = Result<String, BoxError>> + Send {
+            std::future::ready(Ok(value))
+        }
+
+        fn deserialize(
+            &self,
+            _wire: String,
+            _context: SerdesContext,
+        ) -> impl Future<Output = Result<String, BoxError>> + Send {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err("cannot decode".into()))
+        }
+    }
+
+    /// An already-terminal callback whose payload does not decode is
+    /// decoded once, at creation. Creation succeeds, and dropping the
+    /// callback without reading its result fails nothing.
+    #[tokio::test]
+    async fn terminal_callback_decodes_once_at_creation() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some("not json"),
+            None,
+            None,
+            Some("cb-1"),
+        )]);
+        let serdes = CountingFailingSerdes::default();
+        let callback = ctx
+            .create_callback::<String>()
+            .name("cb")
+            .serdes(serdes.clone())
+            .await
+            .expect("creation succeeds");
+        assert_eq!(serdes.decodes(), 1, "creation decodes the record once");
+        drop(callback);
+        assert_eq!(serdes.decodes(), 1, "dropping the callback decodes nothing");
+        assert!(
+            ctx.coordinator().fatal_error().is_none(),
+            "an unread decode failure fails nothing"
+        );
     }
 
     #[tokio::test]
@@ -3551,6 +3650,23 @@ mod tests {
             matches!(callback_kind(&err), Some(CallbackErrorKind::Internal)),
             "{err:?}"
         );
+        // A status the SDK does not know fails earlier, when the record is
+        // validated, before the callback reads its outcome.
+        let err = create_from(callback_with(
+            CheckpointStatus::Unknown("PAUSED".to_owned()),
+            None,
+        ))
+        .await
+        .expect_err("a PAUSED callback is unrecognized");
+        let OperationErrorKind::NonDeterministicExecution(nde) = err.kind() else {
+            unreachable!("expected NonDeterministicExecution, got {:?}", err.kind());
+        };
+        let crate::error::NonDeterministicExecutionErrorKind::UnrecognizedStatus(details) =
+            nde.kind()
+        else {
+            unreachable!("expected UnrecognizedStatus, got {:?}", nde.kind());
+        };
+        assert_eq!(details.status(), "PAUSED");
     }
 
     /// A `TIMED_OUT` callback record with type `Callback.Heartbeat` gives
@@ -4205,6 +4321,257 @@ mod coordinator_tests {
             format!("{:?}", replayed.kind())
         );
         assert_eq!(live.wire(), replayed.wire());
+    }
+
+    /// The `SUCCEEDED` record of the callback `start` with a payload that
+    /// `JsonSerdes` cannot decode as a `String`.
+    fn not_json(start: &OperationUpdate) -> Operation {
+        operation_like(start, OperationStatus::Succeeded)
+            .callback_details(
+                CallbackDetails::builder()
+                    .callback_id("cb-1")
+                    .result("not json")
+                    .build(),
+            )
+            .build()
+            .expect("all required fields set")
+    }
+
+    /// Whether `err` is a callback error of kind `DeserializationFailed`.
+    fn is_decode_failure(err: &crate::OperationError) -> bool {
+        matches!(
+            err.kind(),
+            crate::error::OperationErrorKind::Callback(e)
+                if matches!(e.kind(), crate::error::CallbackErrorKind::DeserializationFailed)
+        )
+    }
+
+    /// The live reference error: callback `cb` is completed with the raw
+    /// payload `not json` while `cb.result()` waits beside step `s`.
+    /// Creation succeeds and `result()` returns `DeserializationFailed`.
+    /// Returns the client, whose updates hold the callback's START, and the
+    /// error.
+    async fn live_decode_failure() -> (Arc<ScriptedClient>, crate::OperationError) {
+        let client = Arc::new(client_completing(not_json));
+        let (outcome, result) = join_callback_with_step(&client).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let err = result
+            .expect("creation succeeded and the handler finished")
+            .expect_err("the payload does not decode");
+        assert!(is_decode_failure(&err), "{err:?}");
+        (client, err)
+    }
+
+    /// A root context whose log holds the terminal `not json` record of the
+    /// callback that `client` started.
+    fn not_json_replay_ctx(client: &ScriptedClient) -> crate::DurableContext {
+        let start = named(&client.updates(), "cb", &OperationAction::Start)
+            .cloned()
+            .expect("the callback started");
+        let log = crate::client::operations_to_checkpoint_log(&[not_json(&start)]);
+        crate::DurableContext::new_root(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+        )
+    }
+
+    /// Asserts that `actual` has the kind, `{:#}` text and wire of `expected`.
+    fn assert_same_error(actual: &crate::OperationError, expected: &crate::OperationError) {
+        assert_eq!(
+            format!("{:?}", actual.kind()),
+            format!("{:?}", expected.kind())
+        );
+        assert_eq!(format!("{actual:#}"), format!("{expected:#}"));
+        assert_eq!(actual.wire(), expected.wire());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replayed_callback_decode_failure_comes_from_result() {
+        let (client, live) = live_decode_failure().await;
+
+        let ctx = not_json_replay_ctx(&client);
+        let cb = ctx
+            .create_callback::<String>()
+            .name("cb")
+            .await
+            .expect("creation succeeds");
+        let replayed = cb.result().await.expect_err("the payload does not decode");
+        assert_same_error(&replayed, &live);
+
+        let ctx = not_json_replay_ctx(&client);
+        let cb = ctx
+            .create_callback::<String>()
+            .name("cb")
+            .await
+            .expect("creation succeeds");
+        let spawned = cb
+            .spawn_result()
+            .await
+            .expect_err("the payload does not decode");
+        assert_same_error(&spawned, &live);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_spawn_result_decode_failure_matches_result() {
+        let (_, live) = live_decode_failure().await;
+
+        let client = Arc::new(client_completing(not_json));
+        let ctx = scripted_ctx(&client);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            // The handle is called and polled while the callback is
+            // pending; step `s`'s response settles it.
+            let (result, step) = tokio::join!(
+                cb.spawn_result(),
+                ctx.step(|_| async { Ok(2_u32) }).name("s").future()
+            );
+            step.map_err(wire_err)?;
+            *handler_seen.lock().expect("lock") = Some(result);
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let spawned = seen
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("the handler finished")
+            .expect_err("the payload does not decode");
+        assert_same_error(&spawned, &live);
+    }
+
+    /// The handler of `caught_callback_decode_failure_replays_the_same_path`.
+    async fn catch_decode_failure(
+        ctx: crate::DurableContext,
+    ) -> Result<String, crate::error::WireError> {
+        let cb = ctx
+            .create_callback::<String>()
+            .name("cb")
+            .await
+            .map_err(wire_err)?;
+        let (result, step) = tokio::join!(
+            cb.result(),
+            ctx.step(|_| async { Ok(2_u32) }).name("s").future()
+        );
+        step.map_err(wire_err)?;
+        match result {
+            Err(err) if is_decode_failure(&err) => {
+                ctx.step(|_| async { Ok(3_u32) })
+                    .name("after")
+                    .await
+                    .map_err(wire_err)?;
+                Ok("decode-failed".to_owned())
+            }
+            Err(err) => Err(wire_err(err)),
+            Ok(value) => Ok(value),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caught_callback_decode_failure_replays_the_same_path() {
+        let client = Arc::new(client_completing(not_json));
+        let outcome = drive_handler(scripted_ctx(&client), None, catch_decode_failure)
+            .await
+            .expect("no panic");
+        assert_eq!(
+            outcome,
+            InvocationOutcome::Complete("decode-failed".to_owned())
+        );
+
+        // The terminal log of that run: the callback, `s` and `after`.
+        let updates = client.updates();
+        let mut operations = Vec::new();
+        for update in &updates {
+            if update.r#type() == &OperationType::Callback
+                && update.action() == &OperationAction::Start
+            {
+                operations.push(not_json(update));
+            }
+            if update.r#type() == &OperationType::Step
+                && update.action() == &OperationAction::Succeed
+            {
+                operations.push(
+                    operation_like(update, OperationStatus::Succeeded)
+                        .step_details(
+                            aws_sdk_lambda::types::StepDetails::builder()
+                                .attempt(1)
+                                .set_result(update.payload().map(str::to_owned))
+                                .build(),
+                        )
+                        .build()
+                        .expect("all required fields set"),
+                );
+            }
+        }
+        assert_eq!(operations.len(), 3, "{updates:?}");
+        let log = crate::client::operations_to_checkpoint_log(&operations);
+        let replay_client = Arc::new(ScriptedClient::empty());
+        let ctx = crate::DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+            Arc::clone(&replay_client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+        );
+        let outcome = drive_handler(ctx, None, catch_decode_failure)
+            .await
+            .expect("no panic");
+        assert_eq!(
+            outcome,
+            InvocationOutcome::Complete("decode-failed".to_owned())
+        );
+        assert!(
+            replay_client.updates().is_empty(),
+            "the replay sends no update: {:?}",
+            replay_client.updates()
+        );
+    }
+
+    /// A pending callback dropped without `result()` or `spawn_result()` is
+    /// never decoded, even when its terminal record arrives with step `s`'s
+    /// response.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_pending_callback_is_not_decoded() {
+        let decodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let serdes = super::tests::CountingFailingSerdes(Arc::clone(&decodes));
+        let client = Arc::new(client_completing(not_json));
+        let outcome = drive_handler(scripted_ctx(&client), None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .serdes(serdes)
+                .await
+                .map_err(wire_err)?;
+            drop(cb);
+            ctx.step(|_| async { Ok(2_u32) })
+                .name("s")
+                .await
+                .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        assert!(
+            client
+                .calls()
+                .iter()
+                .any(|(_, u)| named(u, "s", &OperationAction::Succeed).is_some()),
+            "step `s`'s response carried the terminal record"
+        );
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a dropped pending callback is not decoded"
+        );
     }
 
     #[tokio::test(start_paused = true)]

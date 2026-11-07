@@ -524,12 +524,63 @@ async fn create_callback_marked_decode_failure_reinvokes() {
 
     assert_eq!(result.output().map(String::as_str), Some("ok"));
     assert_no_failed_operation(&result);
+    assert_eq!(result.invocation_count(), 3);
     assert_eq!(
         counters.body(),
         2,
-        "the faulting invocation and the next one each reach the code between creating and awaiting the callback"
+        "the initial invocation and the successful replay reach the code after creating the callback; the faulting invocation does not"
     );
     assert_eq!(counters.after(), 1, "the faulting decode returns nothing");
+}
+
+/// An unmarked decode failure of a `create_callback` payload comes from
+/// `result()`, both in the invocation that first reads the terminal record
+/// and on the replay after it, so a handler that catches it takes the same
+/// path every time.
+#[tokio::test]
+async fn create_callback_unmarked_decode_failure_reaches_result() {
+    let observed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let handler_observed = Arc::clone(&observed);
+    let result = LocalRunner::new()
+        .callback(CallbackReply::raw("not json"))
+        .run(
+            move |_event: serde_json::Value, ctx: DurableContext| {
+                let observed = Arc::clone(&handler_observed);
+                async move {
+                    let callback = ctx.create_callback::<String>().name("approval").await?;
+                    let err = callback
+                        .result()
+                        .await
+                        .expect_err("the payload does not decode");
+                    let kind = match err.kind() {
+                        durable::OperationErrorKind::Callback(e) => format!("{:?}", e.kind()),
+                        other => format!("non-callback: {other}"),
+                    };
+                    observed.lock().expect("lock").push(kind.clone());
+                    ctx.step(|_| async { Ok(1_u32) }).name("after").await?;
+                    ctx.wait(Duration::from_secs(1)).name("pause").await?;
+                    Ok::<_, BoxError>(kind)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+
+    assert!(result.is_success(), "{:?}", result.error());
+    assert_eq!(
+        result.output().map(String::as_str),
+        Some("DeserializationFailed")
+    );
+    assert_eq!(result.invocation_count(), 3);
+    assert_eq!(
+        *observed.lock().expect("lock"),
+        ["DeserializationFailed", "DeserializationFailed"]
+    );
+    let approval = result.operation("approval").expect("the callback");
+    assert_eq!(approval.status(), durable::OperationStatus::Succeeded);
+    assert_eq!(approval.result(), Some("not json"));
+    assert!(approval.error().is_none(), "{:?}", approval.error());
 }
 
 /// Runs a `wait_for_condition` that counts to 2 with a 1 s delay.

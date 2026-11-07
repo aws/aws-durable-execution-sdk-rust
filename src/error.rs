@@ -1286,7 +1286,11 @@ pub enum CallbackErrorKind {
     ///
     /// This is a payload decode failure that the serdes did not mark with
     /// [`RetryableSerdesError`](crate::serdes::RetryableSerdesError); a
-    /// marked failure ends the invocation instead. From
+    /// marked failure ends the invocation instead. From `create_callback`,
+    /// `create_callback(..).await` succeeds, and
+    /// [`Callback::result`](crate::builders::callback::Callback::result) or
+    /// [`Callback::spawn_result`](crate::builders::callback::Callback::spawn_result) returns
+    /// this permanent error, live and on replay. From
     /// `wait_for_callback`, the outer operation's record has already
     /// succeeded with the raw payload, and this error is the decode of that
     /// payload with the operation's serdes. So every invocation that reads

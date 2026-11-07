@@ -879,3 +879,55 @@ async fn failed_wait_for_callback_replay_decode_emits_no_operation_replayed() {
         "a failed replay decode must not emit operation_replayed. Got: {output}"
     );
 }
+
+/// REGRESSION: a `create_callback` whose terminal record does not decode
+/// returns the permanent error from `result()`. Neither terminal-record
+/// decode, in the invocation that first reads the record nor in the replay
+/// a wait forces after it, emits `operation_replayed` for the callback,
+/// because no recorded outcome was returned.
+#[tokio::test]
+async fn failed_create_callback_replay_decode_emits_no_operation_replayed() {
+    let (buffer, _guard) = capture_subscriber();
+
+    let result = LocalRunner::new()
+        .callback(CallbackReply::raw("not json"))
+        .run(
+            |_event: serde_json::Value, ctx: durable::DurableContext| async move {
+                let callback = ctx
+                    .create_callback::<String>()
+                    .name("decays-on-replay")
+                    .await?;
+                let err = callback
+                    .result()
+                    .await
+                    .expect_err("the payload does not decode");
+                // The wait suspends the execution, so the resume reads the
+                // terminal record again.
+                ctx.wait(Duration::from_secs(1))
+                    .name("force-resume")
+                    .await?;
+                Ok::<_, durable::BoxError>(err.to_string())
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+
+    assert!(result.output().is_some(), "{:?}", result.error());
+    assert_eq!(
+        result.invocation_count(),
+        3,
+        "the record is read at creation in two invocations"
+    );
+
+    let output = captured(&buffer);
+    let replayed = lifecycle_events(&output, event_names::OPERATION_REPLAYED);
+    assert!(
+        !events_with_field(&replayed, field_names::OPERATION_NAME, "force-resume").is_empty(),
+        "the replayed wait emits operation_replayed. Got: {output}"
+    );
+    assert!(
+        events_with_field(&replayed, field_names::OPERATION_NAME, "decays-on-replay").is_empty(),
+        "a failed callback decode must not emit operation_replayed. Got: {output}"
+    );
+}

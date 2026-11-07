@@ -703,6 +703,15 @@ let raw: String = cb.result().await?;
 `wait_for_callback` records the raw payload as its result and applies the
 serdes after it, once per invocation that reads the result.
 
+`create_callback` decodes the payload at `create_callback(..).await` when
+the callback's record is already terminal, and inside `result()` when the
+callback settles while the result waits. In both cases
+`create_callback(..).await` succeeds, and `result()` and `spawn_result()`
+return a permanent decode failure as `CallbackErrorKind::DeserializationFailed`.
+So a handler that catches that error takes the same path in every
+invocation. A failure marked `RetryableSerdesError` ends the invocation at
+the decode instead.
+
 Both builders take `.timeout(...)` and `.heartbeat_timeout(...)`.
 `wait_for_callback` also takes `.submitter_retry(...)`, which retries the
 submitter with the same retry strategy shape a step uses.

@@ -152,7 +152,14 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     /// The callback payload is produced by an external caller through the
     /// callback-completion API, so the SDK never serializes a value on the
     /// way out: only the deserialize half of this serdes acts on the
-    /// delivered payload when the result is read. The serdes must implement
+    /// delivered payload. It decodes the payload in one of two places:
+    /// in `create_callback(..).await` when the callback's record is already
+    /// terminal at creation, and in the result resolver of
+    /// [`Callback::result`](crate::builders::callback::Callback::result) or
+    /// [`Callback::spawn_result`](crate::builders::callback::Callback::spawn_result) when the
+    /// callback settles while the result waits. A permanent decode failure
+    /// is returned by `result()` or `spawn_result()` in both cases. The
+    /// serdes must implement
     /// [`Serdes<O>`](crate::Serdes) for this callback's payload type:
     /// attaching a serdes for a different type fails at compile time. The
     /// default is [`JsonSerdes`].

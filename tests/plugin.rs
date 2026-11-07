@@ -2105,6 +2105,7 @@ struct CbRec {
     sub_type: Option<String>,
     result: Option<String>,
     error_type: Option<String>,
+    error: Option<WireError>,
 }
 
 /// Records every operation and attempt hook of a callback, a context and
@@ -2171,6 +2172,7 @@ impl CallbacksPlugin {
                 .error()
                 .and_then(WireError::error_type)
                 .map(str::to_owned),
+            error: info.error().cloned(),
         };
         self.callbacks.recs.lock().unwrap().push(rec);
     }
@@ -2271,6 +2273,139 @@ async fn callback_timeout_hooks() {
         .map(|r| r.shape.5)
         .collect();
     assert_eq!(ends, [Some(OperationStatus::TimedOut)]);
+}
+
+/// Runs a callback `cb` whose payload `not json` does not decode, and
+/// catches the error of `result()`, or of `spawn_result()` when
+/// `spawned`, joined with step `s` that sleeps 200 ms. A 1 s wait then
+/// forces another invocation. With `live_reply` the test answers the
+/// callback while step `s` sleeps; otherwise the runner answers it between
+/// invocations.
+async fn run_undecodable_callback(callbacks: &Callbacks, spawned: bool, live_reply: bool) {
+    let mut runner = callbacks.runner();
+    if !live_reply {
+        runner = runner.callback(durable::test_util::CallbackReply::raw("not json"));
+    }
+    let run = runner.run(
+        move |_e: (), ctx: DurableContext| async move {
+            let cb = ctx.create_callback::<String>().name("cb").await?;
+            let result = if spawned {
+                cb.spawn_result()
+            } else {
+                cb.result()
+            };
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .future();
+            let (result, step) = tokio::join!(result, step);
+            step?;
+            let err = result.expect_err("the payload does not decode");
+            assert!(
+                matches!(
+                    err.kind(),
+                    durable::OperationErrorKind::Callback(e)
+                        if matches!(e.kind(), durable::CallbackErrorKind::DeserializationFailed { .. })
+                ),
+                "{err:?}"
+            );
+            ctx.wait(Duration::from_secs(1)).await?;
+            Ok::<_, BoxError>("decode-failed".to_owned())
+        },
+        (),
+    );
+    if live_reply {
+        let cb = run.operation("cb");
+        cb.wait_for_data(durable::test_util::WaitingStatus::Started)
+            .await
+            .expect("the callback started");
+        cb.send_callback(durable::test_util::CallbackReply::raw("not json"))
+            .await
+            .expect("sent");
+    }
+    let result = run.await.expect("runner");
+    assert_eq!(
+        result.output().map(String::as_str),
+        Some("decode-failed"),
+        "{:?}",
+        result.error()
+    );
+}
+
+/// Asserts that every end hook of `cb` reports a `SUCCEEDED` record with
+/// the raw result `not json` and no error, and that no hook reports an
+/// error.
+fn assert_undecodable_ends(recs: &[CbRec]) {
+    for rec in recs {
+        assert_eq!(rec.error, None, "no hook reports a wire error: {rec:?}");
+        if rec.shape.1 == "end" {
+            assert_eq!(rec.shape.5, SUCCEEDED, "{rec:?}");
+            assert_eq!(rec.result.as_deref(), Some("not json"), "{rec:?}");
+        }
+    }
+}
+
+/// A callback whose undecodable record settles while `result()` or
+/// `spawn_result()` waits fires one live end hook in that invocation; the
+/// result read fires no second one. Each later invocation reads the record
+/// at creation and fires one end hook there.
+#[tokio::test]
+async fn undecodable_callback_settled_while_waiting_ends_live() {
+    for spawned in [false, true] {
+        let callbacks = Callbacks::default();
+        run_undecodable_callback(&callbacks, spawned, true).await;
+        let cb = Some("cb".to_owned());
+        let recs = callbacks.of("cb");
+        let first: Vec<_> = recs
+            .iter()
+            .filter(|r| r.shape.0 == 1)
+            .map(|r| r.shape.clone())
+            .collect();
+        assert_eq!(
+            first,
+            [
+                (1, "start", CALLBACK, cb.clone(), false, STARTED),
+                (1, "end", CALLBACK, cb, false, SUCCEEDED),
+            ],
+            "spawned: {spawned}"
+        );
+        let later: Vec<_> = recs
+            .iter()
+            .filter(|r| r.shape.0 > 1)
+            .map(|r| (r.shape.0, r.shape.1))
+            .collect();
+        assert!(!later.is_empty(), "the wait forces another invocation");
+        for (index, (inv, hook)) in later.iter().enumerate() {
+            assert_eq!((*inv, *hook), (index + 2, "end"), "spawned: {spawned}");
+        }
+        assert_undecodable_ends(&recs);
+    }
+}
+
+/// An undecodable record read at creation fires its end hook live in the
+/// invocation that lists it in `updated_operations`, and replayed after
+/// it; the result read fires none.
+#[tokio::test]
+async fn undecodable_callback_read_at_creation_ends_once_per_invocation() {
+    for spawned in [false, true] {
+        let callbacks = Callbacks::default();
+        run_undecodable_callback(&callbacks, spawned, false).await;
+        let cb = Some("cb".to_owned());
+        let recs = callbacks.of("cb");
+        assert_eq!(
+            recs.iter().map(|r| r.shape.clone()).collect::<Vec<_>>(),
+            [
+                (1, "start", CALLBACK, cb.clone(), false, STARTED),
+                (2, "end", CALLBACK, cb.clone(), false, SUCCEEDED),
+                (3, "end", CALLBACK, cb, true, SUCCEEDED),
+            ],
+            "spawned: {spawned}"
+        );
+        assert_undecodable_ends(&recs);
+    }
 }
 
 /// Runs a `wait_for_callback` named `name` (or unnamed), with the reply
