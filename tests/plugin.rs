@@ -1329,6 +1329,48 @@ const PENDING: Option<OperationStatus> = Some(OperationStatus::Pending);
 const OK: Option<AttemptOutcome> = Some(AttemptOutcome::Succeeded);
 const KO: Option<AttemptOutcome> = Some(AttemptOutcome::Failed);
 
+/// The body of step `outer` calls step `inner` through a cloned context.
+/// The claim records the context usage error, which refuses both steps'
+/// terminal writes, so neither fires an end hook. Each step fires its
+/// start hooks, which do not wait for the `START` response.
+#[tokio::test]
+async fn refused_terminal_writes_fire_no_end_hook() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .run(
+            |_event: (), ctx: DurableContext| async move {
+                let cloned = ctx.clone();
+                let value = ctx
+                    .step(move |_| async move {
+                        let v = cloned.step(|_| async { Ok(1_u32) }).name("inner").await?;
+                        Ok(v)
+                    })
+                    .name("outer")
+                    .await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_failure(), "{result}");
+    let hooks: Vec<(&str, String)> = ops
+        .recs()
+        .iter()
+        .map(|rec| (rec.hook, rec.info.name().unwrap_or("").to_owned()))
+        .collect();
+    let expected: Vec<(&str, String)> = [
+        ("start", "outer"),
+        ("attempt_start", "outer"),
+        ("start", "inner"),
+        ("attempt_start", "inner"),
+    ]
+    .into_iter()
+    .map(|(hook, name)| (hook, name.to_owned()))
+    .collect();
+    assert_eq!(hooks, expected);
+}
+
 #[tokio::test]
 async fn step_first_attempt_success() {
     let ops = Ops::default();

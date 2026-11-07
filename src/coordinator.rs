@@ -77,6 +77,19 @@
 //! checkpoint-token lock sees the latch there and is dropped unresolved
 //! too. The invocation answers `PENDING` on every exit that returns a
 //! response or a Lambda error.
+//!
+//! # Fatal records
+//!
+//! A fatal record ([`InvocationCoordinator::record_fatal`],
+//! [`InvocationCoordinator::record_invocation_fault`],
+//! [`InvocationCoordinator::record`], or a failed write through
+//! [`InvocationCoordinator::fail_write`]) closes checkpoint admission in
+//! the same lock that fills the fatal slot: no checkpoint permit is granted
+//! after it, so no update requested later is written, and the write waits
+//! forever. Unlike the withdrawal latch, the record drops nothing: an update
+//! admitted before it is still sent, unless a withdrawal or a failed write
+//! drops it. Activity permits and wait registrations stay available until
+//! the driver ends the drive.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -373,10 +386,11 @@ impl InvocationCoordinator {
 
     /// Takes a permit of `kind`. Returns `None` once the phase is not
     /// `Running`, or once the withdrawal latch is set. A checkpoint permit
-    /// is also refused once the write-failure latch is set (see
-    /// [`Self::fail_write`]): the coalescer takes it under its buffer
-    /// lock, so a join either precedes the latch, and the failure drops
-    /// it, or is refused.
+    /// is also refused once the fatal slot holds an error, which
+    /// [`Self::record`] and [`Self::fail_write`] fill under this lock. The
+    /// coalescer takes the permit under its buffer lock, so a join either
+    /// precedes the record and is written (a failed write drops it), or is
+    /// refused.
     pub(crate) fn acquire(self: &Arc<Self>, kind: PermitKind) -> Option<Permit> {
         let mut state = self.lock();
         if !state.admits() {
@@ -385,7 +399,7 @@ impl InvocationCoordinator {
         match kind {
             PermitKind::Activity => state.activity += 1,
             PermitKind::Checkpoint => {
-                if state.write_failure.is_some() {
+                if state.fatal.is_some() {
                     return None;
                 }
                 state.checkpoint += 1;
@@ -777,7 +791,8 @@ impl InvocationCoordinator {
     }
 
     /// Records an execution-fatal error (first record wins) and wakes the
-    /// invocation driver.
+    /// invocation driver. From then on no checkpoint permit is granted (see
+    /// [`Self::record`]).
     pub(crate) fn record_fatal(&self, error_type: String, error_message: String) {
         self.record(FatalError {
             error_type,
@@ -788,9 +803,9 @@ impl InvocationCoordinator {
 
     /// Records an invocation-fatal error (first record wins): the
     /// invocation dies with a Lambda runtime error, the service invokes the
-    /// function again, and the execution stays alive. Used by the retryable
-    /// checkpoint-failure path and by the serdes fault path
-    /// ([`crate::context::DurableContext::serdes_fault`]).
+    /// function again, and the execution stays alive. From then on no
+    /// checkpoint permit is granted (see [`Self::record`]). Used by the
+    /// serdes fault path ([`crate::context::DurableContext::serdes_fault`]).
     pub(crate) fn record_invocation_fault(&self, error_type: &'static str, error_message: String) {
         self.record(FatalError {
             error_type: error_type.to_owned(),
@@ -800,6 +815,11 @@ impl InvocationCoordinator {
     }
 
     /// Records `fatal` (first record wins) and wakes the invocation driver.
+    ///
+    /// From then on [`Self::acquire`] grants no checkpoint permit, so no
+    /// update whose admission is requested later is written. The record
+    /// drops no update admitted before it: its writer or its batch's flush
+    /// still sends it.
     pub(crate) fn record(&self, fatal: FatalError) {
         let driver = {
             let mut state = self.lock();
@@ -1255,6 +1275,47 @@ mod tests {
         coordinator.record_fatal("Error".to_owned(), "boom".to_owned());
         drop(permit);
         assert_eq!(coordinator.phase(), Phase::Running);
+    }
+
+    /// Each of the three fatal records closes checkpoint admission: a
+    /// checkpoint permit taken before the record stays held, a later one is
+    /// refused, and activity permits are still granted.
+    #[test]
+    fn fatal_record_refuses_checkpoint_permits() {
+        type Record = fn(&InvocationCoordinator);
+        let records: [(&str, Record); 3] = [
+            ("record_fatal", |c| {
+                c.record_fatal("Error".to_owned(), "boom".to_owned());
+            }),
+            ("record_invocation_fault", |c| {
+                c.record_invocation_fault("Error", "boom".to_owned());
+            }),
+            ("record", |c| {
+                c.record(write_fatal("Usage", FatalSeverity::FailExecution));
+            }),
+        ];
+        for (name, record) in records {
+            let coordinator = InvocationCoordinator::new();
+            let held = coordinator
+                .acquire(PermitKind::Checkpoint)
+                .expect("running");
+            record(&coordinator);
+            assert_eq!(
+                coordinator.lock().checkpoint,
+                1,
+                "{name}: the permit stays held"
+            );
+            assert!(
+                coordinator.acquire(PermitKind::Checkpoint).is_none(),
+                "{name}: a later checkpoint permit is refused"
+            );
+            assert_eq!(coordinator.lock().checkpoint, 1, "{name}");
+            let activity = coordinator.acquire(PermitKind::Activity);
+            assert!(activity.is_some(), "{name}: an activity permit is granted");
+            drop(activity);
+            drop(held);
+            assert_eq!(coordinator.lock().checkpoint, 0, "{name}");
+        }
     }
 
     #[test]

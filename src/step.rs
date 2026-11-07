@@ -2207,23 +2207,32 @@ mod tests {
 
     /// Rule 8.2: the wire is derived under `ActiveBody::Outcome`, so an
     /// operation the error's `Display` claims fails the execution with a
-    /// context usage error naming the step.
+    /// context usage error naming the step. That record precedes the
+    /// step's `FAIL`, so the `FAIL` is refused and the step never resolves.
     #[tokio::test]
     async fn failing_step_display_calls_durable_op() {
         use crate::plugin::recorder::Counted;
         let hooks = UfHooks::default();
-        let (ctx, _client) = uf_context(&hooks, Vec::new());
+        let (ctx, client) = uf_context(&hooks, Vec::new());
         let claim_ctx = ctx.clone();
         let dc = Counted::calling(move || drop(claim_ctx.wait(Duration::from_secs(1))));
         let body_dc = dc.clone();
-        let err = ctx
+        let step = ctx
             .step(move |_| async move { Err::<u32, BoxError>(body_dc.boxed()) })
             .name("s")
-            .retry_strategy(|_err, _attempt| RetryDecision::Stop)
-            .await
-            .unwrap_err();
-        drop(err);
+            .retry_strategy(|_err, _attempt| RetryDecision::Stop);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), step.into_future())
+                .await
+                .is_err(),
+            "the step's FAIL is refused, so the step never resolves"
+        );
         assert_eq!(dc.calls(), 1);
+        assert!(
+            update_of(&client, "s", &OperationAction::Fail).is_none(),
+            "no terminal update is recorded"
+        );
+        assert!(update_of(&client, "s", &OperationAction::Succeed).is_none());
         let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
         assert!(
             fatal

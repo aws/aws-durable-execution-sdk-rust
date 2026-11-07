@@ -16,12 +16,14 @@ use std::time::Duration;
 use aws_durable_execution_sdk as durable;
 use durable::builders::map_parallel::NestingMode;
 use durable::builders::wait_for_condition::WaitDecision;
+use durable::lambda_types::EventType;
 use durable::serdes::{
     FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode, RetryableSerdesError, Serdes,
     SerdesContext,
 };
 use durable::test_util::{CallbackReply, LocalRunner, TestResult};
 use durable::{BoxError, DurableContext, RetryDecision, StepSemantics};
+use tokio::sync::Notify;
 
 /// How an injected failure is reported.
 #[derive(Clone, Copy)]
@@ -711,8 +713,8 @@ async fn map_item_marked_serialize_failure_reinvokes() {
     assert_no_failed_operation(&result);
     assert_eq!(
         counters.body(),
-        3,
-        "both items run; the item whose encode failed runs again, the recorded item does not"
+        4,
+        "both items run; the fault refuses the other item's later outcome write, so both run again"
     );
     assert_eq!(counters.after(), 1);
 }
@@ -819,10 +821,146 @@ async fn parallel_branch_marked_serialize_failure_reinvokes() {
     assert_eq!(result.output(), Some(&vec![1, 2]));
     assert_eq!(
         counters.body(),
-        3,
-        "both branches run; the branch whose encode failed runs again, the recorded branch does not"
+        4,
+        "both branches run; the fault refuses the other branch's later outcome write, so both run again"
     );
     assert_eq!(counters.after(), 1);
+}
+
+/// Fails its first serialize with a `RetryableSerdesError`, and notifies
+/// `failed` in that call. Every other call delegates to JSON.
+#[derive(Clone)]
+struct FailFirstEncodeAndSignal {
+    calls: Arc<AtomicUsize>,
+    failed: Arc<Notify>,
+}
+
+impl<T> Serdes<T> for FailFirstEncodeAndSignal
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+{
+    fn serialize(
+        &self,
+        value: T,
+        _context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
+        let result = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.failed.notify_one();
+            Err(Box::new(RetryableSerdesError::new("injected failure")) as BoxError)
+        } else {
+            serde_json::to_string(&value).map_err(Into::into)
+        };
+        std::future::ready(result)
+    }
+
+    fn deserialize(
+        &self,
+        wire: String,
+        _context: SerdesContext,
+    ) -> impl Future<Output = Result<T, BoxError>> + Send {
+        std::future::ready(serde_json::from_str(&wire).map_err(Into::into))
+    }
+}
+
+/// A retryable serdes failure in branch `a` refuses the `SUCCEED` that
+/// branch `b`'s step `slow` requests after it, so the next invocation runs
+/// `slow` again.
+#[tokio::test]
+async fn serdes_fault_refuses_a_later_branch_write() {
+    let slow_runs = Arc::new(AtomicUsize::new(0));
+    let encode_runs = Arc::new(AtomicUsize::new(0));
+    let slow_started = Arc::new(Notify::new());
+    let serdes = FailFirstEncodeAndSignal {
+        calls: Arc::new(AtomicUsize::new(0)),
+        failed: Arc::new(Notify::new()),
+    };
+    let slow_runs_h = Arc::clone(&slow_runs);
+    let result = LocalRunner::new()
+        .run(
+            move |_event: serde_json::Value, ctx: DurableContext| {
+                let serdes = serdes.clone();
+                let slow_runs = Arc::clone(&slow_runs_h);
+                let encode_runs = Arc::clone(&encode_runs);
+                let slow_started = Arc::clone(&slow_started);
+                async move {
+                    let a_started = Arc::clone(&slow_started);
+                    let failed = Arc::clone(&serdes.failed);
+                    let branches: Vec<durable::Branch<u32>> = vec![
+                        durable::Branch::new("a", move |child| async move {
+                            let value = child
+                                .step(move |_| {
+                                    let encode_runs = Arc::clone(&encode_runs);
+                                    let a_started = Arc::clone(&a_started);
+                                    async move {
+                                        if encode_runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                                            a_started.notified().await;
+                                        }
+                                        Ok(1_u32)
+                                    }
+                                })
+                                .name("encode-fails")
+                                .serdes(serdes)
+                                .await?;
+                            Ok(value)
+                        }),
+                        durable::Branch::new("b", move |child| async move {
+                            let value = child
+                                .step(move |_| {
+                                    let slow_runs = Arc::clone(&slow_runs);
+                                    let slow_started = Arc::clone(&slow_started);
+                                    let failed = Arc::clone(&failed);
+                                    async move {
+                                        if slow_runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                                            slow_started.notify_one();
+                                            failed.notified().await;
+                                        }
+                                        Ok(2_u32)
+                                    }
+                                })
+                                .name("slow")
+                                .await?;
+                            Ok(value)
+                        }),
+                    ];
+                    let values = ctx.parallel(branches).name("fan-out").await?;
+                    Ok::<_, BoxError>(values)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+
+    assert_eq!(result.output(), Some(&vec![1, 2]));
+    assert_eq!(
+        slow_runs.load(Ordering::SeqCst),
+        2,
+        "slow's SUCCEED is requested after the fault and refused, so slow runs again"
+    );
+    let first_invocation: Vec<EventType> = result
+        .history_events()
+        .iter()
+        .filter_map(|event| event.event_type().cloned())
+        .scan(false, |done, event_type| {
+            if *done {
+                return None;
+            }
+            *done = event_type == EventType::InvocationCompleted;
+            Some(event_type)
+        })
+        .collect();
+    assert_eq!(
+        first_invocation,
+        [
+            EventType::ExecutionStarted,
+            EventType::ContextStarted,
+            EventType::ContextStarted,
+            EventType::ContextStarted,
+            EventType::StepStarted,
+            EventType::StepStarted,
+            EventType::InvocationCompleted,
+        ]
+    );
 }
 
 #[tokio::test]

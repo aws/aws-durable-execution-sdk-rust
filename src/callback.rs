@@ -3816,12 +3816,11 @@ mod tests {
         );
     }
 
-    /// A submitter step that fails with an error other than a step error
-    /// (here a replay mismatch) passes through `run_wfcb_body` unchanged,
-    /// and the live `wait_for_callback` reports it as `Callback(Internal)`
-    /// with that error as its source and the outer type `Callback.Internal`.
+    /// The submitter's replay mismatch records the fatal nondeterminism
+    /// error before the outer `FAIL`, so the outer write is refused and the
+    /// `wait_for_callback` never resolves.
     #[tokio::test]
-    async fn wfcb_non_step_submitter_error_is_internal() {
+    async fn wfcb_non_step_submitter_fatal_refuses_terminal_write() {
         let wfcb_wire = crate::engine::compute_wire_id_public("1");
         let cb_wire = crate::engine::compute_wire_id_public("1-1");
         let step_wire = crate::engine::compute_wire_id_public("1-2");
@@ -3875,26 +3874,23 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
-        let err = exec.execute().await.expect_err("the replay mismatch fails");
         assert!(
-            matches!(callback_kind(&err), Some(CallbackErrorKind::Internal)),
-            "{err:?}"
+            tokio::time::timeout(Duration::from_millis(50), exec.execute())
+                .await
+                .is_err(),
+            "the outer FAIL is refused, so the operation never resolves"
         );
-        let source = std::error::Error::source(&err)
-            .and_then(std::error::Error::source)
-            .and_then(|s| s.downcast_ref::<OperationError>())
-            .expect("the source is the original error");
-        assert!(
-            matches!(
-                source.kind(),
-                OperationErrorKind::NonDeterministicExecution(_)
-            ),
-            "{source:?}"
-        );
-        assert_eq!(
-            err.wire().and_then(crate::error::WireError::error_type),
-            Some("Callback.Internal")
-        );
+        let terminal: Vec<_> = client
+            .recorded_updates()
+            .into_iter()
+            .filter(|u| {
+                u.id() == wfcb_wire
+                    && matches!(u.action(), OperationAction::Fail | OperationAction::Succeed)
+            })
+            .collect();
+        assert!(terminal.is_empty(), "{terminal:?}");
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
     }
 
     /// A callback's own FAILED record keeps the external classification,

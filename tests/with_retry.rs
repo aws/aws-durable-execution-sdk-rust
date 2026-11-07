@@ -22,8 +22,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
+use durable::lambda_types::EventType;
 use durable::test_util::{LocalRunner, TestOperationDetails};
-use durable::{ChildContextErrorKind, DurableContext, OperationErrorKind, RetryDecision};
+use durable::{
+    ChildContextErrorKind, DurableContext, OperationErrorKind, OperationStatus, RetryDecision,
+};
 
 /// A failing first attempt re-runs BOTH steps of the block on the second
 /// attempt, under a fresh operation namespace.
@@ -1086,9 +1089,10 @@ async fn unwrapped_mode_survives_serdes() {
     }
 }
 
-/// A wait between two attempts of a wrapped block that fails makes the
-/// block fail with `with_retry delay wait failed`, the wait's error as its
-/// source.
+/// A replay mismatch of the wait between two attempts of a wrapped block
+/// records a fatal nondeterminism error before the block's `FAIL`, so the
+/// `FAIL` is refused: the block stays `STARTED`, and the handler receives
+/// no block error.
 ///
 /// The first invocation records, under the block's ID, a plain child
 /// context with the block's identity: a failed `attempt-1` child, then a
@@ -1097,7 +1101,7 @@ async fn unwrapped_mode_survives_serdes() {
 /// claims the wait at the step's position, so the wait fails with a
 /// nondeterminism error.
 #[tokio::test]
-async fn wrapped_failed_wait_returns_delay_wait_error() {
+async fn wrapped_mismatched_wait_records_no_block_failure() {
     let invocations = Arc::new(AtomicU32::new(0));
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (invocations_h, seen_h) = (Arc::clone(&invocations), Arc::clone(&seen));
@@ -1140,11 +1144,32 @@ async fn wrapped_failed_wait_returns_delay_wait_error() {
         .await
         .expect("runner");
     assert!(result.is_failure(), "{result}");
-    let seen = seen.lock().expect("lock");
-    assert_eq!(seen.len(), 1, "{result}");
+    assert_eq!(
+        result.error_type(),
+        Some("NonDeterministicExecutionError"),
+        "{result}"
+    );
+    assert_eq!(result.invocation_count(), 2);
     assert!(
-        seen[0].contains("with_retry delay wait failed"),
-        "{}",
-        seen[0]
+        seen.lock().expect("lock").is_empty(),
+        "the handler never receives the block's error"
+    );
+    let status = |name: &str| result.operation(name).expect("operation recorded").status();
+    assert_eq!(status("block"), OperationStatus::Started);
+    assert_eq!(status("attempt-1"), OperationStatus::Failed);
+    let after_first: Vec<EventType> = result
+        .history_events()
+        .iter()
+        .filter_map(|event| event.event_type().cloned())
+        .skip_while(|event_type| *event_type != EventType::InvocationCompleted)
+        .skip(1)
+        .collect();
+    assert_eq!(
+        after_first,
+        [
+            EventType::WaitSucceeded,
+            EventType::InvocationCompleted,
+            EventType::ExecutionFailed,
+        ]
     );
 }

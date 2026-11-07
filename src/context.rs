@@ -1203,9 +1203,11 @@ impl DurableContext {
     ///   operation.
     /// - Plugin code is active: the SDK records a context usage error.
     ///
-    /// The failure is recorded as an execution-fatal error. When it is
-    /// recorded before the driver's arbitration, the invocation answers
-    /// `FAILED` on the first invocation. Only plugin code can record it
+    /// The failure is recorded as an execution-fatal error, which closes
+    /// checkpoint admission: no update requested after the record is
+    /// written, so an operation whose next update is refused keeps the last
+    /// state written. When it is recorded before the driver's arbitration,
+    /// the invocation answers `FAILED` on the first invocation. Only plugin code can record it
     /// after the arbitration, either before `drive_invocation` returns or
     /// after; such a record changes neither the response nor the
     /// late-panic policy. Without the
@@ -2309,8 +2311,10 @@ impl DurableContext {
             let (updates, events): (Vec<_>, Vec<_>) =
                 updates.into_iter().map(|t| (t.update, t.event)).unzip();
             let Some(permit) = self.inner.coordinator.acquire(PermitKind::Checkpoint) else {
-                // The phase left `Running`: the write is rejected, as a
-                // write from an abandoned owner is.
+                // The phase left `Running`, the checkpoint token was
+                // withdrawn, or a fatal error is recorded (a failed write
+                // records one): the write is rejected, as a write from an
+                // abandoned owner is.
                 return SubmittedWrite::rejected();
             };
             return self.write_direct_detached(updates, events, Some(permit), None);
@@ -2339,10 +2343,11 @@ impl DurableContext {
         // cancelled. Returning `Ok` instead would let an operation continue
         // as if its update were recorded. The admitted join holds a
         // checkpoint permit until the batch's response is merged.
-        // After a failed write nothing more is sent: the join's checkpoint
-        // permit is refused under the buffer lock (see
-        // `InvocationCoordinator::acquire`), so the write is rejected
-        // before it joins the buffer.
+        // After a fatal record, a failed write included, nothing more is
+        // admitted: the join's checkpoint permit is refused under the
+        // buffer lock (see `InvocationCoordinator::acquire`), so the write
+        // is rejected before it joins the buffer. A join admitted before
+        // the record stays in the buffer and is written.
         let (batch, opened) = coalescer.join_owned(
             self.admission(),
             self.coordinator(),
@@ -2427,9 +2432,11 @@ impl DurableContext {
     ///   it returns the error `.spawn()` returns without a runtime (see
     ///   [`Self::checkpoint_failure_unrecoverable`]).
     /// - The admission check rejects the write, the checkpoint token was
-    ///   withdrawn, or a write failed, this one or an earlier one: nothing
-    ///   more is sent, and the returned future never resolves (see
-    ///   [`Admission`] and [`Self::record_write_failure`]).
+    ///   withdrawn, a fatal error was recorded before the caller took the
+    ///   write's checkpoint permit, or a write failed, this one or an
+    ///   earlier one: nothing more is sent, and the returned future never
+    ///   resolves (see [`Admission`], [`InvocationCoordinator::acquire`]
+    ///   and [`Self::record_write_failure`]).
     /// - The checkpoint client panics: the task gateway records the panic on
     ///   the coordinator, which ends the drive. The channel carries no
     ///   payload, so the caller stays pending until the drive's cleanup
@@ -2744,8 +2751,9 @@ impl DurableContext {
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
         let Some(permit) = self.inner.coordinator.acquire(PermitKind::Checkpoint) else {
-            // The phase left `Running`: the write is rejected, as a write
-            // from an abandoned owner is.
+            // The phase left `Running`, the checkpoint token was withdrawn,
+            // or a fatal error is recorded: the write is rejected, as a
+            // write from an abandoned owner is.
             return std::future::pending().await;
         };
         let result = self
@@ -8732,6 +8740,36 @@ mod write_order_tests {
             a.await.expect("A is written");
             b.await.expect("B is written");
             assert_eq!(ids(&client), ["A", "B"], "{window:?}");
+        }
+    }
+
+    /// A fatal record refuses a later update, and does not drop one that
+    /// was admitted before it: with no coalescer, a zero window and a 60 s
+    /// window, `A` is written and resolves, and `B` is never written and
+    /// never resolves.
+    #[tokio::test]
+    async fn fatal_record_keeps_admitted_writes() {
+        for window in [None, Some(Duration::ZERO), Some(Duration::from_secs(60))] {
+            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+            let ctx = context(&client, window);
+            let a = ctx.submit_checkpoint_updates(vec![start("A")]);
+            ctx.coordinator()
+                .record_fatal("Error".to_owned(), "boom".to_owned());
+            let b = ctx.submit_checkpoint_updates(vec![start("B")]);
+            ctx.flush_pending_checkpoints().await;
+            tokio::time::timeout(Duration::from_secs(2), a)
+                .await
+                .map_err(|_| format!("A does not resolve ({window:?})"))
+                .unwrap()
+                .expect("A is written");
+            assert_eq!(ids(&client), ["A"], "{window:?}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), b)
+                    .await
+                    .is_err(),
+                "a refused write never resolves ({window:?})"
+            );
+            assert_eq!(ids(&client), ["A"], "{window:?}");
         }
     }
 

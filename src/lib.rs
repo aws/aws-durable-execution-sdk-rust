@@ -81,7 +81,10 @@
 //!    closes, or until the invocation ends (see [`DurableFuture`]). An
 //!    operation claimed, spawned or awaited on a task or thread that does
 //!    not own the context, plugin hook work included, fails the execution
-//!    with a context usage error.
+//!    with a context usage error. No operation update whose checkpoint
+//!    admission is requested after the error is recorded is written, so an
+//!    operation whose next update is refused keeps the last state written,
+//!    which can be `STARTED`.
 //! 5. On suspension, the user future is dropped, so do not rely on `Drop`
 //!    ordering for correctness between durable operations. For example, a
 //!    guard that unlocks a resource in `Drop` runs the moment the execution

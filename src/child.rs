@@ -1244,7 +1244,9 @@ mod tests {
     /// their wire under `ActiveBody::Outcome`, so a wait that the error's
     /// `Display` calls on the captured child context fails the execution
     /// with a context usage error naming the operation. The `Display`
-    /// runs once.
+    /// runs once. That record precedes the operation's `FAIL`, so the
+    /// `FAIL` is refused, no terminal update is written, and the
+    /// operation never resolves.
     #[tokio::test]
     async fn failing_child_item_branch_display_calls_its_context() {
         use crate::builders::map_parallel::CompletionConfig;
@@ -1253,20 +1255,34 @@ mod tests {
             dc.sharing(move || drop(child.wait(Duration::from_secs(1))))
                 .boxed()
         };
+        let terminal = |client: &crate::client::InMemoryExecutionClient| -> Vec<String> {
+            client
+                .recorded_updates()
+                .into_iter()
+                .filter(|u| matches!(u.action(), OperationAction::Fail | OperationAction::Succeed))
+                .map(|u| u.name().unwrap_or("").to_owned())
+                .collect()
+        };
+        let unresolved = |what: &str| format!("the {what}'s FAIL is refused, so it never resolves");
 
         // A child.
-        let (ctx, _client) = uf_ctx(&UfHooks::default(), Vec::new());
+        let (ctx, client) = uf_ctx(&UfHooks::default(), Vec::new());
         let dc = Counted::new();
         let body_dc = dc.clone();
-        let err = ctx
+        let child = ctx
             .run_in_child_context(move |child| async move {
                 Err::<u32, crate::BoxError>(claims_wait(&body_dc, child))
             })
-            .name("c")
-            .await
-            .unwrap_err();
-        drop(err);
+            .name("c");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), child.into_future())
+                .await
+                .is_err(),
+            "{}",
+            unresolved("child")
+        );
         assert_eq!(dc.calls(), 1, "child");
+        assert_eq!(terminal(&client), Vec::<String>::new(), "child");
         let message = fatal_message(&ctx);
         assert!(
             message.contains("while the SDK records the outcome of operation \"1\""),
@@ -1274,7 +1290,7 @@ mod tests {
         );
 
         // A `map` item.
-        let (ctx, _client) = uf_ctx(&UfHooks::default(), Vec::new());
+        let (ctx, client) = uf_ctx(&UfHooks::default(), Vec::new());
         let dc = Counted::new();
         let body_dc = dc.clone();
         let batch = ctx
@@ -1284,10 +1300,16 @@ mod tests {
             })
             .name("m")
             .completion(CompletionConfig::with_tolerated_failure_count(1))
-            .await_batch()
-            .await;
-        drop(batch);
+            .await_batch();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), batch)
+                .await
+                .is_err(),
+            "{}",
+            unresolved("map item")
+        );
         assert_eq!(dc.calls(), 1, "map item");
+        assert_eq!(terminal(&client), Vec::<String>::new(), "map item");
         let message = fatal_message(&ctx);
         assert!(
             message.contains("while the SDK records the outcome of operation \"1-1\""),
@@ -1295,7 +1317,7 @@ mod tests {
         );
 
         // A `parallel` branch.
-        let (ctx, _client) = uf_ctx(&UfHooks::default(), Vec::new());
+        let (ctx, client) = uf_ctx(&UfHooks::default(), Vec::new());
         let dc = Counted::new();
         let body_dc = dc.clone();
         let branch = crate::Branch::new("b", move |child| async move {
@@ -1305,10 +1327,16 @@ mod tests {
             .parallel(vec![branch])
             .name("p")
             .completion(CompletionConfig::with_tolerated_failure_count(1))
-            .await_batch()
-            .await;
-        drop(batch);
+            .await_batch();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), batch)
+                .await
+                .is_err(),
+            "{}",
+            unresolved("parallel branch")
+        );
         assert_eq!(dc.calls(), 1, "parallel branch");
+        assert_eq!(terminal(&client), Vec::<String>::new(), "parallel branch");
         let message = fatal_message(&ctx);
         assert!(
             message.contains("while the SDK records the outcome of operation \"1-1\""),

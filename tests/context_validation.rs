@@ -13,8 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
+use durable::lambda_types::EventType;
 use durable::test_util::{CallbackReply, LocalRunner, TestResult};
-use durable::{Branch, DurableContext};
+use durable::{Branch, DurableContext, OperationStatus};
+use tokio::sync::Notify;
 
 /// Message A: an operation called on a context whose body is not running.
 fn message_a(method: &str, calling: &str, active: &str) -> String {
@@ -70,9 +72,37 @@ async fn parent_step_inside_child_body_fails() {
     assert_context_usage_failure(&result, &message_a("step", "root", "1"));
 }
 
-#[tokio::test]
-async fn context_used_inside_step_body_fails() {
-    let result = LocalRunner::new()
+/// The name and status of each recorded operation, in record order.
+fn operations<O>(result: &TestResult<O>) -> Vec<(&str, OperationStatus)> {
+    result
+        .operations()
+        .iter()
+        .map(|op| (op.name().unwrap_or(""), op.status()))
+        .collect()
+}
+
+/// The event types of the execution history, in order.
+fn event_types<O>(result: &TestResult<O>) -> Vec<EventType> {
+    result
+        .history_events()
+        .iter()
+        .filter_map(|event| event.event_type().cloned())
+        .collect()
+}
+
+/// The history of the cloned-context handler: `outer`'s `START` is
+/// written, and nothing requested after the context usage error is.
+const CLONED_CONTEXT_EVENTS: [EventType; 4] = [
+    EventType::ExecutionStarted,
+    EventType::StepStarted,
+    EventType::InvocationCompleted,
+    EventType::ExecutionFailed,
+];
+
+/// Runs the cloned-context handler: the body of step `outer` calls a step
+/// `inner` through a clone of the context.
+async fn run_cloned_context_handler(runner: LocalRunner) -> TestResult<u32> {
+    runner
         .run(
             |_event: (), ctx: DurableContext| async move {
                 let cloned = ctx.clone();
@@ -88,8 +118,103 @@ async fn context_used_inside_step_body_fails() {
             (),
         )
         .await
-        .expect("runner");
+        .expect("runner")
+}
+
+/// The context usage error closes checkpoint admission, so neither step
+/// writes an update after it: `outer` keeps its `START`, and `inner` has
+/// no record.
+#[tokio::test]
+async fn context_used_inside_step_body_fails() {
+    let result = run_cloned_context_handler(LocalRunner::new()).await;
     assert_context_usage_failure(&result, &message_b("step", "1"));
+    assert_eq!(operations(&result), [("outer", OperationStatus::Started)]);
+    assert_eq!(event_types(&result), CLONED_CONTEXT_EVENTS);
+}
+
+/// With a 60 s coalescing window, `outer`'s `START` waits in the buffer
+/// when the claim records the error. That admitted update is still
+/// written, and `inner`'s later `START` is not.
+#[tokio::test]
+async fn buffered_start_before_context_usage_error_is_written() {
+    let options = durable::Options::builder()
+        .checkpoint_delay(Duration::from_secs(60))
+        .build()
+        .expect("valid options");
+    let result = run_cloned_context_handler(LocalRunner::new().options(options)).await;
+    assert_context_usage_failure(&result, &message_b("step", "1"));
+    assert_eq!(operations(&result), [("outer", OperationStatus::Started)]);
+    assert_eq!(event_types(&result), CLONED_CONTEXT_EVENTS);
+}
+
+/// A context usage error in branch `a` refuses the outcome writes that
+/// branch `b`, `a` and the parallel request after it, so each keeps its
+/// `START`.
+#[tokio::test]
+async fn fatal_in_one_branch_refuses_the_other_branch_outcome() {
+    let slow_started = Arc::new(Notify::new());
+    let claimed = Arc::new(Notify::new());
+    let result = LocalRunner::new()
+        .run(
+            move |_event: (), ctx: DurableContext| {
+                let slow_started = Arc::clone(&slow_started);
+                let claimed = Arc::clone(&claimed);
+                async move {
+                    let parent = ctx.clone();
+                    let (a_started, a_claimed) = (Arc::clone(&slow_started), Arc::clone(&claimed));
+                    let branches: Vec<Branch<u32>> = vec![
+                        Branch::new("a", move |_child| async move {
+                            a_started.notified().await;
+                            drop(parent.step(|_| async { Ok(0_u32) }).name("p"));
+                            a_claimed.notify_one();
+                            Ok(1_u32)
+                        }),
+                        Branch::new("b", move |child| async move {
+                            child
+                                .step(move |_| {
+                                    let slow_started = Arc::clone(&slow_started);
+                                    let claimed = Arc::clone(&claimed);
+                                    async move {
+                                        slow_started.notify_one();
+                                        claimed.notified().await;
+                                        Ok(2_u32)
+                                    }
+                                })
+                                .name("slow")
+                                .await
+                                .map_err(Into::into)
+                        }),
+                    ];
+                    let values = ctx.parallel(branches).name("fan-out").await?;
+                    Ok::<_, durable::BoxError>(values)
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_context_usage_failure(&result, &message_a("step", "root", "1-1"));
+    assert_eq!(
+        operations(&result),
+        [
+            ("fan-out", OperationStatus::Started),
+            ("a", OperationStatus::Started),
+            ("b", OperationStatus::Started),
+            ("slow", OperationStatus::Started),
+        ]
+    );
+    assert_eq!(
+        event_types(&result),
+        [
+            EventType::ExecutionStarted,
+            EventType::ContextStarted,
+            EventType::ContextStarted,
+            EventType::ContextStarted,
+            EventType::StepStarted,
+            EventType::InvocationCompleted,
+            EventType::ExecutionFailed,
+        ]
+    );
 }
 
 /// A capture whose `Clone` implementation claims a durable operation.

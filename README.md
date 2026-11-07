@@ -358,7 +358,10 @@ body receives, exposes just `attempt()` and no operation methods, so calling a
 durable operation inside a step body fails to compile rather than failing at
 run time. A `DurableContext` clone that a step body, a `wait_for_condition`
 check, or a child body uses for an operation it does not own fails the
-execution on the first invocation with a context usage error.
+execution on the first invocation with a context usage error. The SDK writes
+no operation update whose checkpoint admission is requested after the error
+is recorded, so an operation whose next update is refused keeps the last
+state written, which can be `STARTED`.
 
 Use `ctx.race` or `ctx.select_ok` rather than `tokio::select!` over durable
 futures, so the SDK records which branch won. `tokio::join!` over SDK
@@ -1407,6 +1410,10 @@ body does not run again, and a deserialize failure of a recorded value
 returns an error to the handler. An error marked with
 `serdes::RetryableSerdesError` is transient: the SDK ends the Lambda
 invocation, records nothing, and the service invokes the function again.
+After the SDK observes such a failure, it writes no operation update whose
+checkpoint admission is requested later, so an operation that would have
+finished in that invocation, such as another branch of a `parallel`, runs
+again in the next one.
 The SDK finds the marker anywhere in the error's `source()` chain, and
 `FileSystemSerdes` marks the failures of its filesystem calls.
 
