@@ -1148,7 +1148,13 @@ impl Error for InvokeError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum InvokeErrorKind {
-    /// The invoked function returned an error.
+    /// The invoke's record ended `FAILED`, `TIMED_OUT`, `STOPPED` or
+    /// `CANCELLED`.
+    ///
+    /// The error's [`wire()`](crate::OperationError::wire) and its
+    /// [`ReplayedFailure`] source carry the record's error type, message,
+    /// data and stack trace. A record without a message, or with an empty
+    /// one, gives the message `Invoke failed`.
     #[non_exhaustive]
     FunctionFailed,
     /// A serialization or deserialization error occurred.

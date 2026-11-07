@@ -596,7 +596,7 @@ impl OptionsBuilder {
         }
         if self.sdk_config.is_some() && self.lambda_client.is_some() {
             return Err(OptionsValidationError {
-                message: "cannot set both `sdk_config` and `lambda_client` — \
+                message: "cannot set both `sdk_config` and `lambda_client`: \
                           the pre-built client supersedes the config; provide one or the other"
                     .to_owned(),
             });
@@ -690,15 +690,10 @@ mod tests {
             .sdk_config(dummy_sdk_config())
             .lambda_client(dummy_lambda_client())
             .build();
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("sdk_config"),
-            "Error should mention sdk_config: {err_msg}"
-        );
-        assert!(
-            err_msg.contains("lambda_client"),
-            "Error should mention lambda_client: {err_msg}"
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid Options configuration: cannot set both `sdk_config` and `lambda_client`: \
+             the pre-built client supersedes the config; provide one or the other"
         );
     }
 

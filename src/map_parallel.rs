@@ -4428,35 +4428,46 @@ fn oversized_batch_summary<O>(
         BatchStatus::Succeeded => "SUCCEEDED",
     };
     let parallel = parent_sub_type == PARALLEL_SUB_TYPE;
-    let mut summary = serde_json::Map::new();
-    let type_name = if parallel {
-        "ParallelResult"
-    } else {
-        "MapResult"
+    let summary = OversizedBatchSummary {
+        type_name: if parallel {
+            "ParallelResult"
+        } else {
+            "MapResult"
+        },
+        total_count: total,
+        success_count: succeeded,
+        failure_count: failed,
+        started_count: parallel.then(|| total - succeeded - failed),
+        completion_reason: result.reason.as_str(),
+        status,
+        item_statuses,
+        summary: caller_summary,
     };
-    summary.insert("type".to_owned(), type_name.into());
-    summary.insert("totalCount".to_owned(), total.into());
-    summary.insert("successCount".to_owned(), succeeded.into());
-    summary.insert("failureCount".to_owned(), failed.into());
-    if parallel {
-        summary.insert(
-            "startedCount".to_owned(),
-            (total - succeeded - failed).into(),
-        );
-    }
-    summary.insert("completionReason".to_owned(), result.reason.as_str().into());
-    summary.insert("status".to_owned(), status.into());
-    summary.insert("itemStatuses".to_owned(), item_statuses.into());
-    let mut text = serde_json::Value::Object(summary).to_string();
-    if let Some(caller_summary) = caller_summary {
-        // Appended to the text rather than inserted into the map, so the
-        // key is last whatever key order the map keeps.
-        text.pop();
-        text.push_str(",\"summary\":");
-        text.push_str(&serde_json::Value::from(caller_summary).to_string());
-        text.push('}');
-    }
-    text
+    #[expect(clippy::expect_used)]
+    // reason: the struct holds only JSON-native strings and integers, so serialization cannot fail
+    serde_json::to_string(&summary).expect("the oversized batch summary serializes to JSON")
+}
+
+/// The JS summary of an oversized batch, with its keys declared in the
+/// order JS writes them, so the text does not depend on whether
+/// `serde_json` keeps map insertion order.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OversizedBatchSummary<'a> {
+    #[serde(rename = "type")]
+    type_name: &'static str,
+    total_count: usize,
+    success_count: usize,
+    failure_count: usize,
+    /// Written for a parallel, omitted for a map.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_count: Option<usize>,
+    completion_reason: &'a str,
+    status: &'static str,
+    item_statuses: String,
+    /// The caller's summary, omitted when the caller supplied none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'a str>,
 }
 
 /// Parses a batch record text and converts it back into a `BatchResult`.
@@ -12033,6 +12044,35 @@ mod tests {
                 "status": "SUCCEEDED",
                 "itemStatuses": "SSS",
             })
+        );
+    }
+
+    /// The oversized summary text has JS's key order, whether or not the
+    /// build enables `serde_json`'s `preserve_order`.
+    #[test]
+    fn oversized_summary_text_has_js_key_order() {
+        let result = BatchResult::new(
+            vec![BatchItem::<u32>::new(
+                0,
+                "a".to_owned(),
+                BatchItemStatus::Succeeded,
+                Some(1),
+                None,
+                None,
+            )],
+            CompletionReason::AllCompleted,
+        );
+        assert_eq!(
+            oversized_batch_summary(&result, MAP_SUB_TYPE, None),
+            r#"{"type":"MapResult","totalCount":1,"successCount":1,"failureCount":0,"completionReason":"ALL_COMPLETED","status":"SUCCEEDED","itemStatuses":"S"}"#
+        );
+        assert_eq!(
+            oversized_batch_summary(&result, PARALLEL_SUB_TYPE, None),
+            r#"{"type":"ParallelResult","totalCount":1,"successCount":1,"failureCount":0,"startedCount":0,"completionReason":"ALL_COMPLETED","status":"SUCCEEDED","itemStatuses":"S"}"#
+        );
+        assert_eq!(
+            oversized_batch_summary(&result, MAP_SUB_TYPE, Some("ok")),
+            r#"{"type":"MapResult","totalCount":1,"successCount":1,"failureCount":0,"completionReason":"ALL_COMPLETED","status":"SUCCEEDED","itemStatuses":"S","summary":"ok"}"#
         );
     }
 

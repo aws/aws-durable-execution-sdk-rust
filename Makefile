@@ -17,7 +17,7 @@ CI_TARGETS = pins check-sdk msrv dependencies external-types feature-powerset wo
 WORKSPACES ?= conformance examples
 WORKSPACE_TARGETS = $(addprefix workspace-,$(WORKSPACES))
 
-.PHONY: check ci $(CI_TARGETS) $(WORKSPACE_TARGETS) \
+.PHONY: check ci $(CI_TARGETS) $(WORKSPACE_TARGETS) summary-order-consumer-test \
 	test-role conformance conformance-build conformance-run cloud-tests
 
 # The quality gate for every change: the check-sdk, dependencies and msrv
@@ -77,6 +77,13 @@ $(WORKSPACE_TARGETS): workspace-%:
 	. scripts/tools.sh && require cargo clippy
 	cd $* && cargo build --all-targets
 	cd $* && cargo clippy --all-targets -- -D warnings
+
+# The examples workspace builds serde_json without `preserve_order`, as a
+# consumer's build can, so its parallel_heterogeneous tests check that the
+# SDK's oversized batch summary keeps JS's key order without the feature.
+workspace-examples: summary-order-consumer-test
+summary-order-consumer-test:
+	cd examples && cargo test --locked -p parallel_heterogeneous
 
 # Targets that deploy to AWS. They need TEST_ACCOUNT_ID.
 test-role:

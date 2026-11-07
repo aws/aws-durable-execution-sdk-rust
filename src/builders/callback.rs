@@ -60,7 +60,7 @@ pub struct CreateCallbackBuilder<O, S = JsonSerdes> {
     op_id: OperationId,
     name: Option<String>,
     timeout: Option<Duration>,
-    heartbeat: Option<Duration>,
+    heartbeat_timeout: Option<Duration>,
     sub_type: Option<OperationSubType>,
     serdes: S,
     _marker: PhantomData<O>,
@@ -82,7 +82,7 @@ impl<O: Send + 'static> CreateCallbackBuilder<O> {
             op_id,
             name: None,
             timeout: None,
-            heartbeat: None,
+            heartbeat_timeout: None,
             sub_type: None,
             serdes: JsonSerdes,
             _marker: PhantomData,
@@ -103,9 +103,11 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
         self
     }
 
-    /// Sets the heartbeat interval for keep-alive signals.
-    pub fn heartbeat(mut self, interval: Duration) -> Self {
-        self.heartbeat = Some(interval);
+    /// Sets the heartbeat timeout. If the external system sends no
+    /// heartbeat before the timeout elapses, the callback times out with
+    /// [`CallbackErrorKind::HeartbeatTimedOut`](crate::CallbackErrorKind::HeartbeatTimedOut).
+    pub fn heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.heartbeat_timeout = Some(timeout);
         self
     }
 
@@ -170,7 +172,7 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
             op_id: self.op_id,
             name: self.name,
             timeout: self.timeout,
-            heartbeat: self.heartbeat,
+            heartbeat_timeout: self.heartbeat_timeout,
             sub_type: self.sub_type,
             serdes,
             _marker: PhantomData,
@@ -272,7 +274,7 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
             op_id: self.op_id,
             name: self.name,
             timeout: self.timeout,
-            heartbeat: self.heartbeat,
+            heartbeat: self.heartbeat_timeout,
             sub_type: self.sub_type.unwrap_or(OperationSubType::CALLBACK),
             plugin_name: None,
             serdes: self.serdes,
@@ -343,7 +345,7 @@ pub struct WaitForCallbackBuilder<O, F, Fut, S = JsonSerdes> {
     op_id: OperationId,
     name: Option<String>,
     timeout: Option<Duration>,
-    heartbeat: Option<Duration>,
+    heartbeat_timeout: Option<Duration>,
     submitter: F,
     submitter_retry: Option<RetryStrategy>,
     serdes: S,
@@ -373,7 +375,7 @@ where
             op_id,
             name: None,
             timeout: None,
-            heartbeat: None,
+            heartbeat_timeout: None,
             submitter,
             submitter_retry: None,
             serdes: JsonSerdes,
@@ -480,12 +482,11 @@ where
         self
     }
 
-    /// Sets the heartbeat interval for keep-alive signals.
-    ///
-    /// If the external system does not send heartbeats within this
-    /// interval, the callback times out.
-    pub fn heartbeat(mut self, interval: Duration) -> Self {
-        self.heartbeat = Some(interval);
+    /// Sets the heartbeat timeout. If the external system sends no
+    /// heartbeat before the timeout elapses, the callback times out with
+    /// [`CallbackErrorKind::HeartbeatTimedOut`](crate::CallbackErrorKind::HeartbeatTimedOut).
+    pub fn heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.heartbeat_timeout = Some(timeout);
         self
     }
 
@@ -557,7 +558,7 @@ where
             op_id: self.op_id,
             name: self.name,
             timeout: self.timeout,
-            heartbeat: self.heartbeat,
+            heartbeat_timeout: self.heartbeat_timeout,
             submitter: self.submitter,
             submitter_retry: self.submitter_retry,
             serdes,
@@ -668,7 +669,7 @@ where
             op_id: self.op_id,
             name: self.name,
             timeout: self.timeout,
-            heartbeat: self.heartbeat,
+            heartbeat: self.heartbeat_timeout,
             submitter: self.submitter,
             submitter_retry: self.submitter_retry,
             serdes: self.serdes,
@@ -715,6 +716,26 @@ mod tests {
             builder.sub_type.as_ref().map(OperationSubType::as_str),
             Some("Second")
         );
+    }
+
+    /// For both callback builders, a second `heartbeat_timeout` call
+    /// replaces the first, and `serdes` keeps the value.
+    #[test]
+    fn heartbeat_timeout_setter_replaces_and_survives_serdes() {
+        let ctx = DurableContext::test_context();
+        let create = ctx
+            .create_callback::<String>()
+            .heartbeat_timeout(Duration::from_secs(30))
+            .heartbeat_timeout(Duration::from_secs(90))
+            .serdes(crate::PassthroughSerdes);
+        assert_eq!(create.heartbeat_timeout, Some(Duration::from_secs(90)));
+
+        let wait = ctx
+            .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+            .heartbeat_timeout(Duration::from_secs(30))
+            .heartbeat_timeout(Duration::from_secs(90))
+            .serdes(crate::PassthroughSerdes);
+        assert_eq!(wait.heartbeat_timeout, Some(Duration::from_secs(90)));
     }
 
     /// The callback submitter retry setter likewise takes a bare closure.

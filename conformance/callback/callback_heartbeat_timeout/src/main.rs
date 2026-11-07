@@ -1,5 +1,5 @@
 //! Conformance handler for requirement 4-4: create callback with heartbeat timeout.
-//! No heartbeat is sent, so it times out on the heartbeat interval.
+//! No heartbeat is sent, so it times out on the heartbeat timeout.
 
 use aws_durable_execution_sdk as durable;
 use std::time::Duration;
@@ -10,7 +10,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let cb = ctx
             .create_callback::<String>()
             .name(&name)
-            .heartbeat(Duration::from_secs(5))
+            .heartbeat_timeout(Duration::from_secs(5))
             .await?;
         let result = cb.result().await?;
         Ok(result)

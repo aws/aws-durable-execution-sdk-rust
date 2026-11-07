@@ -530,9 +530,13 @@ let result = ctx
     .await?;
 ```
 
-`.retry_strategy_config(...)` takes a `RetryStrategyConfig` with the default
-backoff instead of a closure, and its builder's `retry_if(predicate)` retries
-only the errors for which the predicate returns `true`.
+A step without a strategy retries with `RetryStrategyConfig::default_preset()`,
+the JS `default` preset: 6 total attempts, a 5 second initial delay doubling
+up to 60 seconds, and full jitter. `.retry_strategy_config(...)` takes a
+`RetryStrategyConfig` instead of a closure. `RetryStrategyConfig::builder()`
+fills the fields it leaves unset as JS `createRetryStrategy` does, with 3
+attempts and a 300 second cap, and its `retry_if(predicate)` retries only the
+errors for which the predicate returns `true`.
 
 `StepSemantics::AtLeastOncePerRetry` is the default: the SDK re-executes the
 body on resume if the previous attempt started but recorded no outcome.
@@ -693,7 +697,7 @@ let raw: String = cb.result().await?;
 `wait_for_callback` records the raw payload as its result and applies the
 serdes after it, once per invocation that reads the result.
 
-Both builders take `.timeout(...)` and `.heartbeat(...)`.
+Both builders take `.timeout(...)` and `.heartbeat_timeout(...)`.
 `wait_for_callback` also takes `.submitter_retry(...)`, which retries the
 submitter with the same retry strategy shape a step uses.
 A submitter that fails after its retry strategy stops surfaces as
@@ -829,8 +833,9 @@ let receipt = ctx
 ```
 
 `.retry_strategy_config(...)` accepts a `RetryStrategyConfig` instead of a
-closure, and without either the step default applies (6 total attempts with
-exponential backoff). `RetryStrategyConfig::linear()` retries
+closure, and without either the step default applies,
+`RetryStrategyConfig::default_preset()` (6 total attempts with exponential
+backoff). `RetryStrategyConfig::linear()` retries
 with delays of 1 to 5 seconds and `RetryStrategyConfig::no_retry()` makes
 the first failure final, as the JS `linear` and `noRetry` presets do.
 

@@ -10,7 +10,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let result: String = ctx
             .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
             .name(&name)
-            .heartbeat(Duration::from_secs(10))
+            .heartbeat_timeout(Duration::from_secs(10))
             .await?;
         Ok(result)
     })

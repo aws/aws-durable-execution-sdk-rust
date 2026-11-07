@@ -67,7 +67,6 @@ where
             return recorded_outcome(
                 &self.ctx,
                 self.name.as_deref(),
-                &self.function_id,
                 &self.result_serdes,
                 &view,
                 &positional_id,
@@ -127,7 +126,6 @@ where
         resume(
             &self.ctx,
             self.name.as_deref(),
-            &self.function_id,
             &self.result_serdes,
             &positional_id,
             serdes_ctx,
@@ -143,7 +141,6 @@ where
 async fn resume<O, RS: Serdes<O>>(
     ctx: &DurableContext,
     name: Option<&str>,
-    function_id: &str,
     result_serdes: &RS,
     positional_id: &str,
     serdes_ctx: SerdesContext,
@@ -159,7 +156,6 @@ async fn resume<O, RS: Serdes<O>>(
     recorded_outcome(
         ctx,
         name,
-        function_id,
         result_serdes,
         &view,
         positional_id,
@@ -174,11 +170,9 @@ async fn resume<O, RS: Serdes<O>>(
 /// (`emit_replayed` false). A record that has not settled waits first.
 /// Emits the `operation_replayed` event for a terminal record when
 /// `emit_replayed`.
-#[expect(clippy::too_many_arguments)] // reason: the replay and resume paths share every input
 async fn recorded_outcome<O, RS: Serdes<O>>(
     ctx: &DurableContext,
     name: Option<&str>,
-    function_id: &str,
     result_serdes: &RS,
     view: &crate::engine::CheckpointStatusView,
     positional_id: &str,
@@ -229,9 +223,12 @@ async fn recorded_outcome<O, RS: Serdes<O>>(
             emit();
             Ok(value)
         }
-        CheckpointStatus::Failed | CheckpointStatus::TimedOut | CheckpointStatus::Stopped => {
+        CheckpointStatus::Failed
+        | CheckpointStatus::TimedOut
+        | CheckpointStatus::Stopped
+        | CheckpointStatus::Cancelled => {
             ended();
-            // Invoke failed: reconstruct InvokeError from details.
+            // Invoke did not succeed: reconstruct InvokeError from details.
             emit();
             let (error_type, error_message, error_data, stack_trace) = ctx
                 .with_checkpoint_record(positional_id, |record| {
@@ -244,7 +241,6 @@ async fn recorded_outcome<O, RS: Serdes<O>>(
                 })
                 .unwrap_or_default();
             Err(invoke_error_from_record(
-                function_id,
                 error_type,
                 error_message,
                 error_data,
@@ -261,26 +257,7 @@ async fn recorded_outcome<O, RS: Serdes<O>>(
                 let info = invoke_info(ctx, &wire_id, name).with_replay(true);
                 crate::plugin::operation_started(plugins, &info);
             }
-            Box::pin(resume(
-                ctx,
-                name,
-                function_id,
-                result_serdes,
-                positional_id,
-                serdes_ctx,
-            ))
-            .await
-        }
-        CheckpointStatus::Cancelled => {
-            ended();
-            emit();
-            Err(
-                OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::new(
-                    InvokeErrorKind::FunctionFailed,
-                    Some("invoke cancelled".into()),
-                )))
-                .with_operation(&wire_id, view.status.wire_str()),
-            )
+            Box::pin(resume(ctx, name, result_serdes, positional_id, serdes_ctx)).await
         }
         CheckpointStatus::Unknown(raw) => {
             // Unreachable in production: `checkpoint_view_validated` already
@@ -392,9 +369,9 @@ fn invoke_serialization_error(boundary: &str, e: crate::BoxError) -> OperationEr
 /// wire fields are preserved: `error_data` and `stack_trace` pass
 /// through verbatim (store-and-expose, never captured fresh on replay),
 /// so the record attached to the [`crate::error::ReplayedFailure`] is
-/// complete.
+/// complete. An absent or empty message becomes `Invoke failed`, as JS's
+/// `toInvokeError` does.
 fn invoke_error_from_record(
-    function_id: &str,
     error_type: Option<String>,
     error_message: Option<String>,
     error_data: Option<String>,
@@ -402,7 +379,9 @@ fn invoke_error_from_record(
     wire_id: &str,
     status: &str,
 ) -> OperationError {
-    let message = error_message.unwrap_or_else(|| format!("invoked function {function_id} failed"));
+    let message = error_message
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "Invoke failed".to_owned());
     let wire = crate::error::WireError::new(error_type, Some(message))
         .with_error_data(error_data)
         .with_stack_trace(stack_trace.unwrap_or_default());
@@ -538,14 +517,19 @@ mod tests {
         }
     }
 
-    /// A `CANCELLED` invoke record returns its error and fires one end
-    /// hook, with status `Cancelled` and `is_replay` true.
-    #[tokio::test]
-    async fn cancelled_invoke_record_fires_end() {
+    /// A terminal invoke record at ID `1` with the given status and error
+    /// fields.
+    fn terminal_invoke_record(
+        status: CheckpointStatus,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        error_data: Option<&str>,
+        stack_trace: Option<Vec<String>>,
+    ) -> (String, CheckpointRecord) {
         let wire_key = crate::engine::compute_wire_id_public("1");
         let record = CheckpointRecord {
             id: wire_key.clone(),
-            status: CheckpointStatus::Cancelled,
+            status,
             result: None,
             error_type: None,
             error_message: None,
@@ -553,10 +537,10 @@ mod tests {
             stack_trace: None,
             attempt: 0,
             invoke_result: None,
-            invoke_error_type: None,
-            invoke_error_message: None,
-            invoke_error_data: None,
-            invoke_stack_trace: None,
+            invoke_error_type: error_type.map(str::to_owned),
+            invoke_error_message: error_message.map(str::to_owned),
+            invoke_error_data: error_data.map(str::to_owned),
+            invoke_stack_trace: stack_trace,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -567,11 +551,19 @@ mod tests {
             start_timestamp: None,
             end_timestamp: None,
         };
+        (wire_key, record)
+    }
+
+    /// Replays the invoke `call` over `record`, and returns its error and
+    /// the plugin hooks it fired.
+    async fn replay_failed_invoke(
+        record: (String, CheckpointRecord),
+    ) -> (OperationError, crate::plugin::test_support::OpHooks) {
         let hooks = crate::plugin::test_support::OpHooks::default();
         let ctx = DurableContext::new_root_with_client_and_defaults(
             "arn:test".to_owned(),
             lambda_runtime::Context::default(),
-            Arc::new(CheckpointLog::from_records(vec![(wire_key, record)])),
+            Arc::new(CheckpointLog::from_records(vec![record])),
             Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
             "token0".to_owned(),
             None,
@@ -582,21 +574,96 @@ mod tests {
             .invoke::<u32, _>("target", 1_u32)
             .name("call")
             .await
-            .unwrap_err();
+            .expect_err("the record did not succeed");
+        (err, hooks)
+    }
+
+    /// Asserts that `err` is an `Invoke(FunctionFailed)` whose `wire()` and
+    /// `ReplayedFailure` source both equal `expected`.
+    pub(super) fn assert_invoke_failure(err: &OperationError, expected: &crate::error::WireError) {
         assert!(
-            matches!(err.kind(), OperationErrorKind::Invoke(_)),
-            "{:?}",
-            err.kind()
+            matches!(
+                err.kind(),
+                OperationErrorKind::Invoke(e) if matches!(e.kind(), InvokeErrorKind::FunctionFailed)
+            ),
+            "{err:?}"
         );
-        let shapes: Vec<_> = hooks
-            .records()
-            .iter()
-            .map(|r| (r.hook, r.replay, r.status))
-            .collect();
-        assert_eq!(
-            shapes,
-            [("end", true, Some(crate::OperationStatus::Cancelled))]
-        );
+        assert_eq!(err.wire(), Some(expected), "{err:?}");
+        let replayed = std::error::Error::source(err)
+            .and_then(std::error::Error::source)
+            .and_then(|e| e.downcast_ref::<crate::error::ReplayedFailure>())
+            .expect("the invoke error's source is a ReplayedFailure");
+        assert_eq!(replayed.wire(), expected);
+    }
+
+    /// Replayed `FAILED` records with an absent and an empty message read
+    /// `Invoke failed` and keep their recorded error type.
+    #[tokio::test]
+    async fn invoke_failure_without_message_reads_invoke_failed() {
+        for message in [None, Some("")] {
+            let (err, _hooks) = replay_failed_invoke(terminal_invoke_record(
+                CheckpointStatus::Failed,
+                Some("TargetError"),
+                message,
+                None,
+                None,
+            ))
+            .await;
+            assert_eq!(
+                err.wire().and_then(crate::error::WireError::error_message),
+                Some("Invoke failed"),
+                "{message:?}"
+            );
+            assert_eq!(
+                err.wire().and_then(crate::error::WireError::error_type),
+                Some("TargetError"),
+                "{message:?}"
+            );
+            assert_invoke_failure(
+                &err,
+                &crate::error::WireError::new(Some("TargetError"), Some("Invoke failed")),
+            );
+        }
+    }
+
+    /// A `CANCELLED` invoke record returns the error it records, through
+    /// `wire()` and the `ReplayedFailure` source, falls back to
+    /// `Invoke failed` without a message, and fires one end hook, with
+    /// status `Cancelled` and `is_replay` true.
+    #[tokio::test]
+    async fn cancelled_invoke_record_fires_end() {
+        let stack = vec!["at target".to_owned(), "at caller".to_owned()];
+        let cases = [
+            (
+                terminal_invoke_record(
+                    CheckpointStatus::Cancelled,
+                    Some("Cancelled"),
+                    Some("stopped by operator"),
+                    Some(r#"{"why":"manual"}"#),
+                    Some(stack.clone()),
+                ),
+                crate::error::WireError::new(Some("Cancelled"), Some("stopped by operator"))
+                    .with_error_data(Some(r#"{"why":"manual"}"#))
+                    .with_stack_trace(stack.clone()),
+            ),
+            (
+                terminal_invoke_record(CheckpointStatus::Cancelled, None, None, None, None),
+                crate::error::WireError::new(None::<&str>, Some("Invoke failed")),
+            ),
+        ];
+        for (record, expected) in cases {
+            let (err, hooks) = replay_failed_invoke(record).await;
+            assert_invoke_failure(&err, &expected);
+            let shapes: Vec<_> = hooks
+                .records()
+                .iter()
+                .map(|r| (r.hook, r.replay, r.status))
+                .collect();
+            assert_eq!(
+                shapes,
+                [("end", true, Some(crate::OperationStatus::Cancelled))]
+            );
+        }
     }
 
     #[tokio::test]
@@ -1769,7 +1836,9 @@ mod refresh_tests {
     use crate::driver::test_support::{
         RefreshClient, drive_handler, named, operation_like, wire_err,
     };
-    use aws_sdk_lambda::types::{ChainedInvokeDetails, OperationAction, OperationStatus};
+    use aws_sdk_lambda::types::{
+        ChainedInvokeDetails, ErrorObject, OperationAction, OperationStatus,
+    };
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1829,5 +1898,98 @@ mod refresh_tests {
                 ("end", false, Some(crate::OperationStatus::Succeeded)),
             ]
         );
+    }
+
+    /// An invoke that a refresh moves to `CANCELLED`, while a step sleeps
+    /// 3 s beside it, returns the record's error, with `Invoke failed` for a
+    /// record without a message, and fires its start and end hooks live,
+    /// once each.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_invoke_refresh_uses_error_and_fires_live_end() {
+        let stack = vec!["at target".to_owned()];
+        let full = ErrorObject::builder()
+            .error_type("Cancelled")
+            .error_message("stopped by operator")
+            .error_data(r#"{"why":"manual"}"#)
+            .set_stack_trace(Some(stack.clone()))
+            .build();
+        let cases = [
+            (
+                Some(full),
+                crate::error::WireError::new(Some("Cancelled"), Some("stopped by operator"))
+                    .with_error_data(Some(r#"{"why":"manual"}"#))
+                    .with_stack_trace(stack.clone()),
+            ),
+            (
+                None,
+                crate::error::WireError::new(None::<&str>, Some("Invoke failed")),
+            ),
+        ];
+        for (error, expected) in cases {
+            let client = Arc::new(RefreshClient::new(move |req| {
+                if req.empty_number == 1
+                    && let Some(start) = named(req.history, "inv", &OperationAction::Start)
+                {
+                    let details = ChainedInvokeDetails::builder()
+                        .set_error(error.clone())
+                        .build();
+                    let record = operation_like(start, OperationStatus::Cancelled)
+                        .chained_invoke_details(details)
+                        .build()
+                        .expect("all required fields set");
+                    return Ok(vec![record]);
+                }
+                Ok(Vec::new())
+            }));
+            let hooks = crate::plugin::test_support::OpHooks::default();
+            let ctx = crate::DurableContext::new_root_with_client_and_defaults(
+                "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(crate::engine::CheckpointLog::empty()),
+                Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+                "t0".to_owned(),
+                None,
+                0,
+                Some(hooks.plugins()),
+            );
+            let seen = Arc::new(std::sync::Mutex::new(None));
+            let handler_seen = Arc::clone(&seen);
+            let outcome = drive_handler(ctx, None, move |ctx| async move {
+                let invoke = ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn();
+                let step = ctx
+                    .step(|_| async {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        Ok(1_u32)
+                    })
+                    .name("s")
+                    .spawn();
+                let (invoke, step) = tokio::join!(invoke, step);
+                step.map_err(wire_err)?;
+                *handler_seen.lock().expect("lock") = Some(invoke);
+                Ok("done".to_owned())
+            })
+            .await
+            .expect("no panic");
+            assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+            let err = seen
+                .lock()
+                .expect("lock")
+                .take()
+                .expect("the handler finished")
+                .expect_err("the invoke was cancelled");
+            super::tests::assert_invoke_failure(&err, &expected);
+            let shapes: Vec<_> = hooks
+                .of("inv")
+                .iter()
+                .map(|r| (r.hook, r.replay, r.status))
+                .collect();
+            assert_eq!(
+                shapes,
+                [
+                    ("start", false, Some(crate::OperationStatus::Started)),
+                    ("end", false, Some(crate::OperationStatus::Cancelled)),
+                ]
+            );
+        }
     }
 }

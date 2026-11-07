@@ -21,10 +21,20 @@ use crate::{OperationKind, OperationStatus};
 #[cfg(doc)]
 use super::LocalRunner;
 
-/// The `Unsupported` text of a live control under
+/// The `Unsupported` text of `wait_for_data` under
 /// [`InvocationType::RequestResponse`].
-pub(super) const REQUEST_RESPONSE_UNSUPPORTED: &str =
-    "wait_for_data with InvocationType::RequestResponse; use InvocationType::Event";
+pub(super) const WAIT_FOR_DATA_REQUEST_RESPONSE_UNSUPPORTED: &str =
+    "wait_for_data with InvocationType::RequestResponse (use InvocationType::Event)";
+
+/// The `Unsupported` text of `send_callback` under
+/// [`InvocationType::RequestResponse`].
+pub(super) const SEND_CALLBACK_REQUEST_RESPONSE_UNSUPPORTED: &str =
+    "send_callback with InvocationType::RequestResponse (use InvocationType::Event)";
+
+/// The `Unsupported` text of `send_callback_heartbeat` under
+/// [`InvocationType::RequestResponse`].
+pub(super) const SEND_CALLBACK_HEARTBEAT_REQUEST_RESPONSE_UNSUPPORTED: &str =
+    "send_callback_heartbeat with InvocationType::RequestResponse (use InvocationType::Event)";
 
 /// The `Unsupported` text of a timeout reply under [`CloudRunner`].
 pub(super) const CLOUD_TIMEOUT_REPLY_UNSUPPORTED: &str =
@@ -1475,7 +1485,9 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
     ) -> Result<TestOperation, TestRunnerError> {
         core.check_failure()?;
         if self.invocation_type == InvocationType::RequestResponse {
-            return Err(TestRunnerError::Unsupported(REQUEST_RESPONSE_UNSUPPORTED));
+            return Err(TestRunnerError::Unsupported(
+                WAIT_FOR_DATA_REQUEST_RESPONSE_UNSUPPORTED,
+            ));
         }
         let registration = Registration::new(core, ControlKind::Cloud);
         let (api, execution_arn) = self.until_target(&registration).await?;
@@ -1514,7 +1526,9 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
     ) -> Result<(), TestRunnerError> {
         core.check_failure()?;
         if self.invocation_type == InvocationType::RequestResponse {
-            return Err(TestRunnerError::Unsupported(REQUEST_RESPONSE_UNSUPPORTED));
+            return Err(TestRunnerError::Unsupported(
+                SEND_CALLBACK_REQUEST_RESPONSE_UNSUPPORTED,
+            ));
         }
         let call = match reply.kind {
             CallbackReplyKind::Success(payload) => CallbackCall::Success(payload),
@@ -1561,7 +1575,9 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
     ) -> Result<(), TestRunnerError> {
         core.check_failure()?;
         if self.invocation_type == InvocationType::RequestResponse {
-            return Err(TestRunnerError::Unsupported(REQUEST_RESPONSE_UNSUPPORTED));
+            return Err(TestRunnerError::Unsupported(
+                SEND_CALLBACK_HEARTBEAT_REQUEST_RESPONSE_UNSUPPORTED,
+            ));
         }
         let registration = Registration::new(core, ControlKind::Cloud);
         let (api, ops) = self.control_operations(&registration).await?;

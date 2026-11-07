@@ -94,7 +94,7 @@ fn backoff_built_outside_the_crate() {
 }
 
 /// A partial exponential builder fills the JS `createRetryStrategy` values,
-/// and `default()` keeps the step default.
+/// and `default_preset()` keeps the step default.
 #[test]
 fn partial_builder_fills_js_values() {
     let config = builders::RetryStrategyConfig::builder()
@@ -108,7 +108,7 @@ fn partial_builder_fills_js_values() {
     );
     assert_eq!(config.jitter(), JitterStrategy::Full);
 
-    let default = builders::RetryStrategyConfig::default();
+    let default = builders::RetryStrategyConfig::default_preset();
     assert_eq!(default.max_attempts(), 6);
     assert_eq!(default.max_delay(), Duration::from_secs(60));
 }

@@ -24,14 +24,15 @@ use crate::start::StartStep;
 use crate::tracing_layer;
 use crate::{BoxError, OperationSubType, RetryDecision, RetryStrategy, Serdes};
 
-/// The default retry strategy: 6 total attempts, 5s initial delay, 60s max
-/// delay, 2x backoff rate, FULL jitter.
+/// The default retry strategy of a step, a `with_retry` block and a
+/// `wait_for_callback` submitter: 6 total attempts, 5s initial delay, 60s
+/// max delay, 2x backoff rate, FULL jitter.
 ///
-/// Matches the standard `ExponentialBackoff` defaults. The constants live in
-/// [`RetryStrategyConfig::default`]; this is one call so they are defined in
-/// exactly one place.
+/// The constants live in [`RetryStrategyConfig::default_preset`], the JS
+/// `default` preset; this is one call so they are defined in exactly one
+/// place.
 pub(crate) fn default_retry_strategy() -> RetryStrategy {
-    RetryStrategyConfig::default().into_retry_strategy()
+    RetryStrategyConfig::default_preset().into_retry_strategy()
 }
 
 impl RetryStrategyConfig {
@@ -3187,7 +3188,7 @@ mod tests {
         assert_eq!(config.decide(&sample_error(), 7), RetryDecision::Stop);
     }
 
-    /// `default_retry_strategy` agrees with `RetryStrategyConfig::default`
+    /// `default_retry_strategy` agrees with `RetryStrategyConfig::default_preset`
     /// attempt by attempt, modulo jitter: it stops at exactly the same
     /// attempts, and each retry delay falls within the full-jitter envelope
     /// `[1, base]` where `base` is the no-jitter delay for that attempt.

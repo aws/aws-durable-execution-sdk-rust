@@ -3899,6 +3899,58 @@ mod coordinator_tests {
         })
     }
 
+    /// A heartbeat timeout of 90 seconds reaches `heartbeat_timeout_seconds`
+    /// on the `START` of a live `create_callback` and on the inner callback
+    /// `START` of a live `wait_for_callback`.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_timeout_reaches_the_start() {
+        let client = Arc::new(submitter_completing(succeeded));
+        let ctx = scripted_ctx(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let value = ctx
+                .wait_for_callback::<String, _, _>(|_step, _callback_id| async { Ok(()) })
+                .name("w")
+                .heartbeat_timeout(std::time::Duration::from_secs(90))
+                .await
+                .map_err(wire_err)?;
+            ctx.create_callback::<String>()
+                .name("cb")
+                .heartbeat_timeout(std::time::Duration::from_secs(90))
+                .await
+                .map_err(wire_err)?;
+            Ok(value)
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("ok".to_owned()));
+
+        let updates = client.updates();
+        let outer = named(&updates, "w", &OperationAction::Start)
+            .expect("the wait_for_callback started")
+            .id()
+            .to_owned();
+        let inner = updates
+            .iter()
+            .find(|u| {
+                u.r#type() == &OperationType::Callback
+                    && u.action() == &OperationAction::Start
+                    && u.parent_id() == Some(outer.as_str())
+            })
+            .expect("the inner callback started");
+        let created =
+            named(&updates, "cb", &OperationAction::Start).expect("the create_callback started");
+        for start in [inner, created] {
+            assert_eq!(start.r#type(), &OperationType::Callback, "{start:?}");
+            assert_eq!(
+                start
+                    .callback_options()
+                    .map(aws_sdk_lambda::types::CallbackOptions::heartbeat_timeout_seconds),
+                Some(90),
+                "{start:?}"
+            );
+        }
+    }
+
     /// The active body that a closure saw, in `Debug` form.
     type Seen = Arc<std::sync::Mutex<Option<String>>>;
 

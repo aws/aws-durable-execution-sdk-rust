@@ -8531,7 +8531,7 @@ mod tests {
                     let cb = ctx
                         .create_callback::<u32>()
                         .name("cb")
-                        .heartbeat(std::time::Duration::from_secs(60))
+                        .heartbeat_timeout(std::time::Duration::from_secs(60))
                         .await?;
                     let Err(err) = cb.result().await else {
                         return Err::<bool, BoxError>("callback succeeded".into());
@@ -17150,7 +17150,7 @@ mod tests {
                             .create_callback::<u32>()
                             .name("cb")
                             .timeout(std::time::Duration::from_secs(60))
-                            .heartbeat(std::time::Duration::from_secs(10))
+                            .heartbeat_timeout(std::time::Duration::from_secs(10))
                             .await?;
                         Ok::<_, BoxError>(cb.result().await?)
                     },
@@ -18914,7 +18914,7 @@ mod tests {
                 let h = ctx
                     .create_callback::<u32>()
                     .name("h")
-                    .heartbeat(std::time::Duration::from_secs(60))
+                    .heartbeat_timeout(std::time::Duration::from_secs(60))
                     .await?;
                 let n = ctx.create_callback::<u32>().name("n").await?;
                 Ok::<_, BoxError>(h.result().await? + n.result().await?)
@@ -18951,7 +18951,7 @@ mod tests {
                 let h = ctx
                     .create_callback::<u32>()
                     .name("h")
-                    .heartbeat(std::time::Duration::from_secs(60))
+                    .heartbeat_timeout(std::time::Duration::from_secs(60))
                     .await?;
                 Ok::<_, BoxError>(h.result().await?)
             },
@@ -19649,32 +19649,45 @@ mod tests {
         let api = fake_with_history(callback_started_history());
         let run = CloudRunner::new("f").run_with::<_, u32>(Arc::clone(&api), Vec::new());
         let approval = run.operation("approval");
-        let errors = [
-            approval
-                .wait_for_data(WaitingStatus::Started)
-                .await
-                .expect_err("wait_for_data"),
-            approval
-                .send_callback(CallbackReply::raw("1"))
-                .await
-                .expect_err("send_callback"),
-            approval
-                .send_callback_heartbeat()
-                .await
-                .expect_err("heartbeat"),
-        ];
-        for err in errors {
-            assert!(
-                matches!(
-                    err,
-                    TestRunnerError::Unsupported(
-                        "wait_for_data with InvocationType::RequestResponse; use \
-                         InvocationType::Event"
-                    )
-                ),
-                "{err:?}"
-            );
-        }
+        let wait = approval
+            .wait_for_data(WaitingStatus::Started)
+            .await
+            .expect_err("wait_for_data");
+        let send = approval
+            .send_callback(CallbackReply::raw("1"))
+            .await
+            .expect_err("send_callback");
+        let heartbeat = approval
+            .send_callback_heartbeat()
+            .await
+            .expect_err("heartbeat");
+        let unsupported = |err: &TestRunnerError| match err {
+            TestRunnerError::Unsupported(text) => Some(*text),
+            _ => None,
+        };
+        assert_eq!(
+            unsupported(&wait),
+            Some("wait_for_data with InvocationType::RequestResponse (use InvocationType::Event)"),
+            "{wait:?}"
+        );
+        assert_eq!(
+            unsupported(&send),
+            Some("send_callback with InvocationType::RequestResponse (use InvocationType::Event)"),
+            "{send:?}"
+        );
+        assert_eq!(
+            unsupported(&heartbeat),
+            Some(
+                "send_callback_heartbeat with InvocationType::RequestResponse \
+                 (use InvocationType::Event)"
+            ),
+            "{heartbeat:?}"
+        );
+        assert_eq!(
+            send.to_string(),
+            "durable: test runner: send_callback with InvocationType::RequestResponse \
+             (use InvocationType::Event) is not supported by this runner"
+        );
         assert_eq!(api.calls(), Vec::<FakeCall>::new());
         drop(run);
     }
@@ -20952,7 +20965,7 @@ mod tests {
     async fn heartbeat_callback_then_wait((): (), ctx: DurableContext) -> Result<u32, BoxError> {
         ctx.create_callback::<u32>()
             .name("c")
-            .heartbeat(std::time::Duration::from_secs(60))
+            .heartbeat_timeout(std::time::Duration::from_secs(60))
             .await?;
         ctx.wait(std::time::Duration::from_secs(3600))
             .name("w")
@@ -21255,7 +21268,7 @@ mod tests {
     async fn callback_then_oversized((): (), ctx: DurableContext) -> Result<String, BoxError> {
         ctx.create_callback::<u32>()
             .name("c")
-            .heartbeat(std::time::Duration::from_secs(60))
+            .heartbeat_timeout(std::time::Duration::from_secs(60))
             .await?;
         Ok("a".repeat(crate::LAMBDA_RESPONSE_SIZE_LIMIT - 1))
     }
