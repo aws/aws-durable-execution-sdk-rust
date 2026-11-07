@@ -242,9 +242,9 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Installs the default Lambda subscriber with replayed records suppressed.
 ///
-/// The subscriber has the settings of
-/// `lambda_runtime::tracing::init_default_subscriber`, and its `fmt` layer is
-/// filtered by [`ReplayFilterLayer`]. So a record between operations is
+/// The level, the `RUST_LOG` directives and the choice of format follow
+/// `lambda_runtime::tracing::init_default_subscriber`, and the `fmt` layer
+/// is filtered by [`ReplayFilterLayer`]. So a record between operations is
 /// written once per execution, not again on every replay. The level and
 /// the `RUST_LOG` directives decide which records are written. The SDK's
 /// replay-tracking spans stay enabled whatever they say, so suppression
@@ -253,8 +253,19 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// The level comes from `AWS_LAMBDA_LOG_LEVEL`, else `RUST_LOG`, else
 /// `INFO`. A level that does not parse falls back to `INFO`. The subscriber
 /// writes JSON when `AWS_LAMBDA_LOG_FORMAT` is `json` in any case, and text
-/// otherwise. It writes to stdout: this function is
+/// without the time otherwise. It writes to stdout: this function is
 /// [`init_default_subscriber_with_writer`]`(std::io::stdout)`.
+///
+/// The JSON record is the SDK's own, not `lambda_runtime`'s. Each record is
+/// one JSON object on one line, with its keys at the top level in the order
+/// the JavaScript SDK writes them: `requestId`, `timestamp`, `level`,
+/// `executionArn`, `tenantId`, `operationId`, `operationName`, `attempt`,
+/// the record's other fields, then `message`. A correlation key comes from
+/// the event, else from the nearest SDK span that carries it, and a key
+/// without a value is left out. `timestamp` is the UTC time as
+/// `YYYY-MM-DDTHH:MM:SS.sssZ`, `level` is the record's level, and `message`
+/// is the event's message, or `""`. `isReplay` is not written. See
+/// [`observability`] for the record of a step body.
 ///
 /// The SDK never installs a subscriber implicitly. [`run`], [`wrap`] and
 /// `LocalRunner` install none; only a call to this function or to
@@ -292,8 +303,9 @@ pub fn init_default_subscriber() -> Result<(), BoxError> {
 /// This mirrors `lambda_runtime::tracing::init_default_subscriber_with_writer`,
 /// whose documentation recommends a non-blocking writer for high-throughput
 /// functions, because a write to stdout can briefly block the runtime. It
-/// reads the level and the format exactly as [`init_default_subscriber`]
-/// does, and its `fmt` layer is filtered by [`ReplayFilterLayer`].
+/// reads the level, the directives and the format exactly as
+/// [`init_default_subscriber`] does, writes the same JSON record, and its
+/// `fmt` layer is filtered by [`ReplayFilterLayer`].
 ///
 /// The SDK never installs a subscriber implicitly. [`run`], [`wrap`] and
 /// `LocalRunner` install none; only a call to this function or to

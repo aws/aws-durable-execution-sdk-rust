@@ -387,9 +387,11 @@ compares this with the JavaScript SDK's replay-aware logger.
 `durable::init_default_subscriber_with_writer(writer)` does the same with
 another writer, such as a non-blocking one.
 
-Each record carries correlation fields from the SDK's spans. Every record
-has `executionArn`, `requestId`, `isReplay` and, when the invocation has
-one, `tenantId`. A record inside a child context body, a map item or a
+Each record carries correlation fields from the SDK's spans. A record
+emitted during an invocation, inside the SDK's `durable_execution` span,
+has `executionArn`, `requestId` and, when the invocation has one,
+`tenantId`. A record emitted outside every SDK span, such as one that
+`main` writes before it calls `durable::run`, has none of these fields. A record inside a child context body, a map item or a
 parallel branch also has the child operation's `operationId` and, when the
 operation has a recorded name, `operationName`. A map item or parallel
 branch without a caller-given name has its generated name, such as
@@ -398,8 +400,33 @@ branch without a caller-given name has its generated name, such as
 condition operation, plus `attempt`. The `observability` module lists
 which span carries which field.
 
+With `AWS_LAMBDA_LOG_FORMAT=json`, the helper writes each record as one
+JSON object on one line, with every field at the top level. The record of
+`tracing::info!(order = 5_u32, "in-step")` in a step named `fetch` is
+(line breaks added):
+
+```json
+{"requestId":"<request ID>","timestamp":"2026-11-07T14:48:46.335Z","level":"INFO",
+ "executionArn":"<execution ARN>","operationId":"<the step's operation ID>",
+ "operationName":"fetch","attempt":1,"order":5,"message":"in-step"}
+```
+
+The correlation fields `requestId`, `executionArn`, `tenantId`,
+`operationId`, `operationName` and `attempt` take the event's own value,
+else the value of the nearest SDK span that carries them, and a field
+without a value is left out. They come in the order the JavaScript SDK
+writes them, with `timestamp` after `requestId` and `level` after
+`timestamp`. The other fields of the event and its spans, such as `order`
+here or a plugin span's `trace_id`, follow them, and `message` comes last.
+`timestamp` is the UTC time to the millisecond, which Lambda's log-level
+filtering needs to read `level`. `message` is `""` for an event without
+one. The record does not write `isReplay`.
+
 A custom subscriber keeps the suppression by adding `ReplayFilterLayer` as
-the filter of its `fmt` layer. The filter implements the `Filter` trait of
+the filter of its `fmt` layer. The filter only decides which records are
+written, so the record keeps its formatter's shape: the stock
+`fmt::layer().json()` below writes the event's fields under `fields` and
+the span fields under `span` and `spans`. The filter implements the `Filter` trait of
 `tracing-subscriber`, which `lambda_runtime` re-exports as
 `lambda_runtime::tracing::subscriber`, so no extra dependency is needed.
 The `ReplayFilterLayer` rustdoc shows how to keep the records of one target

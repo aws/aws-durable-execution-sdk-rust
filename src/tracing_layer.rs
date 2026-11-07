@@ -23,14 +23,22 @@
 //!   and each `wait_for_condition` check, carrying the full structured-log
 //!   field contract below.
 //!
-//! When these spans are rendered by a JSON subscriber (e.g.,
-//! `lambda_runtime`'s `init_default_subscriber()` with
-//! `AWS_LAMBDA_LOG_FORMAT=JSON`), the fields appear as top-level JSON keys:
-//! matching the `CloudWatch` Logs Insights query:
+//! The JSON record of [`crate::init_default_subscriber`] and
+//! [`crate::init_default_subscriber_with_writer`] writes the correlation
+//! fields `requestId`, `executionArn`, `tenantId`, `operationId`,
+//! `operationName` and `attempt` as top-level keys. Each comes from the
+//! event, else from the nearest SDK span that carries it. The record also
+//! writes `timestamp`, `level`, the other fields, and `message` last, and
+//! omits `isReplay`. So the `CloudWatch` Logs Insights query below matches
+//! it:
 //!
 //! ```text
 //! filter coalesce(durableExecutionArn, executionArn) like "<arn>"
 //! ```
+//!
+//! `lambda_runtime`'s own subscriber and a stock `fmt::layer().json()`
+//! write the event's fields under `fields` and the span fields under `span`
+//! and `spans`, so the correlation fields are not top-level keys there.
 //!
 //! # Structured-log field contract
 //!
@@ -62,7 +70,8 @@ use std::str::FromStr as _;
 use lambda_runtime::tracing::subscriber;
 use subscriber::Layer as _;
 use subscriber::filter::{EnvFilter, LevelFilter};
-use subscriber::fmt::MakeWriter;
+use subscriber::fmt::format::{FormatEvent, FormatFields as _, JsonFields, Writer};
+use subscriber::fmt::{FmtContext, FormattedFields, MakeWriter};
 use subscriber::layer::SubscriberExt as _;
 use tracing::Id;
 use tracing::span::Attributes;
@@ -596,6 +605,12 @@ impl ReplayTracker {
 /// own layer to keep each record between operations written once per
 /// execution.
 ///
+/// The filter only decides which records are written. A custom subscriber
+/// keeps its formatter's record shape: a stock `fmt::layer().json()`, as
+/// below, writes the event's fields under `fields` and the span fields
+/// under `span` and `spans`, not the top-level record of
+/// [`crate::init_default_subscriber`].
+///
 /// # Usage
 ///
 /// The filter implements the `Filter` trait of `tracing-subscriber`, which
@@ -946,8 +961,11 @@ where
 ///    `level` that does not parse as a level filter falls back to `INFO`.
 ///    The caller passes the value of `RUST_LOG`, which is what
 ///    `from_env_lossy` would read.
-/// 2. An `fmt` layer without the target and the time, writing to `writer`.
-///    It writes JSON when `format` is `json` in any case, and text otherwise.
+/// 2. An `fmt` layer writing to `writer`. When `format` is `json` in any
+///    case, it writes one [`TopLevelJson`] record per event: a JSON object
+///    with the fields at the top level and a `timestamp`, the UTC time to
+///    the millisecond. Otherwise it writes text without the target and the
+///    time.
 ///
 /// The `fmt` layer is filtered by [`DefaultFilter`]: the `EnvFilter`, then
 /// [`ReplayFilterLayer`], with the SDK's replay-tracking spans always
@@ -969,16 +987,218 @@ where
             .parse_lossy(directives),
         replay: ReplayFilterLayer::new(),
     };
-    let layer = subscriber::fmt::layer()
-        .with_target(false)
-        .without_time()
-        .with_writer(writer);
     let registry = subscriber::registry();
     if format.eq_ignore_ascii_case("json") {
-        Box::new(registry.with(layer.json().with_filter(filter)))
+        let layer = subscriber::fmt::layer()
+            .fmt_fields(JsonFields::new())
+            .event_format(TopLevelJson)
+            .with_writer(writer);
+        Box::new(registry.with(layer.with_filter(filter)))
     } else {
+        let layer = subscriber::fmt::layer()
+            .with_target(false)
+            .without_time()
+            .with_writer(writer);
         Box::new(registry.with(layer.with_filter(filter)))
     }
+}
+
+/// The event format of the default subscriber's JSON branch.
+///
+/// Each record is one JSON object on one line. Its keys are, in order:
+/// `requestId`, `timestamp`, `level`, `executionArn`, `tenantId`,
+/// `operationId`, `operationName`, `attempt`, the ordinary fields, then
+/// `message`, as the JavaScript SDK's default logger writes them. A key
+/// that has no value is left out, except `timestamp`, `level` and
+/// `message`, which every record has.
+///
+/// A correlation key takes the event's value, else the value of the
+/// nearest SDK span that carries it. A span the SDK did not create never
+/// supplies one. An ordinary field is any other recorded field except
+/// `timestamp`, `level`, `isReplay` and `message`; it takes the event's
+/// value, else the value of the nearest span that carries it. `isReplay`
+/// is never written. `message` is the event's own field, or `""`.
+///
+/// Values have the representation `JsonFields` gives them: the event's
+/// fields are formatted with the layer's `JsonFields`, and the span fields
+/// are the `FormattedFields<JsonFields>` that the `fmt` layer stores.
+#[derive(Debug, Clone, Copy)]
+struct TopLevelJson;
+
+/// The correlation keys after `requestId`, `timestamp` and `level`, in the
+/// order the record writes them.
+const TRAILING_CORRELATION_KEYS: [&str; 5] = [
+    fields::EXECUTION_ARN,
+    fields::TENANT_ID,
+    fields::OPERATION_ID,
+    fields::OPERATION_NAME,
+    fields::ATTEMPT,
+];
+
+/// The key of the record's time.
+const TIMESTAMP_KEY: &str = "timestamp";
+/// The key of the record's level.
+const LEVEL_KEY: &str = "level";
+/// The key of the record's message.
+const MESSAGE_KEY: &str = "message";
+
+/// Whether `key` is written from a place other than the ordinary fields.
+fn is_reserved_key(key: &str) -> bool {
+    key == fields::REQUEST_ID
+        || TRAILING_CORRELATION_KEYS.contains(&key)
+        || key == TIMESTAMP_KEY
+        || key == LEVEL_KEY
+        || key == fields::IS_REPLAY
+        || key == MESSAGE_KEY
+}
+
+/// The fields of one source of a record: the event, or one span.
+type FieldMap = std::collections::BTreeMap<String, serde_json::Value>;
+
+/// Parses fields that `JsonFields` formatted as one JSON object.
+fn parse_fields(formatted: &str) -> Result<FieldMap, std::fmt::Error> {
+    serde_json::from_str(formatted).map_err(|_| std::fmt::Error)
+}
+
+/// The fields of one span in an event's scope.
+struct SpanFields {
+    /// Whether the SDK created the span, so it may supply correlation keys.
+    is_sdk: bool,
+    fields: FieldMap,
+}
+
+impl<S> FormatEvent<S, JsonFields> for TopLevelJson
+where
+    S: tracing::Subscriber + for<'lookup> subscriber::registry::LookupSpan<'lookup>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, JsonFields>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        // The time is sampled first, so a time outside the four-digit years
+        // fails the record before any of it is written.
+        let timestamp = js_timestamp(std::time::SystemTime::now())?;
+
+        let mut formatted = String::new();
+        ctx.field_format()
+            .format_fields(Writer::new(&mut formatted), event)?;
+        let event_fields = parse_fields(&formatted)?;
+
+        // Leaf to root, so the first span found is the nearest one.
+        let mut spans = Vec::new();
+        if let Some(scope) = ctx.event_scope() {
+            for span in scope {
+                let extensions = span.extensions();
+                let fields = match extensions.get::<FormattedFields<JsonFields>>() {
+                    Some(stored) => parse_fields(&stored.fields)?,
+                    None => FieldMap::new(),
+                };
+                spans.push(SpanFields {
+                    is_sdk: sdk_span(span.metadata()).is_some(),
+                    fields,
+                });
+            }
+        }
+
+        let correlation = |key: &str| {
+            event_fields.get(key).or_else(|| {
+                spans
+                    .iter()
+                    .filter(|span| span.is_sdk)
+                    .find_map(|span| span.fields.get(key))
+            })
+        };
+        let mut ordinary = std::collections::BTreeMap::new();
+        for source in std::iter::once(&event_fields).chain(spans.iter().map(|span| &span.fields)) {
+            for (key, value) in source {
+                if !is_reserved_key(key) {
+                    ordinary.entry(key.as_str()).or_insert(value);
+                }
+            }
+        }
+        let empty_message = serde_json::Value::String(String::new());
+        let message = event_fields.get(MESSAGE_KEY).unwrap_or(&empty_message);
+        let level = serde_json::Value::String(event.metadata().level().as_str().to_owned());
+        let timestamp = serde_json::Value::String(timestamp);
+
+        let mut entries: Vec<(&str, &serde_json::Value)> = Vec::new();
+        if let Some(value) = correlation(fields::REQUEST_ID) {
+            entries.push((fields::REQUEST_ID, value));
+        }
+        entries.push((TIMESTAMP_KEY, &timestamp));
+        entries.push((LEVEL_KEY, &level));
+        for key in TRAILING_CORRELATION_KEYS {
+            if let Some(value) = correlation(key) {
+                entries.push((key, value));
+            }
+        }
+        entries.extend(ordinary);
+        entries.push((MESSAGE_KEY, message));
+
+        // `Value`'s `Display` writes compact JSON, and a string value
+        // escapes the key as a JSON string.
+        writer.write_char('{')?;
+        for (index, (key, value)) in entries.into_iter().enumerate() {
+            if index > 0 {
+                writer.write_char(',')?;
+            }
+            write!(writer, "{}:{value}", serde_json::Value::from(key))?;
+        }
+        writer.write_str("}\n")
+    }
+}
+
+/// Formats `time` as the JavaScript SDK's records do, which is
+/// `Date.prototype.toISOString`: UTC, `YYYY-MM-DDTHH:MM:SS.sssZ`, with the
+/// time cut to whole milliseconds rather than rounded.
+///
+/// Returns an error when the UTC year is outside `0000..=9999`, which the
+/// format cannot write.
+fn js_timestamp(time: std::time::SystemTime) -> Result<String, std::fmt::Error> {
+    const MILLIS_PER_DAY: i128 = 86_400_000;
+    // Milliseconds since the epoch, rounded towards earlier times.
+    let millis = match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => i128::from(after.as_secs()) * 1000 + i128::from(after.subsec_millis()),
+        Err(before) => {
+            let before = before.duration();
+            let nanos =
+                i128::from(before.as_secs()) * 1_000_000_000 + i128::from(before.subsec_nanos());
+            -((nanos + 999_999) / 1_000_000)
+        }
+    };
+    let (year, month, day) = civil_from_days(millis.div_euclid(MILLIS_PER_DAY));
+    if !(0..=9999).contains(&year) {
+        return Err(std::fmt::Error);
+    }
+    let of_day = millis.rem_euclid(MILLIS_PER_DAY);
+    let (hours, minutes) = (of_day / 3_600_000, of_day / 60_000 % 60);
+    let (seconds, subsec) = (of_day / 1000 % 60, of_day % 1000);
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec:03}Z"
+    ))
+}
+
+/// The proleptic Gregorian year, month and day of `days` since
+/// 1970-01-01, by Howard Hinnant's `civil_from_days` algorithm.
+fn civil_from_days(days: i128) -> (i128, i128, i128) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    // Months counted from March, so February is last and takes leap days.
+    let march_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * march_month + 2) / 5 + 1;
+    let month = if march_month < 10 {
+        march_month + 3
+    } else {
+        march_month - 9
+    };
+    let year = year_of_era + era * 400 + i128::from(month <= 2);
+    (year, month, day)
 }
 
 #[cfg(test)]
@@ -1965,7 +2185,7 @@ pub(crate) mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter_map(|record| {
                 record
-                    .pointer("/fields/message")
+                    .pointer("/message")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
             })
@@ -2699,5 +2919,812 @@ pub(crate) mod tests {
         };
         assert!(interest(other).is_never());
         assert!(interest(execution).is_sometimes());
+    }
+
+    // The default subscriber's JSON record.
+
+    /// One JSON record with its top-level keys in the order they were
+    /// written. Parsing it rejects a key that occurs twice.
+    #[derive(Debug)]
+    struct OrderedRecord(Vec<(String, serde_json::Value)>);
+
+    impl<'de> serde::Deserialize<'de> for OrderedRecord {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct RecordVisitor;
+
+            impl<'de> serde::de::Visitor<'de> for RecordVisitor {
+                type Value = OrderedRecord;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<OrderedRecord, A::Error> {
+                    let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
+                    while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                        if entries.iter().any(|(seen, _)| *seen == key) {
+                            return Err(serde::de::Error::custom(format!("repeated key {key}")));
+                        }
+                        entries.push((key, value));
+                    }
+                    Ok(OrderedRecord(entries))
+                }
+            }
+
+            deserializer.deserialize_map(RecordVisitor)
+        }
+    }
+
+    impl OrderedRecord {
+        fn keys(&self) -> Vec<&str> {
+            self.0.iter().map(|(key, _)| key.as_str()).collect()
+        }
+
+        fn get(&self, key: &str) -> Option<&serde_json::Value> {
+            self.0
+                .iter()
+                .find(|(seen, _)| seen == key)
+                .map(|(_, value)| value)
+        }
+    }
+
+    /// Parses every captured line as an [`OrderedRecord`], failing on a line
+    /// that is not one.
+    fn ordered_records(buffer: &std::sync::Mutex<Vec<u8>>) -> Vec<OrderedRecord> {
+        captured(buffer)
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line).expect("each line is one record with unique keys")
+            })
+            .collect()
+    }
+
+    /// The first record whose `message` is `message`.
+    fn record<'a>(records: &'a [OrderedRecord], message: &str) -> &'a OrderedRecord {
+        records
+            .iter()
+            .find(|r| r.get("message") == Some(&json_str(message)))
+            .expect("the record is in the captured output")
+    }
+
+    /// Whether `value` is a string holding a valid UTC time of the form
+    /// `YYYY-MM-DDTHH:MM:SS.sssZ`.
+    fn is_js_timestamp(value: &serde_json::Value) -> bool {
+        let Some(text) = value.as_str() else {
+            return false;
+        };
+        let shape_ok = text.len() == 24
+            && text.char_indices().all(|(i, c)| match i {
+                4 | 7 => c == '-',
+                10 => c == 'T',
+                13 | 16 => c == ':',
+                19 => c == '.',
+                23 => c == 'Z',
+                _ => c.is_ascii_digit(),
+            });
+        let number = |range: std::ops::Range<usize>| -> Option<u32> {
+            text.get(range).and_then(|digits| digits.parse().ok())
+        };
+        let (Some(year), Some(month), Some(day)) = (number(0..4), number(5..7), number(8..10))
+        else {
+            return false;
+        };
+        let (Some(hour), Some(minute), Some(second)) =
+            (number(11..13), number(14..16), number(17..19))
+        else {
+            return false;
+        };
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let month_days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return false,
+        };
+        shape_ok && (1..=month_days).contains(&day) && hour <= 23 && minute <= 59 && second <= 59
+    }
+
+    #[test]
+    fn is_js_timestamp_accepts_only_valid_times() {
+        for valid in [
+            "1970-01-01T00:00:00.000Z",
+            "2024-02-29T23:59:59.999Z",
+            "9999-12-31T23:59:59.999Z",
+        ] {
+            assert!(is_js_timestamp(&json_str(valid)), "{valid}");
+        }
+        for invalid in [
+            "9999-99-99T99:99:99.999Z",
+            "2023-02-29T00:00:00.000Z",
+            "2024-13-01T00:00:00.000Z",
+            "2024-04-31T00:00:00.000Z",
+            "2024-01-00T00:00:00.000Z",
+            "2024-01-01T24:00:00.000Z",
+            "2024-01-01T00:60:00.000Z",
+            "2024-01-01T00:00:60.000Z",
+            "2024-01-01T00:00:00.000+00:00",
+            "2024-01-01 00:00:00.000Z",
+        ] {
+            assert!(!is_js_timestamp(&json_str(invalid)), "{invalid}");
+        }
+        assert!(!is_js_timestamp(&serde_json::json!(0)));
+    }
+
+    /// The JSON default subscriber at `INFO` plus `directives`, writing
+    /// into a new buffer.
+    fn default_json(
+        directives: &str,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        Box<dyn tracing::Subscriber + Send + Sync>,
+    ) {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "INFO",
+            directives,
+            "json",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+        (buffer, subscriber)
+    }
+
+    /// Runs `handler` through `runner` under the JSON default subscriber
+    /// with `directives`, on a current-thread runtime. Returns the records,
+    /// the result and the run's execution ARN.
+    fn run_default_json<F, Fut>(
+        runner: crate::test_util::LocalRunner,
+        directives: &str,
+        handler: F,
+    ) -> (Vec<OrderedRecord>, crate::test_util::TestResult<()>, String)
+    where
+        F: Fn(serde_json::Value, crate::DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), crate::BoxError>> + Send,
+    {
+        let (buffer, subscriber) = default_json(directives);
+        let arn = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = std::sync::Arc::clone(&arn);
+        let handler = std::sync::Arc::new(handler);
+        let result = {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                runner
+                    .run(
+                        move |event, ctx: crate::DurableContext| {
+                            *seen.lock().expect("arn") = ctx.execution_arn().to_owned();
+                            handler(event, ctx)
+                        },
+                        serde_json::Value::Null,
+                    )
+                    .await
+                    .expect("runner")
+            })
+        };
+        assert!(result.is_success(), "{:?}", result.error());
+        let arn = arn.lock().expect("arn").clone();
+        assert_ne!(arn, "");
+        (ordered_records(&buffer), result, arn)
+    }
+
+    /// The keys a record of an operation's user code has, before its
+    /// ordinary fields and `message`.
+    const OPERATION_KEYS: [&str; 7] = [
+        "requestId",
+        "timestamp",
+        "level",
+        "executionArn",
+        "operationId",
+        "operationName",
+        "attempt",
+    ];
+
+    #[test]
+    fn default_json_step_record_has_top_level_fields() {
+        let (records, result, arn) = run_default_json(
+            crate::test_util::LocalRunner::new(),
+            "",
+            |_event, ctx| async move {
+                ctx.step(|_| async {
+                    tracing::info!(order = 5_u32, "in-step");
+                    Ok(())
+                })
+                .name("fetch")
+                .await?;
+                Ok(())
+            },
+        );
+        let step = result.operation("fetch").expect("step operation");
+        let record = record(&records, "in-step");
+        let mut expected = OPERATION_KEYS.to_vec();
+        expected.extend(["order", "message"]);
+        assert_eq!(record.keys(), expected, "{record:?}");
+        assert_eq!(
+            record.get("requestId"),
+            Some(&json_str("local-invocation-1"))
+        );
+        assert!(is_js_timestamp(record.get("timestamp").expect("timestamp")));
+        assert_eq!(record.get("level"), Some(&json_str("INFO")));
+        assert_eq!(record.get("executionArn"), Some(&json_str(&arn)));
+        assert_eq!(record.get("operationId"), Some(&json_str(step.id())));
+        assert_eq!(record.get("operationName"), Some(&json_str("fetch")));
+        assert_eq!(record.get("attempt"), Some(&serde_json::json!(1)));
+        assert_eq!(record.get("order"), Some(&serde_json::json!(5)));
+        assert_eq!(record.get("message"), Some(&json_str("in-step")));
+    }
+
+    #[test]
+    fn default_json_tenant_id_is_optional_and_ordered() {
+        let (buffer, subscriber) = default_json("");
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            execution_span("arn:run", "req-1", Some("tenant-1"), false)
+                .in_scope(|| tracing::info!("with-tenant"));
+            execution_span("arn:run", "req-1", None, false)
+                .in_scope(|| tracing::info!("without-tenant"));
+        }
+        let records = ordered_records(&buffer);
+        let with = record(&records, "with-tenant");
+        assert_eq!(
+            with.keys(),
+            [
+                "requestId",
+                "timestamp",
+                "level",
+                "executionArn",
+                "tenantId",
+                "message"
+            ],
+            "{with:?}"
+        );
+        assert_eq!(with.get("tenantId"), Some(&json_str("tenant-1")));
+        let without = record(&records, "without-tenant");
+        assert_eq!(
+            without.keys(),
+            ["requestId", "timestamp", "level", "executionArn", "message"],
+            "{without:?}"
+        );
+    }
+
+    #[test]
+    fn default_json_child_record_has_top_level_fields() {
+        let (records, result, arn) = run_default_json(
+            crate::test_util::LocalRunner::new(),
+            "",
+            |_event, ctx| async move {
+                ctx.run_in_child_context(|_child| async move {
+                    tracing::info!("in-child");
+                    Ok(())
+                })
+                .name("enrich")
+                .await?;
+                Ok(())
+            },
+        );
+        let child = result.operation("enrich").expect("child operation");
+        let record = record(&records, "in-child");
+        assert_eq!(
+            record.keys(),
+            [
+                "requestId",
+                "timestamp",
+                "level",
+                "executionArn",
+                "operationId",
+                "operationName",
+                "message"
+            ],
+            "{record:?}"
+        );
+        assert_eq!(
+            record.get("requestId"),
+            Some(&json_str("local-invocation-1"))
+        );
+        assert_eq!(record.get("executionArn"), Some(&json_str(&arn)));
+        assert_eq!(record.get("operationId"), Some(&json_str(child.id())));
+        assert_eq!(record.get("operationName"), Some(&json_str("enrich")));
+    }
+
+    #[test]
+    fn default_json_map_item_record_has_top_level_fields() {
+        let (records, result, arn) = run_default_json(
+            crate::test_util::LocalRunner::new(),
+            "",
+            |_event, ctx| async move {
+                ctx.map(vec![7_u32], |_child, _item, _idx| async move {
+                    tracing::info!("in-item");
+                    Ok(())
+                })
+                .name("items")
+                .await?;
+                Ok(())
+            },
+        );
+        let batch = result.operation("items").expect("map operation");
+        let item = result
+            .children(batch)
+            .find(|op| op.kind() == crate::OperationKind::Context)
+            .expect("item child");
+        let record = record(&records, "in-item");
+        assert_eq!(
+            record.keys(),
+            [
+                "requestId",
+                "timestamp",
+                "level",
+                "executionArn",
+                "operationId",
+                "operationName",
+                "message"
+            ],
+            "{record:?}"
+        );
+        assert_eq!(
+            record.get("requestId"),
+            Some(&json_str("local-invocation-1"))
+        );
+        assert_eq!(record.get("executionArn"), Some(&json_str(&arn)));
+        assert_eq!(record.get("operationId"), Some(&json_str(item.id())));
+        assert_eq!(record.get("operationName"), Some(&json_str("map-item-0")));
+    }
+
+    #[test]
+    fn default_json_step_in_child_uses_nearest_sdk_span() {
+        let (records, result, _arn) = run_default_json(
+            crate::test_util::LocalRunner::new(),
+            "",
+            |_event, ctx| async move {
+                ctx.run_in_child_context(|child| async move {
+                    child
+                        .step(|_| async {
+                            tracing::info!("in-inner-step");
+                            Ok(())
+                        })
+                        .name("inner")
+                        .await?;
+                    tracing::info!("in-outer-child");
+                    Ok(())
+                })
+                .name("outer")
+                .await?;
+                Ok(())
+            },
+        );
+        let outer = result.operation("outer").expect("child operation");
+        let inner = result.operation("inner").expect("step operation");
+        let in_step = record(&records, "in-inner-step");
+        assert_eq!(in_step.get("operationId"), Some(&json_str(inner.id())));
+        assert_eq!(in_step.get("operationName"), Some(&json_str("inner")));
+        assert_eq!(in_step.get("attempt"), Some(&serde_json::json!(1)));
+        let in_child = record(&records, "in-outer-child");
+        assert_eq!(in_child.get("operationId"), Some(&json_str(outer.id())));
+        assert_eq!(in_child.get("operationName"), Some(&json_str("outer")));
+        assert_eq!(in_child.get("attempt"), None, "{in_child:?}");
+    }
+
+    /// A span that is not the SDK's, though it has the name of the SDK's
+    /// operation span and carries correlation keys.
+    fn impostor_span() -> tracing::Span {
+        tracing::info_span!(
+            "durable_operation",
+            requestId = "impostor-request",
+            operationId = "impostor-operation",
+            trace_id = "trace-1",
+        )
+    }
+
+    /// A plugin whose user-function wrap enters [`impostor_span`].
+    #[derive(Clone)]
+    struct Impostor;
+
+    impl crate::plugin::Plugin for Impostor {
+        fn wrap_user_function(&self, _info: &crate::plugin::OperationInfo, next: &mut dyn FnMut()) {
+            impostor_span().in_scope(next);
+        }
+    }
+
+    impl crate::plugin::PluginFactory for Impostor {
+        fn create_plugin(
+            &self,
+            _info: &crate::plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn crate::plugin::Plugin>>, crate::BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    #[test]
+    fn default_json_correlation_uses_only_events_and_sdk_spans() {
+        let options = crate::Options::builder()
+            .plugin(Impostor)
+            .build()
+            .expect("options");
+        let (records, result, _arn) = run_default_json(
+            crate::test_util::LocalRunner::new().options(options),
+            "",
+            |_event, ctx| async move {
+                ctx.step(|_| async {
+                    tracing::info!("in-step");
+                    tracing::info!(
+                        requestId = "event-request",
+                        operationId = "event-operation",
+                        "explicit"
+                    );
+                    Ok(())
+                })
+                .name("fetch")
+                .await?;
+                Ok(())
+            },
+        );
+        let step = result.operation("fetch").expect("step operation");
+        let in_step = record(&records, "in-step");
+        assert_eq!(
+            in_step.get("trace_id"),
+            Some(&json_str("trace-1")),
+            "{in_step:?}"
+        );
+        assert_eq!(
+            in_step.get("requestId"),
+            Some(&json_str("local-invocation-1"))
+        );
+        assert_eq!(in_step.get("operationId"), Some(&json_str(step.id())));
+        let explicit = record(&records, "explicit");
+        assert_eq!(explicit.get("requestId"), Some(&json_str("event-request")));
+        assert_eq!(
+            explicit.get("operationId"),
+            Some(&json_str("event-operation"))
+        );
+        assert_eq!(explicit.get("trace_id"), Some(&json_str("trace-1")));
+
+        let (buffer, subscriber) = default_json("");
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            impostor_span().in_scope(|| tracing::info!("outside"));
+        }
+        let records = ordered_records(&buffer);
+        let outside = record(&records, "outside");
+        assert_eq!(
+            outside.keys(),
+            ["timestamp", "level", "trace_id", "message"],
+            "{outside:?}"
+        );
+    }
+
+    #[test]
+    fn default_json_field_collisions_have_one_winner() {
+        let (buffer, subscriber) = default_json("");
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            let outer = tracing::info_span!(
+                "outer",
+                shared = "outer",
+                nested = "outer",
+                outer_only = "outer",
+                "timestamp" = "span-timestamp",
+                "level" = "span-level",
+                "message" = "span-message",
+            );
+            outer.in_scope(|| {
+                // Created inside `outer`, so `outer` is its parent.
+                let inner = tracing::info_span!(
+                    "inner",
+                    shared = "inner",
+                    nested = "inner",
+                    isReplay = false,
+                );
+                inner.in_scope(|| {
+                    tracing::info!(
+                        shared = "event",
+                        "timestamp" = "event-timestamp",
+                        "level" = "event-level",
+                        isReplay = false,
+                        "fields" = "user-fields",
+                        "span" = "user-span",
+                        "spans" = "user-spans",
+                        "target" = "user-target",
+                        "name" = "user-name",
+                        "collide"
+                    );
+                });
+            });
+        }
+        let records = ordered_records(&buffer);
+        let record = record(&records, "collide");
+        let keys = record.keys();
+        assert_eq!(keys.first(), Some(&"timestamp"), "{record:?}");
+        assert_eq!(keys.get(1), Some(&"level"), "{record:?}");
+        assert_eq!(keys.last(), Some(&"message"), "{record:?}");
+        assert!(is_js_timestamp(record.get("timestamp").expect("timestamp")));
+        assert_eq!(record.get("level"), Some(&json_str("INFO")));
+        assert_eq!(record.get("message"), Some(&json_str("collide")));
+        assert_eq!(record.get("shared"), Some(&json_str("event")));
+        assert_eq!(record.get("nested"), Some(&json_str("inner")));
+        assert_eq!(
+            record.get("outer_only"),
+            Some(&json_str("outer")),
+            "{record:?}"
+        );
+        assert_eq!(record.get("isReplay"), None, "{record:?}");
+        for (key, value) in [
+            ("fields", "user-fields"),
+            ("span", "user-span"),
+            ("spans", "user-spans"),
+            ("target", "user-target"),
+            ("name", "user-name"),
+        ] {
+            assert_eq!(keys.iter().filter(|k| **k == key).count(), 1, "{key}");
+            assert_eq!(record.get(key), Some(&json_str(value)), "{key}");
+        }
+        assert_eq!(keys.len(), 11, "{record:?}");
+    }
+
+    #[test]
+    fn default_json_values_match_json_fields() {
+        /// Renders differently with `Display` and `Debug`.
+        #[derive(Debug)]
+        struct Shown;
+
+        impl std::fmt::Display for Shown {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("shown-display")
+            }
+        }
+
+        impl std::error::Error for Shown {}
+
+        let (buffer, subscriber) = default_json("");
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            let error: &(dyn std::error::Error + 'static) = &Shown;
+            tracing::info_span!(
+                "values",
+                span_u64 = u64::MAX,
+                span_i128 = i128::MAX,
+                span_display = %Shown,
+                span_debug = ?Shown,
+            )
+            .in_scope(|| {
+                tracing::info!(
+                    event_u64 = u64::MAX,
+                    event_i64 = i64::MIN,
+                    event_i128 = i128::MAX,
+                    event_u128 = u128::MAX,
+                    display = %Shown,
+                    debug = ?Shown,
+                    finite = 1.5_f64,
+                    infinite = f64::INFINITY,
+                    nan = f64::NAN,
+                    flag = true,
+                    text = "plain",
+                    bytes = &b"ab"[..],
+                    error = error,
+                    "values"
+                );
+            });
+        }
+        let records = ordered_records(&buffer);
+        let record = record(&records, "values");
+        let expected = [
+            ("span_u64", serde_json::json!(u64::MAX)),
+            (
+                "span_i128",
+                json_str("170141183460469231731687303715884105727"),
+            ),
+            ("span_display", json_str("shown-display")),
+            ("span_debug", json_str("Shown")),
+            ("event_u64", serde_json::json!(u64::MAX)),
+            ("event_i64", serde_json::json!(i64::MIN)),
+            (
+                "event_i128",
+                json_str("170141183460469231731687303715884105727"),
+            ),
+            (
+                "event_u128",
+                json_str("340282366920938463463374607431768211455"),
+            ),
+            ("display", json_str("shown-display")),
+            ("debug", json_str("Shown")),
+            ("finite", serde_json::json!(1.5)),
+            ("infinite", serde_json::Value::Null),
+            ("nan", serde_json::Value::Null),
+            ("flag", serde_json::json!(true)),
+            ("text", json_str("plain")),
+            ("bytes", serde_json::json!([97, 98])),
+            ("error", json_str("shown-display")),
+        ];
+        for (key, value) in expected {
+            assert_eq!(record.get(key), Some(&value), "{key}: {record:?}");
+        }
+    }
+
+    #[test]
+    fn default_json_message_is_last_and_defaults_to_empty() {
+        let (buffer, subscriber) = default_json("");
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            tracing::info!(marker = "no-message");
+            tracing::info!(message = 7_u64);
+        }
+        let records = ordered_records(&buffer);
+        assert_eq!(records.len(), 2, "{records:?}");
+        let last = |record: &OrderedRecord| record.0.last().cloned();
+        let first = records.first().expect("first record");
+        assert_eq!(first.get("marker"), Some(&json_str("no-message")));
+        assert_eq!(last(first), Some(("message".to_owned(), json_str(""))));
+        let second = records.get(1).expect("second record");
+        assert_eq!(
+            last(second),
+            Some(("message".to_owned(), serde_json::json!(7)))
+        );
+    }
+
+    #[test]
+    fn default_json_records_have_unique_keys() {
+        let directives = format!("info,{TARGET}=debug");
+        let (records, _result, arn) = run_default_json(
+            crate::test_util::LocalRunner::new(),
+            &directives,
+            |_event, ctx| async move {
+                ctx.step(|_| async { Ok(()) }).name("s").await?;
+                ctx.run_in_child_context(|_child| async move { Ok(()) })
+                    .name("c")
+                    .await?;
+                ctx.map(vec![1_u32], |_child, _item, _idx| async move { Ok(()) })
+                    .name("m")
+                    .await?;
+                Ok(())
+            },
+        );
+        let lifecycle: Vec<&OrderedRecord> = records
+            .iter()
+            .filter(|r| {
+                r.get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|m| m.starts_with("operation_") || m.starts_with("execution_"))
+            })
+            .collect();
+        assert!(
+            lifecycle
+                .iter()
+                .any(|r| r.get("message") == Some(&json_str("operation_started"))),
+            "{records:?}"
+        );
+        for record in &records {
+            assert_eq!(record.get("isReplay"), None, "{record:?}");
+        }
+        for record in lifecycle {
+            assert_eq!(
+                record.get("executionArn"),
+                Some(&json_str(&arn)),
+                "{record:?}"
+            );
+            assert!(record.get("requestId").is_some(), "{record:?}");
+            let is_operation = record
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|m| m.starts_with("operation_"));
+            if is_operation {
+                assert!(record.get("operationId").is_some(), "{record:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_json_record_rejects_duplicate_keys() {
+        assert!(serde_json::from_str::<OrderedRecord>(r#"{"a":1,"b":2}"#).is_ok());
+        assert!(serde_json::from_str::<OrderedRecord>(r#"{"a":1,"b":2,"a":3}"#).is_err());
+    }
+
+    #[test]
+    fn js_timestamp_matches_js() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let at = |secs: u64, nanos: u32| UNIX_EPOCH + Duration::new(secs, nanos);
+        let ok = |time| js_timestamp(time).expect("in range");
+        assert_eq!(ok(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            ok(at(1_700_000_000, 123_456_789)),
+            "2023-11-14T22:13:20.123Z"
+        );
+        assert_eq!(
+            ok(at(1_709_251_199, 999_999_999)),
+            "2024-02-29T23:59:59.999Z"
+        );
+        assert_eq!(ok(at(1_709_251_200, 0)), "2024-03-01T00:00:00.000Z");
+        // The last instant of year 9999, then the first of year 10000.
+        assert_eq!(
+            ok(at(253_402_300_799, 999_000_000)),
+            "9999-12-31T23:59:59.999Z"
+        );
+        assert!(js_timestamp(at(253_402_300_800, 0)).is_err());
+
+        // Before the epoch the time is cut towards earlier times, as JS's
+        // millisecond clock is.
+        let before = |secs: u64, nanos: u32| UNIX_EPOCH - Duration::new(secs, nanos);
+        assert_eq!(ok(before(0, 1)), "1969-12-31T23:59:59.999Z");
+        assert_eq!(ok(before(1, 0)), "1969-12-31T23:59:59.000Z");
+        assert_eq!(ok(before(62_167_219_200, 0)), "0000-01-01T00:00:00.000Z");
+        assert!(js_timestamp(before(62_167_219_200, 1)).is_err());
+    }
+
+    #[test]
+    fn parse_fields_rejects_text_that_is_not_an_object() {
+        assert_eq!(
+            parse_fields(r#"{"a":1}"#).expect("an object").get("a"),
+            Some(&serde_json::json!(1))
+        );
+        assert!(parse_fields("a=1").is_err());
+    }
+
+    /// A layer that removes the fields the `fmt` layer stored on each new
+    /// span, or replaces them with text that is not JSON.
+    struct TamperFields {
+        replace: bool,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for TamperFields
+    where
+        S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    {
+        fn on_new_span(
+            &self,
+            _attrs: &Attributes<'_>,
+            id: &Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(span) = ctx.span(id) {
+                let mut extensions = span.extensions_mut();
+                extensions.remove::<FormattedFields<JsonFields>>();
+                if self.replace {
+                    extensions.insert(FormattedFields::<JsonFields>::new("a=1".to_owned()));
+                }
+            }
+        }
+    }
+
+    /// The captured output of `info!("tampered")` in a span with the field
+    /// `gone`, when [`TamperFields`] runs after the record's `fmt` layer.
+    fn tampered_output(replace: bool) -> String {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .fmt_fields(JsonFields::new())
+                    .event_format(TopLevelJson)
+                    .with_writer(CaptureWriter(std::sync::Arc::clone(&buffer))),
+            )
+            .with(TamperFields { replace });
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            tracing::info_span!("tampered_span", gone = 1_u32)
+                .in_scope(|| tracing::info!("tampered"));
+        }
+        captured(&buffer)
+    }
+
+    /// A span without stored fields supplies none; a span whose stored
+    /// fields are not JSON fails the record, which is then not written.
+    #[test]
+    fn top_level_json_handles_spans_without_json_fields() {
+        let records: Vec<OrderedRecord> = tampered_output(false)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a record"))
+            .collect();
+        let record = record(&records, "tampered");
+        assert_eq!(
+            record.keys(),
+            ["timestamp", "level", "message"],
+            "{record:?}"
+        );
+
+        assert_eq!(tampered_output(true), "");
     }
 }

@@ -1,8 +1,8 @@
 //! `init_default_subscriber_with_writer` installs a subscriber that writes
 //! to the given writer.
 //!
-//! This file holds one test, so no other test in its binary installs a
-//! subscriber first.
+//! This file holds one test that installs a subscriber, so no other test in
+//! its binary installs one first.
 //!
 //! The helper reads the process environment. Changing the environment of a
 //! running test is `unsafe` and races with other threads. So the test runs
@@ -130,13 +130,119 @@ fn init_with_writer_installs_and_writes() {
     let lines = captured_by_child(&[("AWS_LAMBDA_LOG_LEVEL", "ERROR")]);
     assert!(lines.is_empty(), "{lines:?}");
 
-    // The helper reads the format from the environment.
+    // The helper reads the format from the environment. The JSON record
+    // has exactly `timestamp`, `level` and `message`, in that order.
+    let started = unix_millis(std::time::SystemTime::now());
     let lines = captured_by_child(&[("AWS_LAMBDA_LOG_FORMAT", "json")]);
+    let finished = unix_millis(std::time::SystemTime::now());
     assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = lines.first().expect("one line");
+    let record: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(line).expect("a JSON object");
+    assert_eq!(record.len(), 3, "{line}");
+    // The values are `INFO`, `x` and a timestamp, so no value contains a
+    // key's quoted name, and the first match of each is its key.
+    let position = |key: &str| line.find(&format!("\"{key}\":")).expect("the key");
     assert!(
-        lines
-            .iter()
-            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
-        "{lines:?}"
+        position("timestamp") < position("level") && position("level") < position("message"),
+        "{line}"
     );
+    assert_eq!(
+        record.get("level"),
+        Some(&serde_json::json!("INFO")),
+        "{line}"
+    );
+    assert_eq!(
+        record.get("message"),
+        Some(&serde_json::json!("x")),
+        "{line}"
+    );
+    let timestamp = record
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .expect("a timestamp string");
+    // The child formatted the record between the parent's two clock reads,
+    // and the timestamp cuts the time to whole milliseconds.
+    let millis = js_timestamp_millis(timestamp).expect("a valid UTC timestamp");
+    assert!(started <= millis && millis <= finished, "{line}");
+}
+
+/// Milliseconds since the Unix epoch of `time`, cut to whole milliseconds.
+fn unix_millis(time: std::time::SystemTime) -> i64 {
+    let since = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a time after the epoch");
+    i64::try_from(since.as_millis()).expect("milliseconds fit in i64")
+}
+
+/// The milliseconds since the Unix epoch of `text`, when `text` is a valid
+/// UTC time of the form `YYYY-MM-DDTHH:MM:SS.sssZ`.
+fn js_timestamp_millis(text: &str) -> Option<i64> {
+    let shape_ok = text.len() == 24
+        && text.char_indices().all(|(i, c)| match i {
+            4 | 7 => c == '-',
+            10 => c == 'T',
+            13 | 16 => c == ':',
+            19 => c == '.',
+            23 => c == 'Z',
+            _ => c.is_ascii_digit(),
+        });
+    if !shape_ok {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> { text.get(range)?.parse().ok() };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    let millis = number(20..23)?;
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=month_days).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // Howard Hinnant's `days_from_civil`.
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * m + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis)
+}
+
+#[test]
+fn js_timestamp_millis_accepts_only_valid_times() {
+    assert_eq!(js_timestamp_millis("1970-01-01T00:00:00.000Z"), Some(0));
+    assert_eq!(
+        js_timestamp_millis("2023-11-14T22:13:20.123Z"),
+        Some(1_700_000_000_123)
+    );
+    assert_eq!(
+        js_timestamp_millis("2024-02-29T23:59:59.999Z"),
+        Some(1_709_251_199_999)
+    );
+    for invalid in [
+        "9999-99-99T99:99:99.999Z",
+        "2023-02-29T00:00:00.000Z",
+        "2024-13-01T00:00:00.000Z",
+        "2024-00-01T00:00:00.000Z",
+        "2024-04-31T00:00:00.000Z",
+        "2024-01-00T00:00:00.000Z",
+        "2024-01-01T24:00:00.000Z",
+        "2024-01-01T00:60:00.000Z",
+        "2024-01-01T00:00:60.000Z",
+        "2024-01-01T00:00:00.000+00:00",
+        "2024-01-01 00:00:00.000Z",
+    ] {
+        assert_eq!(js_timestamp_millis(invalid), None, "{invalid}");
+    }
 }

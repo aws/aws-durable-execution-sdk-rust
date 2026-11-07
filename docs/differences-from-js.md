@@ -72,11 +72,11 @@ This page lists every place where the Rust SDK behaves differently from the Java
 
 ### SDK logger
 
-- **JavaScript:** The context carries a logger, and a plugin's `enrichLogContext` adds fields to its records.
-- **Rust:** No SDK logger. A plugin enters a span carrying the fields around `next()` in `wrap_invocation` or `wrap_user_function`; events inside are parented to it, and the subscriber can render its fields.
-- **Why:** A `tracing` span is the standard way to attach fields to every record in a piece of code.
+- **JavaScript:** The context carries a logger. Its default record has the top-level keys `requestId`, `timestamp`, `level`, `executionArn`, `tenantId`, `operationId`, `operationName` and `attempt`, then the fields a plugin's `enrichLogContext` adds, then `message`.
+- **Rust:** No SDK logger. The JSON record of `init_default_subscriber()` writes the same keys at the top level in the same order. Every record has `timestamp`, which the formatter generates as the UTC time to the millisecond, and `level`, which it takes from the event's level. Each of `requestId`, `executionArn`, `tenantId`, `operationId`, `operationName` and `attempt` takes the event's value, else the nearest SDK span's, and is omitted when neither has one. Then come the other fields of the event and its spans, including those of a plugin's span; then `message`, which is `""` for an event without one. It omits `isReplay`, and `level` can also be `TRACE`. A plugin enters a span carrying its fields around `next()` in `wrap_invocation` or `wrap_user_function`; events inside are parented to it.
+- **Why:** A `tracing` span is the standard way to attach fields to every record in a piece of code, and `tracing` has a `TRACE` level.
 - **Decision:** Same capability in Rust form.
-- **Where:** `src/plugin.rs`, `Plugin::wrap_user_function`.
+- **Where:** `src/plugin.rs`, `Plugin::wrap_user_function`; `src/tracing_layer.rs`, `default_subscriber`.
 
 ## Errors
 

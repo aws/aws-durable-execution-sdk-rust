@@ -273,10 +273,15 @@ pub mod event_names {
 
 /// Names of the structured fields carried by the spans and events.
 ///
-/// When rendered by a JSON subscriber (e.g. `lambda_runtime`'s
-/// `init_default_subscriber()` with `AWS_LAMBDA_LOG_FORMAT=JSON`), these
-/// appear as top-level JSON keys, matching the `CloudWatch` Logs Insights
-/// query `filter coalesce(durableExecutionArn, executionArn) like "<arn>"`.
+/// The JSON record of [`crate::init_default_subscriber`] and
+/// [`crate::init_default_subscriber_with_writer`] writes `requestId`,
+/// `executionArn`, `tenantId`, `operationId`, `operationName` and `attempt`
+/// as top-level keys, taken from the event or the nearest SDK span, so the
+/// `CloudWatch` Logs Insights query
+/// `filter coalesce(durableExecutionArn, executionArn) like "<arn>"`
+/// matches it. That record omits `isReplay`. `lambda_runtime`'s own
+/// subscriber and a stock `fmt::layer().json()` keep the event's fields
+/// under `fields` and the span fields under `span` and `spans` instead.
 pub mod field_names {
     /// Durable execution ARN: identifies the orchestration instance.
     pub const EXECUTION_ARN: &str = "executionArn";
