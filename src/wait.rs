@@ -118,7 +118,8 @@ impl WaitExecution {
             }
         };
 
-        // 3. Live path: await the WaitStarted response, then suspend.
+        // 3. Live path: await the WaitStarted response, then wait for the
+        //    result record.
         if let Err(err) = start.await {
             return self.ctx.checkpoint_failure_unrecoverable(err).await;
         }

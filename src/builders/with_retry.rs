@@ -26,9 +26,11 @@ use crate::with_retry::{LoopFailure, RetryWrap};
 /// child context and applies a retry strategy to the closure's **overall**
 /// outcome, so a multi-operation block retries as a unit. Each attempt
 /// starts clean: nothing recorded by a failed attempt is replayed into the
-/// next one, so every operation in the block re-runs on retry. Delays
-/// between attempts suspend the execution, and retry progress survives
-/// suspension.
+/// next one, so every operation in the block re-runs on retry. The block
+/// waits between attempts. The invocation suspends during that wait only
+/// when no other SDK work can make progress, and a wait that ends while
+/// other SDK work runs continues in the same invocation. Retry progress
+/// survives suspension.
 ///
 /// The closure receives the attempt's context and the 1-based attempt
 /// number, which is `N` in the attempt's name `attempt-N`. The number is

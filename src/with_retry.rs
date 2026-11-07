@@ -25,7 +25,9 @@
 //! - The delay after failed attempt N is a durable wait, named
 //!   `{name}-backoff-N` when the block has a non-empty name and unnamed
 //!   otherwise, as in the JS SDK. So the backend owns the retry timer, and
-//!   the execution suspends between attempts exactly as a retrying step does.
+//!   the block waits between attempts exactly as a retrying step does: the
+//!   invocation suspends during the wait only when no other SDK work can
+//!   make progress.
 //!
 //! Retry-state checkpointing: the loop carries no in-process state that
 //! matters across a suspension. The current attempt number is re-derived on
@@ -200,7 +202,7 @@ where
         let step_err = StepError::new(StepErrorKind::ExecutionFailed, Some(Box::new(err)));
         match strategy(&step_err, attempt) {
             RetryDecision::Retry { delay } => {
-                // Durable wait between attempts: checkpoint-suspend, the
+                // Durable wait between attempts: checkpointed, and the
                 // backend owns the timer. `ctx.wait` rounds the delay up
                 // to whole seconds with a one-second minimum. JS names
                 // this wait `{name}-backoff-{attempt}` only when the

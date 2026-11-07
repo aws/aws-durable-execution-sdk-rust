@@ -1,10 +1,12 @@
 //! Basic wait: pause a durable function without holding the invocation open.
 //!
-//! [`ctx.wait`](aws_durable_execution_sdk::DurableContext::wait) suspends
-//! the execution for a
-//! [`Duration`](std::time::Duration). This is not a `sleep` that blocks a
-//! running Lambda: the SDK checkpoints the wait, the invocation ends, and the
-//! service re-invokes the function when the duration elapses. A wait of two
+//! [`ctx.wait`](aws_durable_execution_sdk::DurableContext::wait) waits for a
+//! [`Duration`](std::time::Duration). The invocation suspends during a wait
+//! only when no other SDK work can make progress. This handler runs no other
+//! SDK work during its wait, so its invocation suspends at the wait. This is
+//! not a `sleep` that blocks a running Lambda: the SDK checkpoints the wait,
+//! the invocation ends, and the service re-invokes the function when the
+//! duration elapses. A wait of two
 //! seconds and a wait of thirty days cost the same while suspended: nothing
 //! is running.
 //!

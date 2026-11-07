@@ -1,7 +1,8 @@
 //! Wait-for-condition operation execution engine.
 //!
 //! Implements the live path (evaluate check fn, checkpoint state per attempt,
-//! apply wait strategy → delay-suspend or complete or exhaust) and replay path
+//! apply wait strategy → wait for the delay, complete or exhaust) and replay
+//! path
 //! (frozen terminal state; LOUD error on state deserialization failure: never
 //! silent reset to initial state).
 //!
@@ -64,7 +65,7 @@ pub(crate) const WFC_SUB_TYPE: &str = "WaitForCondition";
 pub enum WaitDecision {
     /// Condition met: return the final state.
     Complete,
-    /// Condition not met: suspend for `delay` then re-check.
+    /// Condition not met: wait for `delay`, then re-check.
     Continue {
         /// Duration to wait before the next check attempt.
         delay: Duration,
@@ -583,7 +584,7 @@ where
                         Ok(WfcSettled::Done(deserialized))
                     }
                     WaitDecision::Continue { delay } => {
-                        // Not met: checkpoint RETRY with state + delay, then suspend.
+                        // Not met: checkpoint RETRY with state + delay, then wait.
                         #[expect(clippy::cast_possible_truncation)] // reason: delay clamped to i32
                         let delay_secs = (delay.as_secs_f64().ceil() as i64)
                             .clamp(1, i64::from(i32::MAX))

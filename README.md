@@ -429,7 +429,7 @@ durable::wrap(handler, options);
 | Operation | Behavior |
 | --- | --- |
 | `ctx.step(f)` | Runs `f` and checkpoints its result. On replay, returns the recorded result without re-running `f`. |
-| `ctx.wait(duration)` | Suspends the execution for `duration`. |
+| `ctx.wait(duration)` | Waits for `duration`. The invocation suspends during the wait only when no other SDK work can make progress. |
 | `ctx.invoke(function_id, input)` | Calls another durable function and waits for its result. |
 | `ctx.run_in_child_context(f)` | Runs `f` against a child context with its own operation namespace. |
 | `ctx.with_retry(f)` | Runs `f` against a child context and retries the whole block as a unit, with a fresh operation namespace per attempt. |
@@ -591,7 +591,10 @@ invocation.
 ### wait_for_condition
 
 `wait_for_condition` runs a check repeatedly, carrying checkpointed state
-between attempts, and suspends between polls. `wait_strategy_fn` receives the
+between attempts, and waits between polls. The invocation suspends during
+that wait only when no other SDK work can make progress, and a check that
+becomes due while other work runs continues in the same invocation.
+`wait_strategy_fn` receives the
 current state and the attempt number and returns `WaitDecision::complete()`
 or `WaitDecision::continue_with(delay)`.
 
@@ -616,7 +619,7 @@ exponential backoff configuration (`initial_delay`, `max_delay`,
 `backoff_rate`, `jitter`). After each check it completes the operation
 when the predicate matches the new state, fails it with a
 `MaxChecksExceeded` error once `max_attempts` checks have run, and
-otherwise suspends for the computed backoff delay. Build one with
+otherwise waits for the computed backoff delay. Build one with
 `WaitStrategy::builder(predicate)` (the predicate is the builder's
 argument, so an unbounded strategy cannot be constructed), and the
 remaining knobs default to 60 attempts, 5 second initial delay, 5 minute
@@ -754,8 +757,10 @@ every invocation.
 strategy to the closure's overall outcome, so a multi-operation block
 retries as a unit. Each attempt gets a fresh child operation namespace: a
 failed attempt's recorded operations are never replayed into the next
-attempt, so every operation in the block re-runs on retry. Delays between
-attempts suspend the execution, exactly as step retries do, and the retry
+attempt, so every operation in the block re-runs on retry. The block waits
+between attempts, exactly as a retrying step does: the invocation suspends
+during that wait only when no other SDK work can make progress, and a wait
+that ends while other work runs continues in the same invocation. The retry
 progress is derived from checkpointed results, so it survives suspension.
 The closure is `Fn` rather than `FnOnce` because the SDK calls it once per
 attempt.

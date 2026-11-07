@@ -3169,8 +3169,11 @@ impl DurableContext {
 
     /// Creates a durable wait (timer) operation.
     ///
-    /// The execution pauses for the specified duration. The wait is
-    /// checkpointed, so replay does not re-wait.
+    /// The operation waits for the specified duration. The invocation
+    /// suspends during the wait only when no other SDK work can make
+    /// progress, and a wait that ends while other SDK work runs continues
+    /// in the same invocation. The wait is checkpointed, so replay does not
+    /// re-wait.
     ///
     /// The duration is rounded up to whole seconds, so the wait never ends
     /// early. A duration under one second, including [`Duration::ZERO`],
@@ -3300,10 +3303,13 @@ impl DurableContext {
     /// the entire block again. Each attempt receives a **fresh child
     /// operation namespace**, so operations recorded by a failed attempt
     /// are never replayed into the next one: every operation in the block
-    /// re-runs on retry. The delay between attempts suspends the execution
-    /// (the backend owns the timer, exactly as step retries do), and the
-    /// retry progress is derived from checkpointed results, so it survives
-    /// suspension and replays deterministically.
+    /// re-runs on retry. The block waits for the delay between attempts
+    /// (the backend owns the timer, exactly as step retries do). The
+    /// invocation suspends during that wait only when no other SDK work can
+    /// make progress, and a wait that ends while other SDK work runs
+    /// continues in the same invocation. The retry progress is derived from
+    /// checkpointed results, so it survives suspension and replays
+    /// deterministically.
     ///
     /// The closure is `Fn` rather than `FnOnce` because the SDK calls it
     /// once per attempt. It receives the attempt's context and the 1-based

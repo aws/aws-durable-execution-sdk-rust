@@ -9,8 +9,11 @@
 //! [`RetryDecision::Stop`](aws_durable_execution_sdk::RetryDecision::Stop)
 //! to give up and propagate the error.
 //!
-//! Between attempts the execution suspends for the delay and resumes later, so
-//! a retrying step does not hold the invocation open. Each failed attempt is
+//! Between attempts the step waits for the delay. The invocation suspends
+//! during that wait only when no other SDK work can make progress. This
+//! handler runs no other SDK work during its waits, so its invocation
+//! suspends at each wait and resumes later, and the retrying step does not
+//! hold the invocation open. Each failed attempt is
 //! recorded; the successful attempt's result is the one checkpointed and
 //! replayed.
 //!

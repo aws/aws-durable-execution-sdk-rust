@@ -1,8 +1,11 @@
 //! Poll a condition until it is satisfied, with a bounded wait strategy.
 //!
 //! [`DurableContext::wait_for_condition`](aws_durable_execution_sdk::DurableContext::wait_for_condition)
-//! repeatedly runs a check, carrying state between attempts, and suspends for a
-//! delay between polls so it does not hold the invocation open. The state
+//! repeatedly runs a check, carrying state between attempts, and waits for a
+//! delay between polls. The invocation suspends during that wait only when no
+//! other SDK work can make progress. This handler runs no other SDK work
+//! during its waits, so its invocation suspends at each wait and the polling
+//! does not hold the invocation open. The state
 //! (here a counter starting at 0) is checkpointed each attempt and survives
 //! across resumes. The strategy returns
 //! [`WaitDecision::complete`](aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision::complete)

@@ -1,9 +1,11 @@
 //! Invoke operation execution engine.
 //!
 //! Implements the chained-invoke model: checkpoint `ChainedInvokeStarted`
-//! with the target function name and serialized input, then suspend. The
-//! backend performs the actual child invocation; on resume the SDK reads the
-//! result from the checkpoint log.
+//! with the target function name and serialized input, then wait for the
+//! result record. The invocation suspends during that wait only when no
+//! other SDK work can make progress. The backend performs the actual child
+//! invocation; the SDK reads the result from the checkpoint log, in the same
+//! invocation or on resume.
 
 use aws_sdk_lambda::types::{
     ChainedInvokeOptions, OperationAction, OperationType, OperationUpdate,
@@ -100,7 +102,7 @@ where
             ))
         });
 
-        // Checkpoint ChainedInvokeStarted then suspend.
+        // Checkpoint ChainedInvokeStarted, then wait for the result record.
         let update = build_chained_invoke_start(
             &wire_id,
             self.name.as_deref(),
