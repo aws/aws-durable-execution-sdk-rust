@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
 use durable::builders::map_parallel::{CompletionConfig, NestingMode};
+use durable::plugin::{HookWork, InvocationInfo, OperationInfo, Plugin, PluginFactory};
 use durable::test_util::{LocalRunner, TestResult};
 use durable::{BoxError, BranchSet, DurableContext, DurableFuture, OperationStatus, RetryDecision};
 
@@ -805,34 +806,83 @@ async fn detached_service_wait_lets_the_invocation_suspend() {
     );
 }
 
+/// Counts every `on_operation_end` call. In `drive_end_stops_detached_work`
+/// the step `late` is the handler's only operation, so the count is the
+/// number of end hooks `late` fired.
+struct EndHookCounter {
+    ends: Arc<AtomicUsize>,
+}
+
+impl Plugin for EndHookCounter {
+    fn on_operation_end(&self, _info: &OperationInfo) -> HookWork {
+        self.ends.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+}
+
+/// Gives each invocation an [`EndHookCounter`] that shares one count.
+struct EndHookCounterFactory {
+    ends: Arc<AtomicUsize>,
+}
+
+impl PluginFactory for EndHookCounterFactory {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(EndHookCounter {
+            ends: Arc::clone(&self.ends),
+        })))
+    }
+}
+
+/// The handler drops the handle of the running step `late` and returns, so
+/// the end of the invocation stops the step: its body has no effect, its
+/// record stays `STARTED`, its end hook never fires, and the execution
+/// ends with the handler's result.
 #[tokio::test(start_paused = true)]
 async fn drive_end_stops_detached_work() {
     let effects = counter();
+    let late_end_hooks = counter();
+    let options = durable::Options::builder()
+        .plugin(EndHookCounterFactory {
+            ends: Arc::clone(&late_end_hooks),
+        })
+        .build()
+        .expect("valid options");
     let handler_effects = Arc::clone(&effects);
-    let result = run(move |(), ctx: DurableContext| {
-        let effects = Arc::clone(&handler_effects);
-        async move {
-            drop(
-                ctx.step(move |_| async move {
-                    tokio::time::sleep(secs(5)).await;
-                    effects.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-                .name("late")
-                .spawn(),
-            );
-            Ok(())
-        }
-    })
-    .await;
+    let result = LocalRunner::new()
+        .options(options)
+        .run(
+            move |(), ctx: DurableContext| {
+                let effects = Arc::clone(&handler_effects);
+                async move {
+                    let started = Arc::new(tokio::sync::Notify::new());
+                    let body_started = Arc::clone(&started);
+                    drop(
+                        ctx.step(move |_| async move {
+                            body_started.notify_one();
+                            tokio::time::sleep(secs(5)).await;
+                            effects.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .name("late")
+                        .spawn(),
+                    );
+                    started.notified().await;
+                    Ok(7_u32)
+                }
+            },
+            (),
+        )
+        .await
+        .expect("the run finishes");
     tokio::time::sleep(secs(10)).await;
-    assert!(result.is_success(), "{:?}", result.error_message());
-    assert_eq!(count(&effects), 0);
-    assert_ne!(
+    assert_eq!(result.output(), Some(&7_u32), "{result}");
+    assert_eq!(count(&effects), 0, "{result}");
+    assert_eq!(
         status(&result, "late"),
-        Some(OperationStatus::Succeeded),
+        Some(OperationStatus::Started),
         "{result}"
     );
+    assert_eq!(count(&late_end_hooks), 0, "{result}");
 }
 
 #[tokio::test(start_paused = true)]

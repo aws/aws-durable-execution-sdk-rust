@@ -252,11 +252,16 @@ own, so they queue no `START` of their own; the attempts of the block queue
 theirs.
 
 Dropping the handle that `.spawn()` returns loses only the result. The
-operation runs until it settles, records its outcome and fires its plugin
-hooks. Its error goes into its record and is returned to nobody, and a
-panic in it fails the invocation. A running detached operation keeps the
-invocation open; one that waits only on the service, such as a wait, lets
-it suspend. The same holds for `.spawn_batch()` and
+operation keeps running until it settles, its scope closes or the
+invocation ends. An operation that settles records its outcome and fires
+its plugin hooks. Its error goes into its record and is returned to
+nobody, and a panic in it fails the invocation. A running detached
+operation keeps the invocation from suspending; one that waits only on the
+service, such as a wait, lets it suspend. When the handler returns, the
+invocation ends and stops each detached operation that still runs. A
+stopped operation fires no end hook. Its record, if it has one, keeps the
+last state written, which can be `STARTED`, and the execution can end with
+the handler's result. The same holds for `.spawn_batch()` and
 `Callback::spawn_result()`.
 
 The SDK stops work in three cases. A combinator stops the `.future()`
@@ -682,7 +687,17 @@ external caller's type.
 A callback that an external system completes while other work runs
 continues in the same invocation. `cb.spawn_result()` waits for the result
 on its own task, as `.spawn()` does for other operations. Dropping its
-handle loses only the result; the wait keeps running.
+handle loses only the result. The wait keeps running until the callback
+settles, its scope closes or the invocation ends. A wait that settles
+records its outcome and fires its plugin hooks. Its error is returned to
+nobody, and a panic in it, such as one in its serdes, fails the
+invocation. While the wait decodes the payload it keeps the invocation from
+suspending, and while it waits for the callback it lets the invocation
+suspend, because it waits only on the service. When the handler returns,
+the invocation ends and stops the wait if it still runs. The stopped wait
+fires no end hook, the callback's record keeps the last state written,
+which can be `STARTED`, and the execution can end with the handler's
+result.
 
 ### child contexts
 
@@ -969,8 +984,17 @@ configured tolerance too.
 `.spawn_batch()` starts the batch on its own task at once and returns a
 `DurableFuture<BatchResult<O>>`, as `.spawn()` does for the `Vec<O>` form,
 so the handler can run other operations before it awaits the batch.
-Dropping the returned handle loses only the result; the batch keeps
-running.
+Dropping the returned handle loses only the result. The batch keeps
+running until it completes, its scope closes or the invocation ends. A
+batch that completes records its outcome and fires its plugin hooks, its
+error goes into its record and is returned to nobody, and a panic in it
+fails the invocation. While an item runs, the batch keeps the invocation
+from suspending, and while every unfinished item waits only on the
+service, such as on a wait, it lets the invocation suspend. When the
+handler returns, the invocation ends and stops the batch if it still runs.
+The stopped batch fires no end hook, its record, if it has one, keeps the
+last state written, which can be `STARTED`, and the execution can end with
+the handler's result.
 
 ```rust ignore
 let batch = ctx

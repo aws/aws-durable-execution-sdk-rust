@@ -40,9 +40,15 @@ use crate::error::{ChildFnError, OperationError};
 /// When produced by `.spawn()`, `.spawn_batch()` or
 /// [`Callback::spawn_result`], the operation runs eagerly on its own SDK
 /// task. Dropping the `DurableFuture` loses only the result: the operation
-/// runs until it settles, records its outcome and fires its plugin hooks.
-/// Its error goes into its record and is returned to nobody. A panic in it
-/// fails the invocation.
+/// keeps running until it settles, its scope closes or the invocation ends.
+/// An operation that settles records its outcome and fires its plugin
+/// hooks. Its error goes into its record and is returned to nobody, and a
+/// panic in it fails the invocation. A running detached operation keeps the
+/// invocation from suspending, and one that waits only on the service lets
+/// it suspend. When the handler returns, the invocation ends and stops each
+/// detached operation that still runs. A stopped operation fires no end
+/// hook. Its record, if it has one, keeps the last state written, which can
+/// be `STARTED`, and the execution can end with the handler's result.
 ///
 /// The SDK stops work in three cases:
 ///
