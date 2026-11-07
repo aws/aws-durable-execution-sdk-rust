@@ -623,9 +623,12 @@ impl StepDetails {
     /// The time the step's next attempt was scheduled for, after a retry.
     /// `None` for a step that was never retried.
     ///
-    /// Under [`LocalRunner`] it is the virtual time the latest retry delay
-    /// ended. Under [`CloudRunner`] it is the timestamp of the latest
-    /// `StepFailed` event that carries a retry delay, plus that delay.
+    /// A step retry and a `wait_for_condition` check that continued both
+    /// set it. Under [`LocalRunner`] it is the virtual time the latest retry
+    /// delay ended. Under [`CloudRunner`] it is the timestamp of the latest
+    /// step event that carries a retry delay, plus that delay: a
+    /// `StepFailed` for a step retry, or a `StepSucceeded` for a check that
+    /// continued. The two runners report the same value.
     pub fn next_attempt_time(&self) -> Option<std::time::SystemTime> {
         self.next_attempt_time
     }
@@ -3762,8 +3765,9 @@ fn fold_history(events: &[Event]) -> Vec<TestOperation> {
         }
         apply_event_transition(op, event);
         // The end time is the timestamp of the terminal event. A retried
-        // step records `StepFailed` and then `StepStarted`, so a later
-        // non-terminal event clears the end time of an earlier failure.
+        // step records `StepFailed`, and a `wait_for_condition` check that
+        // continued records `StepSucceeded`, and then `StepStarted`, so a
+        // later non-terminal event clears the end time of an earlier one.
         op.end_time = if is_terminal_status(op.status) {
             event_time(event)
         } else {
@@ -3802,22 +3806,16 @@ fn apply_event_transition(op: &mut TestOperation, event: &Event) {
             if let Some(details) = event.step_succeeded_details() {
                 op.result = event_result_payload(details.result());
                 set_attempt(op, details.retry_details());
+                // A `wait_for_condition` check that continued records
+                // `StepSucceeded` with a retry delay.
+                set_next_attempt_time(op, event, details.retry_details());
             }
         }
         Some(EventType::StepFailed) => {
             op.status = OperationStatus::Failed;
             if let Some(details) = event.step_failed_details() {
                 set_attempt(op, details.retry_details());
-                // The latest `StepFailed` that carries a retry delay sets
-                // the next attempt time; one without a delay keeps it. A
-                // carried delay whose time cannot be represented sets
-                // `None`, so the value never describes an older retry.
-                if let Some(delay) = details
-                    .retry_details()
-                    .and_then(RetryDetails::next_attempt_delay_seconds)
-                {
-                    op.step.next_attempt_time = next_attempt_time(event, delay);
-                }
+                set_next_attempt_time(op, event, details.retry_details());
             }
         }
         Some(EventType::WaitSucceeded) => op.status = OperationStatus::Succeeded,
@@ -3860,10 +3858,23 @@ fn event_time(event: &Event) -> Option<std::time::SystemTime> {
         .and_then(|t| std::time::SystemTime::try_from(*t).ok())
 }
 
-/// The next attempt time of a `StepFailed` event: its timestamp plus its
-/// retry delay `delay_seconds`, as the JS cloud runner derives it. `None`
-/// when the event has no timestamp, the delay is negative, or the sum
-/// overflows `SystemTime`.
+/// Sets the next attempt time of a step from the retry details of its
+/// `StepFailed` or `StepSucceeded` event `event`.
+///
+/// The latest step event that carries a retry delay sets the next attempt
+/// time; one without a delay keeps it. A carried delay whose time cannot
+/// be represented sets `None`, so the value never describes an older retry.
+fn set_next_attempt_time(op: &mut TestOperation, event: &Event, retry: Option<&RetryDetails>) {
+    if let Some(delay) = retry.and_then(RetryDetails::next_attempt_delay_seconds) {
+        op.step.next_attempt_time = next_attempt_time(event, delay);
+    }
+}
+
+/// The next attempt time of a step event that carries a retry delay (a
+/// `StepFailed` of a step retry, or a `StepSucceeded` of a
+/// `wait_for_condition` check that continued): its timestamp plus the
+/// delay `delay_seconds`. `None` when the event has no timestamp, the
+/// delay is negative, or the sum overflows `SystemTime`.
 fn next_attempt_time(event: &Event, delay_seconds: i32) -> Option<std::time::SystemTime> {
     let delay = std::time::Duration::from_secs(u64::try_from(delay_seconds).ok()?);
     event_time(event)?.checked_add(delay)
@@ -3900,7 +3911,8 @@ fn event_result_payload(result: Option<&EventResult>) -> Option<String> {
 ///
 /// The op holds the error of its latest event. A retried step records
 /// `StepFailed` with an error and then `StepStarted` or `StepSucceeded`
-/// without one. Keeping the earlier error would report a succeeded step with
+/// without one, and a `wait_for_condition` check that continued records
+/// `StepSucceeded` without one. Keeping the earlier error would report a succeeded step with
 /// the error of a failed attempt. So an event without an error clears it, as
 /// `LocalRunner` clears a stored error when a retry starts.
 fn set_error(op: &mut TestOperation, error: Option<&EventError>) {
@@ -5026,20 +5038,35 @@ impl BackendState {
                         .retry_details(retry_details(op.attempt.saturating_add(1), None))
                         .build(),
                 ),
-            // A `RETRY` has already counted the failed attempt in
-            // `attempt`, so `attempt` is the 1-based number of that attempt.
-            (OperationKind::Step, OperationAction::Retry) => op_event(op, EventType::StepFailed)
-                .step_failed_details(
-                    aws_sdk_lambda::types::StepFailedDetails::builder()
-                        .set_error(error())
-                        .retry_details(retry_details(
-                            op.attempt,
-                            update.step_options().and_then(
-                                aws_sdk_lambda::types::StepOptions::next_attempt_delay_seconds,
-                            ),
-                        ))
-                        .build(),
-                ),
+            // A `RETRY` has already counted the attempt in `attempt`, so
+            // `attempt` is the 1-based number of that attempt. A `RETRY`
+            // with an error is a failed step attempt, which the service
+            // records as `StepFailed`. A `RETRY` without an error is a
+            // `wait_for_condition` check that asked to continue, which the
+            // service records as `StepSucceeded` with the update's payload,
+            // the new state.
+            (OperationKind::Step, OperationAction::Retry) => {
+                let retry = retry_details(
+                    op.attempt,
+                    update
+                        .step_options()
+                        .and_then(aws_sdk_lambda::types::StepOptions::next_attempt_delay_seconds),
+                );
+                match error() {
+                    Some(error) => op_event(op, EventType::StepFailed).step_failed_details(
+                        aws_sdk_lambda::types::StepFailedDetails::builder()
+                            .error(error)
+                            .retry_details(retry)
+                            .build(),
+                    ),
+                    None => op_event(op, EventType::StepSucceeded).step_succeeded_details(
+                        aws_sdk_lambda::types::StepSucceededDetails::builder()
+                            .set_result(event_result(update.payload()))
+                            .retry_details(retry)
+                            .build(),
+                    ),
+                }
+            }
             (OperationKind::Context, OperationAction::Start) => {
                 op_event(op, EventType::ContextStarted).context_started_details(
                     aws_sdk_lambda::types::ContextStartedDetails::builder().build(),
@@ -17561,7 +17588,113 @@ mod tests {
                     },
                 ],
             },
+            EventRow {
+                row: 17,
+                setup: || handler_row(poll_handler),
+                checks: vec![EventCheck {
+                    event_type: EventType::StepSucceeded,
+                    owner: Owner::Op("poll"),
+                    expected: |_| json!({ "result": payload("1"), "retry_details": retry(1, Some(1)) }),
+                }],
+            },
         ]
+    }
+
+    /// A `wait_for_condition` named `poll` whose check adds 1 to a state
+    /// that starts at 0, and whose strategy continues with a 1 s delay
+    /// while the state is below 2.
+    async fn poll_handler((): (), ctx: DurableContext) -> Result<i32, BoxError> {
+        use crate::builders::wait_for_condition::WaitDecision;
+        Ok(ctx
+            .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
+            .wait_strategy_fn(|state: i32, _attempt| {
+                if state < 2 {
+                    WaitDecision::continue_with(std::time::Duration::from_secs(1))
+                } else {
+                    WaitDecision::complete()
+                }
+            })
+            .name("poll")
+            .await?)
+    }
+
+    /// A `StepSucceeded` that carries a retry delay, as the service records
+    /// a `wait_for_condition` check that continued, sets the next attempt
+    /// time, and a later `StepSucceeded` without a delay keeps it.
+    #[tokio::test]
+    async fn fold_history_reads_the_delay_of_a_step_succeeded() {
+        use aws_sdk_lambda::types::{
+            EventResult, RetryDetails, StepStartedDetails, StepSucceededDetails,
+        };
+        let started = |id: i32, at: i64| {
+            Event::builder()
+                .event_type(EventType::StepStarted)
+                .id("s")
+                .event_id(id)
+                .event_timestamp(DateTime::from_secs(at))
+                .step_started_details(StepStartedDetails::builder().build())
+                .build()
+        };
+        let succeeded = |id: i32, at: i64, result: &str, attempt: i32, delay: Option<i32>| {
+            Event::builder()
+                .event_type(EventType::StepSucceeded)
+                .id("s")
+                .event_id(id)
+                .event_timestamp(DateTime::from_secs(at))
+                .step_succeeded_details(
+                    StepSucceededDetails::builder()
+                        .result(EventResult::builder().payload(result).build())
+                        .retry_details(
+                            RetryDetails::builder()
+                                .current_attempt(attempt)
+                                .set_next_attempt_delay_seconds(delay)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build()
+        };
+        let ops = fold_history(&[
+            started(1, 100),
+            succeeded(2, 100, "1", 1, Some(1)),
+            started(3, 101),
+            succeeded(4, 101, "2", 2, None),
+        ]);
+        let op = ops.first().expect("one operation");
+        let step = step_details(op).expect("step");
+        assert_eq!(
+            (
+                op.status(),
+                op.result(),
+                step.attempt(),
+                step.next_attempt_time()
+            ),
+            (
+                OperationStatus::Succeeded,
+                Some("2"),
+                1,
+                Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(101)),
+            )
+        );
+
+        // `CloudRunner`'s fold of `LocalRunner`'s history reports the next
+        // attempt time `LocalRunner` reports.
+        let result = LocalRunner::new()
+            .run(poll_handler, ())
+            .await
+            .expect("runner");
+        let local = result.operation("poll").expect("the condition");
+        let folded = fold_history(result.history_events());
+        let cloud = folded
+            .iter()
+            .find(|op| op.name() == Some("poll"))
+            .expect("the folded condition");
+        let local_time = step_details(local).expect("step").next_attempt_time();
+        assert!(local_time.is_some());
+        assert_eq!(
+            step_details(cloud).expect("step").next_attempt_time(),
+            local_time
+        );
     }
 
     /// Each cause of rule 5 records its event, with the operation's
@@ -17569,7 +17702,7 @@ mod tests {
     #[tokio::test]
     async fn local_events_cover_every_cause_and_detail() {
         let rows = event_rows();
-        assert_eq!(rows.len(), 16);
+        assert_eq!(rows.len(), 17);
         for EventRow { row, setup, checks } in rows {
             let (events, operations) = setup().await;
             for check in checks {

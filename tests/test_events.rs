@@ -151,6 +151,85 @@ async fn retried_step_records_failure_events() {
     );
 }
 
+/// A `wait_for_condition` named `poll` whose check adds 1 to a state that
+/// starts at 0, and whose strategy continues with a 1 s delay while the
+/// state is below 2.
+async fn poll_handler((): (), ctx: DurableContext) -> Result<i32, BoxError> {
+    use durable::builders::wait_for_condition::WaitDecision;
+    Ok(ctx
+        .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
+        .wait_strategy_fn(|state: i32, _attempt| {
+            if state < 2 {
+                WaitDecision::continue_with(Duration::from_secs(1))
+            } else {
+                WaitDecision::complete()
+            }
+        })
+        .name("poll")
+        .await?)
+}
+
+/// A check that continues records `StepSucceeded` with the new state and
+/// the delay, as the service does, and the next attempt time is the start
+/// of `poll` plus that delay.
+#[tokio::test]
+async fn condition_continue_records_step_succeeded() {
+    let result = LocalRunner::new()
+        .run(poll_handler, ())
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&2));
+    assert_eq!(
+        types(result.history_events()),
+        [
+            EventType::ExecutionStarted,
+            EventType::StepStarted,
+            EventType::StepSucceeded,
+            EventType::InvocationCompleted,
+            EventType::StepStarted,
+            EventType::StepSucceeded,
+            EventType::InvocationCompleted,
+            EventType::ExecutionSucceeded,
+        ]
+    );
+
+    let poll = result.operation("poll").expect("the condition");
+    let succeeded: Vec<_> = poll
+        .events()
+        .iter()
+        .filter_map(Event::step_succeeded_details)
+        .map(|details| {
+            let retry = details.retry_details().expect("retry details");
+            (
+                details
+                    .result()
+                    .and_then(|r| r.payload())
+                    .map(ToOwned::to_owned),
+                retry.current_attempt(),
+                retry.next_attempt_delay_seconds(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        succeeded,
+        [
+            (Some("1".to_owned()), 1, Some(1)),
+            (Some("2".to_owned()), 2, None),
+        ]
+    );
+
+    let step = match poll.details() {
+        durable::test_util::TestOperationDetails::Step(step) => Some(step),
+        _ => None,
+    }
+    .expect("a step operation");
+    let start = poll.start_time().expect("a start time");
+    assert_eq!(
+        step.next_attempt_time(),
+        Some(start + Duration::from_secs(1))
+    );
+}
+
 /// A `wait_for_callback` whose callback receives a failure.
 #[tokio::test]
 async fn callback_failure_event_carries_error() {

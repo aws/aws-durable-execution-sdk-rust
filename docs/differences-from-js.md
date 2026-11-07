@@ -657,3 +657,11 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Why:** The service keeps the caller's invoke pending in that case, and JavaScript holds the test until the test framework's timeout instead.
 - **Decision:** JavaScript defect.
 - **Where:** `src/test_util.rs`, `LocalRunner::drive_nested`, `Backend::record_invoke_outcome` and `suspended_message`.
+
+### Next attempt time of a continued check
+
+- **JavaScript:** The local server stores a next attempt time for every STEP `RETRY`, while the cloud runner reads one only from `StepFailed`, so a continued check has one locally and none under the cloud runner.
+- **Rust:** `LocalRunner` and `CloudRunner` both report it.
+- **Why:** The service records the continue as `StepSucceeded` with `RetryDetails.NextAttemptDelaySeconds`, so JavaScript's cloud runner drops a value the history carries, and the same test sees a next attempt time under one JavaScript runner and none under the other.
+- **Decision:** JavaScript defect.
+- **Where:** `src/test_util.rs`, `BackendState::apply_update`, `snapshot_of` and `apply_event_transition`.
