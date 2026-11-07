@@ -188,11 +188,11 @@ This page lists every place where the Rust SDK behaves differently from the Java
 
 ### `wait_for_condition` shape
 
-- **JavaScript:** `initialState` is required, checked at run time. The strategy returns `{ shouldContinue }`, true to keep polling.
-- **Rust:** A typed initial state is required, checked at compile time. The strategy returns `WaitDecision`, and `WaitStrategy::builder(predicate)` takes a predicate that returns `true` when done.
+- **JavaScript:** `waitStrategy` and `initialState` are required by the TypeScript API and checked synchronously at run time. The strategy returns `{ shouldContinue: false }` to complete or `{ shouldContinue: true, delay }` to continue polling.
+- **Rust:** A wait strategy and a typed initial state are required at compile time. The strategy returns `WaitDecision`, and `WaitStrategy::builder(predicate)` takes a predicate that returns `true` when done.
 - **Why:** Types replace a run-time check; the predicate states the same condition with the opposite sign.
 - **Decision:** Same capability in Rust form.
-- **Where:** `src/context.rs`, `wait_for_condition`.
+- **Where:** `src/context.rs`, `wait_for_condition`; `src/builders/wait_for_condition.rs`, `WaitForConditionBuilder`.
 
 ### `WaitStrategyConfig.timeoutSeconds`
 

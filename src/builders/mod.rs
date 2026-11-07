@@ -1,8 +1,11 @@
 //! Fluent operation builders, one public submodule per operation.
 //!
-//! Every builder implements [`IntoFuture`], so awaiting the builder runs
-//! the operation, and provides a `.spawn()` terminal that starts it
-//! eagerly. Chain methods consume and return `self`.
+//! Every builder whose required configuration is present implements
+//! [`IntoFuture`], so awaiting the builder runs the operation, and provides
+//! `.future()` and a `.spawn()` terminal that starts it eagerly. Every
+//! builder is executable as created except
+//! [`WaitForConditionBuilder`], which needs a wait strategy first. Chain
+//! methods consume and return `self`.
 //!
 //! # Layout
 //!
@@ -18,8 +21,11 @@
 //!   types specific to that operation: [`map_parallel`] holds
 //!   [`CompletionConfig`](map_parallel::CompletionConfig) and the batch
 //!   result types, [`wait_for_condition`] holds
-//!   [`WaitStrategy`](wait_for_condition::WaitStrategy) and
-//!   [`WaitDecision`](wait_for_condition::WaitDecision), and [`callback`]
+//!   [`WaitStrategy`](wait_for_condition::WaitStrategy),
+//!   [`WaitDecision`](wait_for_condition::WaitDecision) and the two
+//!   wait-strategy states of its builder,
+//!   [`NoWaitStrategy`](wait_for_condition::NoWaitStrategy) and
+//!   [`WithWaitStrategy`](wait_for_condition::WithWaitStrategy), and [`callback`]
 //!   holds the [`Callback`](callback::Callback) handle.
 //! - [`RetryStrategyConfig`], [`Backoff`] and [`JitterStrategy`] live at this module's
 //!   root because retry shaping is shared by three operations
@@ -1109,6 +1115,7 @@ mod tests {
             .spawn();
         let condition = ctx
             .wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0)
+            .wait_strategy_fn(|_state, _attempt| wait_for_condition::WaitDecision::complete())
             .name("c")
             .spawn();
         assert_eq!(
@@ -1357,14 +1364,15 @@ mod tests {
         assert!(built.retry_predicate().is_none());
     }
 
-    /// Constructs all fourteen builders and finalizes each through
-    /// `.name()`, `.future()`, and `.spawn()`, so a builder losing any of
-    /// the three methods fails the build. All fourteen expose all three
-    /// today; the returned futures are dropped unawaited because this test
-    /// guards the fluent surface, not operation execution (which the
+    /// Constructs all fourteen builders in their configured, executable
+    /// states (a `wait_for_condition` builder with a wait strategy) and
+    /// finalizes each through `.name()`, `.future()`, and `.spawn()`, so a
+    /// configured builder losing any of the three methods fails the build.
+    /// The returned futures are dropped unawaited because this test guards
+    /// the fluent surface, not operation execution (which the
     /// per-operation tests and the conformance suites cover).
     #[tokio::test]
-    async fn all_fourteen_builders_expose_name_future_and_spawn() {
+    async fn all_fourteen_configured_builders_expose_name_future_and_spawn() {
         fn constituents(ctx: &DurableContext) -> Vec<DurableFuture<i32>> {
             vec![
                 ctx.step(|_| async { Ok(1_i32) }).future(),
@@ -1419,10 +1427,12 @@ mod tests {
         // WaitForConditionBuilder
         let _wfc_f = ctx
             .wait_for_condition(|_sc, state: i32| async move { Ok(state) }, 0_i32)
+            .wait_strategy_fn(|_state, _attempt| wait_for_condition::WaitDecision::complete())
             .name("wait-for-condition")
             .future();
         let _wfc_s = ctx
             .wait_for_condition(|_sc, state: i32| async move { Ok(state) }, 0_i32)
+            .wait_strategy_fn(|_state, _attempt| wait_for_condition::WaitDecision::complete())
             .name("wait-for-condition")
             .spawn();
 

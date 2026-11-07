@@ -769,6 +769,9 @@ async fn wfc_state_serialization_failure_persists_fail_and_replays_without_rerun
                             },
                             0_u32,
                         )
+                        .wait_strategy_fn(|_state, _attempt| {
+                            durable::builders::wait_for_condition::WaitDecision::complete()
+                        })
                         .name("bad-wfc")
                         .serdes(FailSerializeAfterInitial)
                         .await;

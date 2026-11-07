@@ -787,10 +787,16 @@ async fn condition_inputs_first_poll_before_combinator_start_hook() {
         let invocation = invoke(transport, move |_, ctx| async move {
             let a = ctx
                 .wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0)
+                .wait_strategy_fn(|_state, _attempt| {
+                    durable::builders::wait_for_condition::WaitDecision::complete()
+                })
                 .name("a")
                 .future();
             let b = ctx
                 .wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0)
+                .wait_strategy_fn(|_state, _attempt| {
+                    durable::builders::wait_for_condition::WaitDecision::complete()
+                })
                 .name("b")
                 .future();
             combinator.run(&ctx, vec![a, b]).await;

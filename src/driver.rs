@@ -4559,6 +4559,8 @@ mod refresh_scheduler {
         i32,
         impl Fn(crate::StepContext, i32) -> CheckFuture + Send + Sync + 'static,
         CheckFuture,
+        crate::serdes::JsonSerdes,
+        crate::builders::wait_for_condition::WithWaitStrategy<i32>,
     > {
         let checks = Arc::clone(checks);
         ctx.wait_for_condition(

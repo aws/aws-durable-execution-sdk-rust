@@ -21,8 +21,10 @@ use crate::error::{ChildFnError, OperationError};
 
 /// The uniform future handle for all durable operations.
 ///
-/// Every builder's [`IntoFuture`](std::future::IntoFuture) target is
-/// `DurableFuture<O>`. Every operation except a combinator and a
+/// Every builder state that implements
+/// [`IntoFuture`](std::future::IntoFuture) targets `DurableFuture<O>`. A
+/// `wait_for_condition` builder implements it only once a wait strategy is
+/// set. Every operation except a combinator and a
 /// [`DurableContext::with_retry`] block has already claimed its operation
 /// ID when its builder was created. A `with_retry` block with its own
 /// record claims its ID when the builder becomes this future; an unwrapped

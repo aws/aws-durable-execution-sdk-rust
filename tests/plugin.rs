@@ -1573,6 +1573,9 @@ async fn wfc_check_error() {
                         |_ctx, _state: u32| async move { Err::<u32, BoxError>("bad".into()) },
                         0_u32,
                     )
+                    .wait_strategy_fn(|_state, _attempt| {
+                        durable::builders::wait_for_condition::WaitDecision::complete()
+                    })
                     .name("cond")
                     .await?,
                 )

@@ -569,6 +569,9 @@ async fn handler_condition_spawned_on_raw_task_with_replay_mismatch_is_refused()
     let result = run_contradicted_spawn(LocalRunner::new(), |ctx: &DurableContext| {
         let builder = ctx
             .wait_for_condition(|_, state: u32| async move { Ok(state) }, 0_u32)
+            .wait_strategy_fn(|_state, _attempt| {
+                durable::builders::wait_for_condition::WaitDecision::complete()
+            })
             .name("foreign");
         Box::new(move || builder.spawn())
     })

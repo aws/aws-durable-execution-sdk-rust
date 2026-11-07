@@ -1912,6 +1912,9 @@ fn lazy_input(
                 },
                 0_u32,
             )
+            .wait_strategy_fn(|_state, _attempt| {
+                durable::builders::wait_for_condition::WaitDecision::complete()
+            })
             .name("in")
             .future(),
     }

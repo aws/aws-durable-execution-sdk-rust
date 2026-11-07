@@ -226,13 +226,16 @@ operations below it exposes `execution_arn()`, `lambda_context()` for the
 request ID and deadline, and `is_replaying()`, which tells you whether the
 current invocation is replaying recorded results.
 
-Every operation method returns a builder. Builders implement `IntoFuture`, so
-awaiting the builder runs the operation; there is no separate build step.
-`.name("...")` labels the operation in the execution history. `.future()`
-converts the builder into a `DurableFuture<O>` that the combinators accept.
-`.spawn()` starts the operation immediately and returns the same
-`DurableFuture<O>`, which lets you overlap independent work and join it with
-`tokio::join!`.
+Every operation method returns a builder. A builder whose required
+configuration is present implements `IntoFuture`, so awaiting the builder
+runs the operation; there is no separate build step. Every builder has its
+required configuration when it is created, except a `wait_for_condition`
+builder, which needs a wait strategy first. `.name("...")` labels the
+operation in the execution history. On a builder whose required
+configuration is present, `.future()` converts the builder into a
+`DurableFuture<O>` that the combinators accept, and `.spawn()` starts the
+operation immediately and returns the same `DurableFuture<O>`, which lets
+you overlap independent work and join it with `tokio::join!`.
 
 ```rust ignore
 let wait = ctx.wait(Duration::from_secs(5)).name("timer").spawn();
@@ -623,7 +626,11 @@ invocation.
 between attempts, and waits between polls. The invocation suspends during
 that wait only when no other SDK work can make progress, and a check that
 becomes due while other work runs continues in the same invocation.
-`wait_strategy_fn` receives the
+A wait strategy is required: call `.wait_strategy(...)` or
+`.wait_strategy_fn(...)` before the builder can become a future. Code that
+awaits the builder without one, or calls `.future()` or `.spawn()` on it,
+fails to compile. A second call of either setter replaces the first
+strategy. `wait_strategy_fn` receives the
 current state and the attempt number and returns `WaitDecision::complete()`
 or `WaitDecision::continue_with(delay)`.
 
@@ -653,8 +660,7 @@ otherwise waits for the computed backoff delay. Build one with
 argument, so an unbounded strategy cannot be constructed), and the
 remaining knobs default to 60 attempts, 5 second initial delay, 5 minute
 maximum delay, 1.5 backoff rate, and full jitter, matching the JS and
-Python SDKs. With no strategy set at all, the check runs exactly once and
-the operation completes with that state. A check that becomes due while
+Python SDKs. A check that becomes due while
 other work runs continues in the same invocation.
 
 ### callbacks
@@ -1303,7 +1309,10 @@ carries its serdes as a generic type parameter defaulting to `JsonSerdes`,
 and `.serdes(...)` swaps that parameter; `.await` still produces a
 `DurableFuture<O>` regardless of the serdes type, so futures configured
 with different serdes implementations coexist in one combinator input
-collection. `WaitBuilder` and the combinator builders carry no serdes
+collection. On `WaitForConditionBuilder`, `.serdes(...)` keeps the
+builder's wait-strategy state: changing the serdes neither satisfies nor
+removes the requirement to set a wait strategy. `WaitBuilder` and the
+combinator builders carry no serdes
 method because their payloads are structural, not user-typed.
 `MapBuilder`, `ParallelBuilder` and `ParallelMixedBuilder` also carry a
 result serdes, set with `.result_serdes(...)`, which defaults to

@@ -121,7 +121,7 @@ pub(crate) struct WaitForConditionExecution<S, F, SD> {
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) initial_state: S,
-    pub(crate) wait_strategy: Option<WaitStrategyFn<S>>,
+    pub(crate) wait_strategy: WaitStrategyFn<S>,
     pub(crate) serdes: SD,
     pub(crate) check: F,
 }
@@ -233,7 +233,7 @@ struct WfcCore<S, SD> {
     op_id: OperationId,
     name: Option<String>,
     initial_state: S,
-    wait_strategy: Option<WaitStrategyFn<S>>,
+    wait_strategy: WaitStrategyFn<S>,
     serdes: SD,
 }
 
@@ -551,14 +551,7 @@ where
                 };
 
                 // Consult the wait strategy.
-                let decision = if let Some(strategy) = &self.wait_strategy {
-                    strategy(deserialized.clone(), attempt)
-                } else {
-                    // Documented no-strategy behavior: the check runs exactly
-                    // once and the operation completes with that state (see
-                    // `WaitForConditionBuilder` docs).
-                    WaitDecision::Complete
-                };
+                let decision = (self.wait_strategy)(deserialized.clone(), attempt);
 
                 match decision {
                     WaitDecision::Complete => {
@@ -1074,13 +1067,13 @@ mod tests {
             op_id,
             name: None,
             initial_state: 0i32,
-            wait_strategy: Some(Box::new(|state: i32, _attempt| {
+            wait_strategy: Box::new(|state: i32, _attempt| {
                 if state >= 3 {
                     WaitDecision::complete()
                 } else {
                     WaitDecision::continue_with(Duration::from_secs(1))
                 }
-            })),
+            }),
             serdes: crate::serdes::JsonSerdes,
             check: move |_ctx, state: i32| {
                 *seen_check
@@ -1189,9 +1182,9 @@ mod tests {
             op_id,
             name: None,
             initial_state: 0i32,
-            wait_strategy: Some(Box::new(|_state: i32, _attempt| {
+            wait_strategy: Box::new(|_state: i32, _attempt| {
                 WaitDecision::continue_with(Duration::from_secs(1))
-            })),
+            }),
             serdes: filesystem_serdes.clone(),
             check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state + 1) },
         };
@@ -1241,13 +1234,13 @@ mod tests {
             op_id,
             name: Some("immediate".to_owned()),
             initial_state: 10i32,
-            wait_strategy: Some(Box::new(|state: i32, _attempt| {
+            wait_strategy: Box::new(|state: i32, _attempt| {
                 if state >= 5 {
                     WaitDecision::complete()
                 } else {
                     WaitDecision::continue_with(Duration::from_secs(1))
                 }
-            })),
+            }),
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state) },
         };
@@ -1297,13 +1290,13 @@ mod tests {
             op_id,
             name: None,
             initial_state: 0i32,
-            wait_strategy: Some(Box::new(|state: i32, _attempt| {
+            wait_strategy: Box::new(|state: i32, _attempt| {
                 if state >= 3 {
                     WaitDecision::complete()
                 } else {
                     WaitDecision::continue_with(Duration::from_secs(1))
                 }
-            })),
+            }),
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state + 1) },
         };
@@ -1327,14 +1320,14 @@ mod tests {
             op_id,
             name: None,
             initial_state: 0i32,
-            wait_strategy: Some(Box::new(|_state: i32, attempt| {
+            wait_strategy: Box::new(|_state: i32, attempt| {
                 // Always exhaust on attempt 1.
                 if attempt >= 1 {
                     WaitDecision::exhausted("max attempts exceeded")
                 } else {
                     WaitDecision::continue_with(Duration::from_secs(1))
                 }
-            })),
+            }),
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state + 1) },
         };
@@ -1408,7 +1401,7 @@ mod tests {
             op_id,
             name: Some("regression".to_owned()),
             initial_state: 0,
-            wait_strategy: Some(Box::new(|_state: i32, _attempt| WaitDecision::complete())),
+            wait_strategy: Box::new(|_state: i32, _attempt| WaitDecision::complete()),
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
                 #[expect(unreachable_code)] // reason: type anchor for the diverging body
@@ -1506,6 +1499,7 @@ mod tests {
                 |_ctx, _state: u32| async { Err::<u32, BoxError>("bad".into()) },
                 0_u32,
             )
+            .wait_strategy_fn(|_state, _attempt| WaitDecision::complete())
             .name("cond")
             .await
             .unwrap_err();
@@ -1611,6 +1605,7 @@ mod tests {
                 },
                 0_u32,
             )
+            .wait_strategy_fn(|_state, _attempt| WaitDecision::complete())
             .name("cond")
             .await
             .unwrap_err();
@@ -1682,7 +1677,7 @@ mod tests {
             op_id,
             name: None,
             initial_state: 0,
-            wait_strategy: Some(Box::new(|_state: i32, _attempt| WaitDecision::complete())),
+            wait_strategy: Box::new(|_state: i32, _attempt| WaitDecision::complete()),
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async {
                 Err::<i32, BoxError>("check function failed".into())
@@ -1731,7 +1726,7 @@ mod tests {
             op_id,
             name: None,
             initial_state: 0,
-            wait_strategy: None,
+            wait_strategy: Box::new(|_state, _attempt| WaitDecision::complete()),
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
                 #[expect(unreachable_code)] // reason: type anchor for the diverging body
@@ -1782,7 +1777,7 @@ mod tests {
             op_id,
             name: None,
             initial_state: 0,
-            wait_strategy: None,
+            wait_strategy: Box::new(|_state, _attempt| WaitDecision::complete()),
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
                 #[expect(unreachable_code)] // reason: type anchor for the diverging body
@@ -1843,7 +1838,7 @@ mod tests {
             op_id,
             name: None,
             initial_state: 0,
-            wait_strategy: None,
+            wait_strategy: Box::new(|_state, _attempt| WaitDecision::complete()),
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
                 #[expect(unreachable_code)] // reason: type anchor for the diverging body
@@ -2021,8 +2016,9 @@ mod tests {
         )
     }
 
-    /// Runs one `wait_for_condition` with no strategy whose check records
-    /// the state it receives and returns it.
+    /// Runs one `wait_for_condition` whose strategy completes after the
+    /// first check, and whose check records the state it receives and
+    /// returns it.
     async fn first_check_receives<S, SD>(
         records: Vec<(String, CheckpointRecord)>,
         initial_state: S,
@@ -2042,7 +2038,7 @@ mod tests {
             op_id,
             name: None,
             initial_state,
-            wait_strategy: None,
+            wait_strategy: Box::new(|_state, _attempt| WaitDecision::complete()),
             serdes,
             check: move |_ctx, state: S| {
                 let seen = Arc::clone(&seen_check);
@@ -2097,7 +2093,7 @@ mod tests {
             op_id,
             name: None,
             initial_state: "a".to_owned(),
-            wait_strategy: None,
+            wait_strategy: Box::new(|_state, _attempt| WaitDecision::complete()),
             serdes,
             check: move |_ctx, state: String| {
                 called.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2245,7 +2241,7 @@ mod tests {
                 op_id,
                 name: None,
                 initial_state: 0,
-                wait_strategy: None,
+                wait_strategy: Box::new(|_state, _attempt| WaitDecision::complete()),
                 serdes: crate::serdes::JsonSerdes,
                 check: move |_ctx, _state: i32| async move { Err::<i32, BoxError>(make_err()) },
             };
@@ -2284,7 +2280,7 @@ mod tests {
                 op_id,
                 name: None,
                 initial_state: 0,
-                wait_strategy: None,
+                wait_strategy: Box::new(|_state, _attempt| WaitDecision::complete()),
                 serdes: crate::serdes::JsonSerdes,
                 check: |_ctx, _state: i32| async move {
                     #[expect(unreachable_code)] // reason: type anchor for the diverging body
@@ -2616,6 +2612,9 @@ mod start_write_tests {
                     },
                     0,
                 )
+                .wait_strategy_fn(|_state, _attempt| {
+                    crate::builders::wait_for_condition::WaitDecision::complete()
+                })
                 .name("c")
                 .await
                 .map_err(wire_err)?;

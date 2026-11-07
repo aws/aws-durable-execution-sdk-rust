@@ -4237,6 +4237,9 @@ mod start_write_tests {
                 },
                 0,
             )
+            .wait_strategy_fn(|_state, _attempt| {
+                crate::builders::wait_for_condition::WaitDecision::complete()
+            })
             .name("c")
             .await
             .map_err(wire_err)?;
@@ -4328,6 +4331,9 @@ mod start_write_tests {
                 },
                 0,
             )
+            .wait_strategy_fn(|_state, _attempt| {
+                crate::builders::wait_for_condition::WaitDecision::complete()
+            })
             .name("c")
             .await
             .map_err(wire_err)?;

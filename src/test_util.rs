@@ -7061,6 +7061,9 @@ mod tests {
                         },
                         "a".to_owned(),
                     )
+                    .wait_strategy_fn(|_state, _attempt| {
+                        crate::builders::wait_for_condition::WaitDecision::complete()
+                    })
                     .name("poll")
                     .serdes(UpperSerdes)
                     .await?;

@@ -20,20 +20,65 @@ use crate::serdes::JsonSerdes;
 
 pub use crate::wait_for_condition::WaitDecision;
 
+/// The wait-strategy state of a [`WaitForConditionBuilder`] that has no
+/// strategy yet.
+///
+/// [`DurableContext::wait_for_condition`] returns a builder in this state.
+/// A builder in this state cannot be awaited and has no
+/// [`future`](WaitForConditionBuilder::future) or
+/// [`spawn`](WaitForConditionBuilder::spawn) method: call
+/// [`wait_strategy`](WaitForConditionBuilder::wait_strategy) or
+/// [`wait_strategy_fn`](WaitForConditionBuilder::wait_strategy_fn) to move
+/// it to [`WithWaitStrategy`].
+pub struct NoWaitStrategy {
+    _private: (),
+}
+
+impl std::fmt::Debug for NoWaitStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoWaitStrategy").finish()
+    }
+}
+
+/// The wait-strategy state of a [`WaitForConditionBuilder`] that holds a
+/// wait strategy for the state type `S`.
+///
+/// [`wait_strategy`](WaitForConditionBuilder::wait_strategy) and
+/// [`wait_strategy_fn`](WaitForConditionBuilder::wait_strategy_fn) return a
+/// builder in this state. Only a builder in this state implements
+/// [`IntoFuture`] and has [`future`](WaitForConditionBuilder::future) and
+/// [`spawn`](WaitForConditionBuilder::spawn).
+pub struct WithWaitStrategy<S> {
+    strategy: crate::wait_for_condition::WaitStrategyFn<S>,
+}
+
+impl<S> std::fmt::Debug for WithWaitStrategy<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WithWaitStrategy").finish_non_exhaustive()
+    }
+}
+
 /// Builder for a wait-for-condition operation.
 ///
-/// Created by [`DurableContext::wait_for_condition`]. Configure the polling
-/// strategy with [`wait_strategy`](Self::wait_strategy) (a bounded
+/// Created by [`DurableContext::wait_for_condition`]. A wait strategy is
+/// required: set it with [`wait_strategy`](Self::wait_strategy) (a bounded
 /// [`WaitStrategy`] configuration) or
-/// [`wait_strategy_fn`](Self::wait_strategy_fn) (a custom closure).
-///
-/// With **no strategy set**, the check runs exactly once and the operation
-/// completes with that check's state: it does not poll. Set a strategy to
-/// poll.
+/// [`wait_strategy_fn`](Self::wait_strategy_fn) (a custom closure). After
+/// each check, the strategy decides whether the operation completes,
+/// continues polling after a delay, or exhausts.
 ///
 /// The builder is generic over the check closure `F` and its future
 /// `Fut`; both parameters are inferred at the call site and never written
-/// by users.
+/// by users. `SD` is the state's serdes, [`JsonSerdes`] unless
+/// [`serdes`](Self::serdes) replaces it. `WS` is the wait-strategy state:
+/// [`NoWaitStrategy`] when the builder is created, and
+/// [`WithWaitStrategy<S>`] once either strategy setter has run.
+///
+/// Only a builder in the [`WithWaitStrategy<S>`] state implements
+/// [`IntoFuture`] and has [`future`](Self::future) and
+/// [`spawn`](Self::spawn), so code that awaits, converts or spawns a
+/// builder without a strategy fails to compile. [`name`](Self::name) and
+/// [`serdes`](Self::serdes) keep the strategy state, in any order.
 ///
 /// # Examples
 ///
@@ -65,20 +110,100 @@ pub use crate::wait_for_condition::WaitDecision;
 ///     Ok(())
 /// }
 /// ```
-#[must_use = "builders do nothing unless awaited or spawned"]
+///
+/// [`serdes`](Self::serdes) and [`name`](Self::name) after the strategy
+/// keep it:
+///
+/// ```no_run
+/// use aws_durable_execution_sdk as durable;
+/// use aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<(), durable::BoxError> {
+///     let state: i32 = ctx
+///         .wait_for_condition(|_step_ctx, state: i32| async move { Ok(state + 1) }, 0_i32)
+///         .wait_strategy_fn(|_state: i32, _attempt| WaitDecision::complete())
+///         .serdes(durable::JsonSerdes)
+///         .name("poll")
+///         .await?;
+///     assert!(state >= 1);
+///     Ok(())
+/// }
+/// ```
+///
+/// Awaiting a builder without a strategy fails to compile:
+///
+/// ```compile_fail,E0277
+/// use aws_durable_execution_sdk as durable;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<(), durable::BoxError> {
+///     let state: i32 = ctx
+///         .wait_for_condition(|_step_ctx, state: i32| async move { Ok(state + 1) }, 0_i32)
+///         .name("poll")
+///         .await?;
+///     assert!(state >= 1);
+///     Ok(())
+/// }
+/// ```
+///
+/// A builder without a strategy has no `future` method, also after
+/// [`serdes`](Self::serdes):
+///
+/// ```compile_fail,E0599
+/// use aws_durable_execution_sdk as durable;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<(), durable::BoxError> {
+///     let future: durable::DurableFuture<i32> = ctx
+///         .wait_for_condition(|_step_ctx, state: i32| async move { Ok(state + 1) }, 0_i32)
+///         .serdes(durable::JsonSerdes)
+///         .name("poll")
+///         .future();
+///     let state = future.await?;
+///     assert!(state >= 1);
+///     Ok(())
+/// }
+/// ```
+///
+/// A builder without a strategy has no `spawn` method:
+///
+/// ```compile_fail,E0599
+/// use aws_durable_execution_sdk as durable;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<(), durable::BoxError> {
+///     let handle: durable::DurableFuture<i32> = ctx
+///         .wait_for_condition(|_step_ctx, state: i32| async move { Ok(state + 1) }, 0_i32)
+///         .name("poll")
+///         .spawn();
+///     let state = handle.await?;
+///     assert!(state >= 1);
+///     Ok(())
+/// }
+/// ```
+#[must_use = "wait-for-condition builders do nothing unless configured with a wait strategy and awaited or spawned"]
 #[non_exhaustive]
-pub struct WaitForConditionBuilder<S, F, Fut, SD = JsonSerdes> {
+pub struct WaitForConditionBuilder<S, F, Fut, SD = JsonSerdes, WS = NoWaitStrategy> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     initial_state: S,
-    wait_strategy: Option<crate::wait_for_condition::WaitStrategyFn<S>>,
+    wait_strategy: WS,
     serdes: SD,
     check: F,
     _marker: std::marker::PhantomData<fn() -> Fut>,
 }
 
-impl<S, F, Fut, SD> std::fmt::Debug for WaitForConditionBuilder<S, F, Fut, SD> {
+impl<S, F, Fut, SD, WS> std::fmt::Debug for WaitForConditionBuilder<S, F, Fut, SD, WS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaitForConditionBuilder")
             .field("name", &self.name)
@@ -92,9 +217,9 @@ where
     F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
 {
-    /// Creates a new builder (internal). Taking the check closure here
-    /// keeps the field non-optional: a builder without a check is
-    /// unrepresentable.
+    /// Creates a new builder (internal), in the [`NoWaitStrategy`] state.
+    /// Taking the check closure here keeps the field non-optional: a
+    /// builder without a check is unrepresentable.
     pub(crate) fn new_internal(
         ctx: DurableContext,
         op_id: OperationId,
@@ -106,7 +231,7 @@ where
             op_id,
             name: None,
             initial_state,
-            wait_strategy: None,
+            wait_strategy: NoWaitStrategy { _private: () },
             serdes: JsonSerdes,
             check,
             _marker: std::marker::PhantomData,
@@ -114,16 +239,36 @@ where
     }
 }
 
-impl<S, F, Fut, SD> WaitForConditionBuilder<S, F, Fut, SD>
+impl<S, F, Fut, SD, WS> WaitForConditionBuilder<S, F, Fut, SD, WS>
 where
     S: Clone + Send + Sync + 'static,
     F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
 {
     /// Sets a human-readable name for this operation.
+    ///
+    /// Keeps the builder's wait-strategy state.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
+    }
+
+    /// Returns this builder in the [`WithWaitStrategy`] state, holding
+    /// `strategy`.
+    fn with_strategy(
+        self,
+        strategy: crate::wait_for_condition::WaitStrategyFn<S>,
+    ) -> WaitForConditionBuilder<S, F, Fut, SD, WithWaitStrategy<S>> {
+        WaitForConditionBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            initial_state: self.initial_state,
+            wait_strategy: WithWaitStrategy { strategy },
+            serdes: self.serdes,
+            check: self.check,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// Sets the wait strategy from a [`WaitStrategy`] configuration.
@@ -135,8 +280,11 @@ where
     /// `max_attempts` checks have run without the predicate matching, and
     /// [`WaitDecision::Continue`] with the computed backoff delay otherwise.
     ///
-    /// With no strategy set at all, the check runs exactly once and the
-    /// operation completes with that state.
+    /// Returns the builder in the [`WithWaitStrategy`] state, which can be
+    /// awaited, converted with [`future`](Self::future) or started with
+    /// [`spawn`](Self::spawn). A second call of this method or of
+    /// [`wait_strategy_fn`](Self::wait_strategy_fn) replaces the existing
+    /// strategy.
     ///
     /// # Examples
     ///
@@ -162,11 +310,13 @@ where
     ///     Ok(done)
     /// }
     /// ```
-    pub fn wait_strategy(mut self, strategy: WaitStrategy<S>) -> Self {
-        self.wait_strategy = Some(Box::new(move |state: S, attempt: u32| {
+    pub fn wait_strategy(
+        self,
+        strategy: WaitStrategy<S>,
+    ) -> WaitForConditionBuilder<S, F, Fut, SD, WithWaitStrategy<S>> {
+        self.with_strategy(Box::new(move |state: S, attempt: u32| {
             strategy.decide(&state, attempt)
-        }));
-        self
+        }))
     }
 
     /// Sets a custom wait strategy closure.
@@ -180,8 +330,13 @@ where
     /// reaches a cap) so the operation cannot poll until the execution
     /// times out. Prefer [`wait_strategy`](Self::wait_strategy) when a
     /// predicate plus attempt cap expresses the condition: it makes the
-    /// bound impossible to forget. With no strategy set at all, the check
-    /// runs exactly once and the operation completes with that state.
+    /// bound impossible to forget.
+    ///
+    /// Returns the builder in the [`WithWaitStrategy`] state, which can be
+    /// awaited, converted with [`future`](Self::future) or started with
+    /// [`spawn`](Self::spawn). A second call of this method or of
+    /// [`wait_strategy`](Self::wait_strategy) replaces the existing
+    /// strategy.
     ///
     /// # Examples
     ///
@@ -207,12 +362,14 @@ where
     ///     Ok(done)
     /// }
     /// ```
-    pub fn wait_strategy_fn<W>(mut self, strategy: W) -> Self
+    pub fn wait_strategy_fn<W>(
+        self,
+        strategy: W,
+    ) -> WaitForConditionBuilder<S, F, Fut, SD, WithWaitStrategy<S>>
     where
         W: Fn(S, u32) -> WaitDecision + Send + Sync + 'static,
     {
-        self.wait_strategy = Some(Box::new(strategy));
-        self
+        self.with_strategy(Box::new(strategy))
     }
 
     /// Sets a custom serializer/deserializer for the state.
@@ -222,7 +379,10 @@ where
     /// type: attaching a serdes for a different type fails at compile
     /// time. To share one instance across operations, wrap it in an
     /// [`Arc`](std::sync::Arc) and clone the `Arc` handle into each builder.
-    pub fn serdes<SD2>(self, serdes: SD2) -> WaitForConditionBuilder<S, F, Fut, SD2>
+    ///
+    /// Keeps the builder's wait-strategy state: a serdes neither sets nor
+    /// removes the required wait strategy.
+    pub fn serdes<SD2>(self, serdes: SD2) -> WaitForConditionBuilder<S, F, Fut, SD2, WS>
     where
         SD2: Serdes<S>,
     {
@@ -237,8 +397,18 @@ where
             _marker: std::marker::PhantomData,
         }
     }
+}
 
+impl<S, F, Fut, SD> WaitForConditionBuilder<S, F, Fut, SD, WithWaitStrategy<S>>
+where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
+    SD: Serdes<S>,
+{
     /// Converts this builder into a [`DurableFuture`] without starting it.
+    ///
+    /// Available once a wait strategy is set.
     ///
     /// [`DurableFuture`] is the one input type the combinators
     /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
@@ -258,14 +428,13 @@ where
     /// own task. A combinator that receives it never starts it again, and
     /// it keeps running independently: when the combinator resolves first,
     /// it does not cancel the handle, and the handle's result is dropped.
-    pub fn future(self) -> DurableFuture<S>
-    where
-        SD: Serdes<S>,
-    {
+    pub fn future(self) -> DurableFuture<S> {
         <Self as IntoFuture>::into_future(self)
     }
 
     /// Eagerly spawns the operation on a tokio task.
+    ///
+    /// Available once a wait strategy is set.
     ///
     /// The returned [`DurableFuture`] is already running; this is the
     /// replay-safe alternative to bare `tokio::spawn` for durable
@@ -301,15 +470,12 @@ where
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
     /// error and the operation records nothing.
-    pub fn spawn(self) -> DurableFuture<S>
-    where
-        SD: Serdes<S>,
-    {
+    pub fn spawn(self) -> DurableFuture<S> {
         spawn_terminal!(self)
     }
 }
 
-impl<S, F, Fut, SD> IntoFuture for WaitForConditionBuilder<S, F, Fut, SD>
+impl<S, F, Fut, SD> IntoFuture for WaitForConditionBuilder<S, F, Fut, SD, WithWaitStrategy<S>>
 where
     S: Clone + Send + Sync + 'static,
     F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
@@ -331,7 +497,7 @@ where
             op_id: self.op_id,
             name: self.name,
             initial_state: self.initial_state,
-            wait_strategy: self.wait_strategy,
+            wait_strategy: self.wait_strategy.strategy,
             serdes: self.serdes,
             check: self.check,
         };
@@ -847,10 +1013,7 @@ mod tests {
                     .build(),
             );
 
-        let strategy = builder
-            .wait_strategy
-            .as_ref()
-            .expect("wait_strategy must install a strategy");
+        let strategy = &builder.wait_strategy.strategy;
 
         // Predicate satisfied → Complete.
         assert!(matches!(strategy(3_i32, 1), WaitDecision::Complete));
@@ -861,6 +1024,38 @@ mod tests {
         }
         // Predicate unmet at the cap → Exhausted.
         assert!(matches!(strategy(0_i32, 4), WaitDecision::Exhausted { .. }));
+    }
+
+    /// A second strategy setter replaces the first, in both directions,
+    /// and `name` and `serdes` between the setters keep the
+    /// `WithWaitStrategy` state.
+    #[test]
+    fn second_strategy_replaces_first() {
+        let ctx = DurableContext::test_context();
+
+        // `wait_strategy_fn`, then `wait_strategy`: the config wins.
+        let builder: WaitForConditionBuilder<_, _, _, JsonSerdes, WithWaitStrategy<i32>> = ctx
+            .wait_for_condition(|_sc, state: i32| async move { Ok(state) }, 0_i32)
+            .wait_strategy_fn(|_state, _attempt| WaitDecision::exhausted("first"))
+            .name("poll")
+            .serdes(JsonSerdes)
+            .wait_strategy(WaitStrategy::builder(|_state: &i32| true).build());
+        assert!(matches!(
+            (builder.wait_strategy.strategy)(0, 1),
+            WaitDecision::Complete
+        ));
+
+        // `wait_strategy`, then `wait_strategy_fn`: the closure wins.
+        let builder: WaitForConditionBuilder<_, _, _, JsonSerdes, WithWaitStrategy<i32>> = ctx
+            .wait_for_condition(|_sc, state: i32| async move { Ok(state) }, 0_i32)
+            .wait_strategy(WaitStrategy::builder(|_state: &i32| true).build())
+            .serdes(JsonSerdes)
+            .name("poll")
+            .wait_strategy_fn(|_state, _attempt| WaitDecision::exhausted("second"));
+        match (builder.wait_strategy.strategy)(0, 1) {
+            WaitDecision::Exhausted { reason } => assert_eq!(reason, "second"),
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
     }
 
     /// The wait strategy rounds a computed delay to the nearest whole

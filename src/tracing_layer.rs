@@ -2288,6 +2288,9 @@ pub(crate) mod tests {
                     },
                     0,
                 )
+                .wait_strategy_fn(|_state, _attempt| {
+                    crate::builders::wait_for_condition::WaitDecision::complete()
+                })
                 .name("poll")
                 .await?;
                 Ok(())

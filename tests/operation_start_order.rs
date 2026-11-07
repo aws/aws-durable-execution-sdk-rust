@@ -336,6 +336,9 @@ impl QueueThenHook {
             Self::WaitForCondition => {
                 let state = ctx
                     .wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0)
+                    .wait_strategy_fn(|_state, _attempt| {
+                        durable::builders::wait_for_condition::WaitDecision::complete()
+                    })
                     .name("a")
                     .await?;
                 Ok(state.to_string())

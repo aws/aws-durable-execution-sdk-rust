@@ -3387,8 +3387,9 @@ impl DurableContext {
     /// (a bounded [`WaitStrategy`](crate::builders::wait_for_condition::WaitStrategy)
     /// configuration) or
     /// [`wait_strategy_fn`](crate::builders::WaitForConditionBuilder::wait_strategy_fn)
-    /// (a custom closure). With no strategy set, the check runs exactly
-    /// once and the operation completes with that state.
+    /// (a custom closure). A strategy is required: the returned builder
+    /// cannot be awaited, converted with `.future()` or started with
+    /// `.spawn()` until one of the two setters has run.
     ///
     /// The first check receives the initial state after a round trip
     /// through the configured serdes, so it sees the same shape as a check
@@ -3409,7 +3410,9 @@ impl DurableContext {
     ///
     /// ```no_run
     /// use aws_durable_execution_sdk as durable;
+    /// use durable::builders::wait_for_condition::WaitDecision;
     /// use serde::{Deserialize, Serialize};
+    /// use std::time::Duration;
     ///
     /// #[derive(Clone, Serialize, Deserialize)]
     /// struct PollState { count: u32 }
@@ -3424,6 +3427,13 @@ impl DurableContext {
     ///         },
     ///         PollState { count: 0 },
     ///     ).name("poll-ready")
+    ///      .wait_strategy_fn(|state: PollState, _attempt| {
+    ///          if state.count >= 3 {
+    ///              WaitDecision::complete()
+    ///          } else {
+    ///              WaitDecision::continue_with(Duration::from_secs(1))
+    ///          }
+    ///      })
     ///      .await?;
     ///     Ok(())
     /// }

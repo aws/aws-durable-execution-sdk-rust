@@ -170,6 +170,9 @@ async fn context_used_inside_condition_check_fails() {
                         },
                         0_u32,
                     )
+                    .wait_strategy_fn(|_state, _attempt| {
+                        durable::builders::wait_for_condition::WaitDecision::complete()
+                    })
                     .name("poll")
                     .await?;
                 Ok::<_, durable::BoxError>(value)
