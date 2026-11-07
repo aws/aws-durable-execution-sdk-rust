@@ -21,9 +21,12 @@ fn describe_combinator_error(err: &durable::OperationError) -> String {
     match err.kind() {
         OperationErrorKind::Combinator(ce) => match ce.kind() {
             CombinatorErrorKind::FirstSettledFailed { .. } => {
-                // The loser travels as the error's source; flatten it the
-                // documented way.
-                format!("FirstSettledFailed:{ce:#}")
+                // The race's record carries the loser's recorded message.
+                let message = err
+                    .wire()
+                    .and_then(durable::WireError::error_message)
+                    .unwrap_or_default();
+                format!("FirstSettledFailed:{message}")
             }
             CombinatorErrorKind::EmptyInput { .. } => "EmptyInput".to_owned(),
             other => format!("other:{other:?}"),

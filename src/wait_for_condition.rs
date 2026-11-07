@@ -2191,6 +2191,40 @@ mod tests {
         std::error::Error::source(wfc_err).map(crate::error::chain_string)
     }
 
+    /// A check that returns a recorded operation error records that
+    /// error's type, message, data and stack unchanged.
+    #[tokio::test]
+    async fn check_failure_records_a_propagated_record_unchanged() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = ctx_with(&client, Vec::new());
+        let op_id = ctx.mint_id();
+        let exec = WaitForConditionExecution::<i32, _, _> {
+            ctx,
+            op_id,
+            name: None,
+            initial_state: 0,
+            wait_strategy: Box::new(|_state, _attempt| WaitDecision::complete()),
+            serdes: crate::serdes::JsonSerdes,
+            check: |_ctx, _state: i32| async move {
+                let wire = crate::error::WireError::new(Some("InnerType"), Some("inner"))
+                    .with_error_data(Some("inner-data"))
+                    .with_stack_trace(vec!["inner-frame".to_owned()]);
+                Err::<i32, BoxError>(Box::new(crate::error::recorded_step_error(wire)))
+            },
+        };
+        drop(exec.execute().await.unwrap_err());
+        let fail = client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| u.action() == &OperationAction::Fail)
+            .expect("a FAIL update");
+        let error = fail.error().expect("the FAIL carries an error object");
+        assert_eq!(error.error_type(), Some("InnerType"));
+        assert_eq!(error.error_message(), Some("inner"));
+        assert_eq!(error.error_data(), Some("inner-data"));
+        assert_eq!(error.stack_trace(), ["inner-frame"]);
+    }
+
     /// C5 to C8: a check failure records through `wire_error_for` with the
     /// fallback `Error`, and the live kind equals the replay kind.
     #[tokio::test]

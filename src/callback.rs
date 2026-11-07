@@ -2501,10 +2501,10 @@ mod tests {
         assert_eq!(err.operation_id(), Some(expected_wire_id.as_str()));
         assert_eq!(err.status(), Some("FAILED"));
         let wire = err.wire().expect("live wfcb failure carries wire record");
-        assert!(
-            wire.error_message()
-                .is_some_and(|m| m.contains("submission failed")),
-            "wire message flattens the body failure: {wire:?}"
+        assert_eq!(
+            wire.error_message(),
+            Some("submission failed"),
+            "the record carries the submitter step's recorded message: {wire:?}"
         );
     }
 
@@ -3346,6 +3346,7 @@ mod tests {
     /// The outer record carries one fixed SDK type per kind; neither the
     /// external type nor a `TypedError` name sets it.
     #[test]
+    #[expect(clippy::too_many_lines)] // reason: one row per callback error kind
     fn extract_wire_error_records_fixed_sdk_types() {
         // C1: the external type is dropped; message and data are copied.
         let external = crate::error::WireError::new(Some("PaymentDeclined"), Some("card declined"))
@@ -3398,6 +3399,48 @@ mod tests {
             wire.error_message().is_some_and(|m| m.contains("declined")),
             "{wire:?}"
         );
+
+        // A propagated recorded failure records its recorded message, for
+        // every kind but `ExternalFailure`, whose row is C1 above: it
+        // copies the external record's message and data unchanged.
+        let recorded = || {
+            crate::error::recorded_step_error(crate::error::WireError::new(
+                Some("InnerType"),
+                Some("inner"),
+            ))
+        };
+        let callback_over = |kind: CallbackErrorKind, source: crate::error::Source| {
+            OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(
+                kind,
+                Some(source),
+            )))
+        };
+        let rows = [
+            (
+                callback_over(CallbackErrorKind::SubmitterFailed, Box::new(recorded())),
+                "Callback.SubmitterFailed",
+            ),
+            (
+                callback_over(CallbackErrorKind::Internal, Box::new(recorded())),
+                "Callback.Internal",
+            ),
+            (
+                callback_over(
+                    CallbackErrorKind::DeserializationFailed,
+                    crate::error::ContextualError::source_from(
+                        "deserialize callback result",
+                        recorded(),
+                    ),
+                ),
+                "Callback.DeserializationFailed",
+            ),
+            (recorded(), "Callback.Internal"),
+        ];
+        for (err, expected_type) in &rows {
+            let wire = extract_wire_error(err);
+            assert_eq!(wire.error_type(), Some(*expected_type), "{err:?}");
+            assert_eq!(wire.error_message(), Some("inner"), "{err:?}");
+        }
 
         // A payload decode failure.
         let wire = extract_wire_error(&callback_failure(

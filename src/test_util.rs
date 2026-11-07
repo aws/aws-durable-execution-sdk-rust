@@ -7158,10 +7158,11 @@ mod tests {
             !result.is_success(),
             "an unmatched predicate must exhaust, not succeed"
         );
-        let message = result.error_message().unwrap_or_default();
-        assert!(
-            message.contains("max checks exceeded: 2"),
-            "failure must name exhaustion with the attempt count: {message}"
+        // The execution records the condition's recorded message.
+        assert_eq!(
+            result.error_message(),
+            Some("max attempts exceeded: 2 checks completed (max_attempts = 2)"),
+            "failure must name exhaustion with the attempt count"
         );
     }
 
@@ -10305,11 +10306,8 @@ mod tests {
     // Harness fidelity: production wire-error mapping
 
     /// The runner reports the SAME wire error message production reports.
-    /// Every failure flattens through the one flattening site, so a child
-    /// failure's wire message is the full chain, one frame per layer,
-    /// with the raw child message as its final frame. (The old special
-    /// case that reported only the raw message was the Display/wire
-    /// asymmetry the error-model redesign removed.)
+    /// The execution propagates the child's failure, so it records the
+    /// child's recorded message, which is the body's raw message.
     #[tokio::test]
     async fn child_failure_wire_error_matches_production_raw_message() {
         let result: TestResult<i32> = LocalRunner::new()
@@ -10333,14 +10331,10 @@ mod tests {
         // plain boxed error) rather than degrading it to the outer kind's
         // registry name: recorded identity passes through boundaries.
         assert_eq!(result.error_type(), Some("Error"));
-        let msg = result.error_message().unwrap_or_default();
-        assert!(
-            msg.contains("boom-child"),
-            "raw child message must survive as the chain's final frame: {msg}"
-        );
         assert_eq!(
-            msg, "operation error: child_context: child failed: boom-child",
-            "wire message is the flattened chain, one frame per layer"
+            result.error_message(),
+            Some("boom-child"),
+            "the execution records the child's recorded message"
         );
     }
 

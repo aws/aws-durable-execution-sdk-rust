@@ -2103,10 +2103,12 @@ mod tests {
         assert_eq!(hooks.find("cb-submitter", "uf_end").probe, "1");
         assert_eq!(hooks.find("cb-submitter", "end").probe, "1");
         // The body's own wire (rule 11's `wait_for_callback` body row,
-        // `extract_wire_error`) is the chain of the submitter's error, so
-        // it formats the error once more.
-        assert_eq!(dc.calls(), 2, "submitter, then the body");
-        assert_eq!(hooks.find("cb", "uf_end").probe, "2");
+        // `extract_wire_error`) takes the submitter step's recorded
+        // message, so it does not format the error again.
+        assert_eq!(dc.calls(), 1, "the submitter only");
+        assert_eq!(hooks.find("cb", "uf_end").probe, "1");
+        let outer = hooks.find("cb", "uf_end").wire.expect("an Err outcome");
+        assert_eq!(outer.error_message(), Some("counted"));
         let end = hooks
             .find("cb-submitter", "uf_end")
             .wire
@@ -2116,6 +2118,7 @@ mod tests {
             .wire
             .expect("an error");
         assert_eq!(type_and_message(&end), type_and_message(&attempt_end));
+        assert_eq!(end.error_message(), Some("counted"));
         // The submitter step's record carries no name.
         let fail = client
             .recorded_updates()
@@ -2126,6 +2129,32 @@ mod tests {
 
         // A `map` item, in both modes.
         map_item_wire_derived_once().await;
+    }
+
+    /// A step body that returns a recorded operation error records that
+    /// error's type, message, data and stack unchanged.
+    #[tokio::test]
+    async fn failed_body_records_a_propagated_record_unchanged() {
+        let hooks = UfHooks::default();
+        let (ctx, client) = uf_context(&hooks, Vec::new());
+        let err = ctx
+            .step(|_| async {
+                let wire = crate::error::WireError::new(Some("InnerType"), Some("inner"))
+                    .with_error_data(Some("inner-data"))
+                    .with_stack_trace(vec!["inner-frame".to_owned()]);
+                Err::<u32, BoxError>(Box::new(crate::error::recorded_step_error(wire)))
+            })
+            .name("step")
+            .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+            .await
+            .unwrap_err();
+        drop(err);
+        let fail = update_of(&client, "step", &OperationAction::Fail).expect("a FAIL");
+        let error = fail.error().expect("the FAIL carries an error object");
+        assert_eq!(error.error_type(), Some("InnerType"));
+        assert_eq!(error.error_message(), Some("inner"));
+        assert_eq!(error.error_data(), Some("inner-data"));
+        assert_eq!(error.stack_trace(), ["inner-frame"]);
     }
 
     /// The `map` item case of [`failed_body_wire_derived_once`], in

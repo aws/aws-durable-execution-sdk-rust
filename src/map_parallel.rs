@@ -1507,8 +1507,8 @@ where
             }
             Err((_error, wire)) => {
                 // The wire record is derived from the error the body
-                // returned: its recorded type, and its flattened chain as
-                // the message.
+                // returned: its recorded type, and its recorded message
+                // (see `wire_message`).
                 Ok((
                     BatchItem::failed_from_wire(req.index, req.item_name.clone(), &wire),
                     None,
@@ -1665,8 +1665,8 @@ where
         Err((_error, wire)) => {
             // The item failed: checkpoint its failure. The wire record is
             // derived from the error the body returned, so the type is the
-            // body error's recorded type, the message is its flattened
-            // chain, and `error_data`/`stack_trace` pass through the
+            // body error's recorded type, the message is its recorded
+            // message (see `wire_message`), and `error_data`/`stack_trace` pass through the
             // boundary.
             let mut builder = OperationUpdate::builder()
                 .id(child_wire.clone())

@@ -852,8 +852,8 @@ async fn checkpoint_live_failure(
     wire: Option<crate::error::WireError>,
 ) -> OperationError {
     // Derive the wire failure from the error the body returned: the type
-    // is the body error's recorded type, the message is its flattened
-    // chain, and `error_data`/`stack_trace` pass through from its cause
+    // is the body error's recorded type, the message is its recorded
+    // message (see `wire_message`), and `error_data`/`stack_trace` pass through from its cause
     // chain, so an inner failure's payload survives this boundary.
     // A body without a runner (a `with_retry` attempt) has no wire yet.
     let wire = wire.unwrap_or_else(|| child_err.failure_wire());
@@ -1109,9 +1109,11 @@ mod tests {
     }
 
     /// A failed child records the type and message of the error its body
-    /// returned, not of the SDK's internal carrier. One row per case: a
-    /// plain error, a `TypedError`, a propagated step failure (untyped and
-    /// typed), and a propagated external callback failure.
+    /// returned, not of the SDK's internal carrier. A propagated
+    /// operation failure records that operation's recorded message. One
+    /// row per case: a plain error, a `TypedError`, a propagated step
+    /// failure (untyped and typed), and a propagated external callback
+    /// failure.
     #[tokio::test]
     async fn child_failure_records_body_error_type() {
         // Row 1: a plain error records the fallback type "Error".
@@ -1138,10 +1140,7 @@ mod tests {
         })
         .await;
         assert_eq!(ty.as_deref(), Some("Error"));
-        assert_eq!(
-            msg.as_deref(),
-            Some("operation error: step: execution failed: step boom")
-        );
+        assert_eq!(msg.as_deref(), Some("step boom"));
 
         // Row 4: a propagated typed step failure records the user's type.
         let (ty, msg) = child_fail_record(|child| async move {
@@ -1158,10 +1157,7 @@ mod tests {
         })
         .await;
         assert_eq!(ty.as_deref(), Some("PaymentError"));
-        assert_eq!(
-            msg.as_deref(),
-            Some("operation error: step: execution failed: PaymentError: declined")
-        );
+        assert_eq!(msg.as_deref(), Some("PaymentError: declined"));
 
         // Row 5: a propagated external callback failure records the type
         // the callback failure carries.
@@ -1178,10 +1174,7 @@ mod tests {
         })
         .await;
         assert_eq!(ty.as_deref(), Some("VendorError"));
-        assert_eq!(
-            msg.as_deref(),
-            Some("operation error: callback: external failure: denied")
-        );
+        assert_eq!(msg.as_deref(), Some("denied"));
     }
 
     /// A root context over `records` whose transport is a fresh in-memory

@@ -119,7 +119,7 @@ const ALL_FAILED_ERROR_TYPE: &str = "CombinatorError.AllFailed";
 /// Mirrors [`SerializedOutcome::Rejected`]: the loser's complete wire
 /// failure record (`error_type`, message, `error_data`, `stack_trace`),
 /// so each loser's identity survives the checkpoint round-trip rather
-/// than only the aggregate's flattened summary. Every field is optional
+/// than only the aggregate's summary of the losers' messages. Every field is optional
 /// with a default so hand-written or trimmed payloads still decode, and
 /// an absent field round-trips as absent rather than as an empty value.
 /// Replay only stores and exposes these fields (via
@@ -361,7 +361,9 @@ pub(crate) struct JoinAllExecution<O> {
 /// `{ status: "rejected", ... }` carrying the outcome's full wire error
 /// record (`error_type`, `message`, `error_data`, `stack_trace`), so the
 /// failure's identity survives the checkpoint round-trip rather than
-/// only its flattened message (issue #41). Fulfilled results serialize
+/// only its message (issue #41). The `message` is the outcome record's
+/// own message, or, for an outcome without a record, its recorded
+/// message (see [`wire_message`](crate::error::wire_message)). Fulfilled results serialize
 /// as `{ status: "fulfilled", value }`. The error fields beyond the
 /// message need defaults because the writer skips a `None` or empty
 /// field.
@@ -1237,7 +1239,8 @@ fn first_failure_wire(failure: &FirstFailure) -> crate::error::WireError {
 }
 
 /// The wire of an `AllFailed` `select_ok`: the discriminator, a message
-/// naming each loser's flattened chain in input order, and, as
+/// naming each loser's recorded message (see
+/// [`wire_message`](crate::error::wire_message)) in input order, and, as
 /// `error_data`, each loser's complete wire failure record (a JSON array
 /// of [`SerializedLoser`]), so replay rebuilds one loser per input with
 /// the same fields the live failures carried.
@@ -1245,21 +1248,30 @@ fn all_failed_wire(losers: &[crate::error::Source]) -> crate::error::WireError {
     let loser_summary = losers
         .iter()
         .enumerate()
-        .map(|(idx, err)| format!("[{idx}] {}", crate::error::chain_string(&**err)))
+        .map(|(idx, err)| format!("[{idx}] {}", crate::error::wire_message(&**err)))
         .collect::<Vec<_>>()
         .join("; ");
     // Pass each loser's own recorded wire record through verbatim when it
     // carries one (the normal case: a failed constituent operation
     // attaches its terminal wire record); derive one only for a wire-less
-    // error (e.g. an internal join failure).
+    // error (e.g. an internal join failure). A derived record keeps the
+    // loser's flattened chain as its message.
     let serialized_losers: Vec<SerializedLoser> = losers
         .iter()
         .map(|err| {
-            let wire = err
+            match err
                 .downcast_ref::<OperationError>()
-                .and_then(|op| op.wire().cloned())
-                .unwrap_or_else(|| crate::error::wire_error_for(&**err, COMBINATOR_ERROR_TYPE));
-            SerializedLoser::from_wire(&wire)
+                .and_then(|op| op.wire())
+            {
+                Some(wire) => SerializedLoser::from_wire(wire),
+                None => SerializedLoser {
+                    message: Some(crate::error::chain_string(&**err)),
+                    ..SerializedLoser::from_wire(&crate::error::wire_error_for(
+                        &**err,
+                        COMBINATOR_ERROR_TYPE,
+                    ))
+                },
+            }
         })
         .collect();
     // `SerializedLoser` holds only strings, options of strings and a
@@ -1563,7 +1575,7 @@ fn replay_outcomes_success<O: DeserializeOwned>(
     // Restore each outcome: rejected items become `Err(OperationError)`s
     // whose synthetic sources carry the recorded wire fields
     // (`error_type`, message, `error_data`, `stack_trace`), not just the
-    // flattened text (issue #41).
+    // recorded message (issue #41).
     let outcomes = serialized
         .into_iter()
         .map(|s| match s {
@@ -4716,6 +4728,71 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "failed cases: {failures:#?}");
+    }
+    /// An operation error with `message` as its record's message.
+    fn loser_with_message(message: &str) -> crate::error::Source {
+        Box::new(
+            OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
+                CombinatorErrorKind::Internal,
+                vec![format!("{message} source").into()],
+            )))
+            .with_wire(crate::error::WireError::new(Some("Error"), Some(message))),
+        )
+    }
+
+    #[test]
+    fn all_failed_message_names_each_loser_message() {
+        let wire = all_failed_wire(&[loser_with_message("a"), loser_with_message("b")]);
+        assert_eq!(
+            wire.error_message(),
+            Some("all 2 futures failed: [0] a; [1] b")
+        );
+    }
+
+    /// A wire-less loser: the outer summary takes its recorded message,
+    /// while its stored record keeps its flattened chain.
+    #[test]
+    fn all_failed_preserves_serialized_loser_message() {
+        let inner = crate::error::WireError::new(Some("InnerType"), Some("a"))
+            .with_error_data(Some("loser-data"))
+            .with_stack_trace(vec!["loser-frame".to_owned()]);
+        let loser = crate::error::ContextualError::source_from(
+            "context",
+            crate::error::recorded_step_error(inner),
+        );
+        let wire = all_failed_wire(&[loser]);
+        assert_eq!(wire.error_message(), Some("all 1 futures failed: [0] a"));
+        assert_eq!(
+            wire.error_data(),
+            Some(
+                r#"[{"error_type":"CombinatorError","message":"context: operation error: step: execution failed: a","error_data":"loser-data","stack_trace":["loser-frame"]}]"#
+            )
+        );
+    }
+
+    /// A wire-less virtual child that propagates a failed step: the
+    /// serialized rejected outcome carries the step's recorded message.
+    #[tokio::test]
+    async fn join_all_rejected_outcome_records_the_propagated_message() {
+        let (ctx, _client) = recording_ctx(CheckpointLog::empty());
+        let input = ctx
+            .run_in_child_context(|child| async move {
+                Ok(child
+                    .step(|_| async { Err::<u32, crate::BoxError>("a".into()) })
+                    .retry_strategy(|_err, _attempt| crate::RetryDecision::Stop)
+                    .await?)
+            })
+            .virtual_context()
+            .future();
+        let outcomes = ctx.join_all([input]).await.expect("join_all succeeds");
+        let [Err(rejected)] = outcomes.as_slice() else {
+            panic!("expected one rejected outcome, got {outcomes:?}");
+        };
+        let wire = rejected
+            .wire()
+            .expect("a rejected outcome carries its record");
+        assert_eq!(wire.error_type(), Some("ChildContextError"));
+        assert_eq!(wire.error_message(), Some("a"));
     }
 }
 

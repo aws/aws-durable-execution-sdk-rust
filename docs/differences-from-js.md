@@ -83,7 +83,7 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### Untyped handler error
 
 - **JavaScript:** Records the error's `name` as the type, so a plain `Error` records `Error`, and the error's message. A result that `JSON.stringify` cannot serialize records the thrown error's name, such as `TypeError`.
-- **Rust:** Records the type `Error` and the flattened error chain as the message; `TypedError` sets another type. A result that fails to serialize records `Error` and the `serde_json` error message.
+- **Rust:** Records the type `Error`; `TypedError` sets another type. The message is the recorded message that `src/error.rs::wire_message` selects: it follows the error's `source()` through the SDK's propagation carriers, such as an `OperationError` without a record, a `StepError` or a `ChildContextError`, and takes the message of the first operation record it reaches, as JavaScript takes the message of the thrown SDK error. It examines at most 11 errors. Any other error on the way, such as a `TypedError` or a user wrapper, a record without a message, and a chain that reaches no record give the flattened error chain. A result that fails to serialize records `Error` and the `serde_json` error message.
 - **Why:** A boxed Rust error and a `serde_json::Error` have no name, so they record the type a plain JavaScript `Error` records.
 - **Decision:** Rust language.
 - **Where:** `src/lib.rs`, `wire_error_from_box_error` and `serialize_handler_result`.
@@ -107,7 +107,7 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### Child failure type
 
 - **JavaScript:** A child whose body propagates a failed step records `StepError`.
-- **Rust:** Records the body error's type. For an operation error the body propagates, that is the type the inner operation recorded, else the type of a `TypedError` in its source chain, else that error kind's name, such as `StepError`. For a replayed failure the body propagates, it is the type that failure's record carries, else `Error`. For any other error, it is the type of a `TypedError` in the source chain, else `Error`.
+- **Rust:** Records the body error's type. For an operation error the body propagates, that is the type the inner operation recorded, else the type of a `TypedError` in its source chain, else that error kind's name, such as `StepError`. For a replayed failure the body propagates, it is the type that failure's record carries, else `Error`. For any other error, it is the type of a `TypedError` in the source chain, else `Error`. The message follows JavaScript: a child that propagates a recorded step failure records the step's recorded message (see "Untyped handler error").
 - **Why:** The inner type tells a history reader more, and the Rust error kind `ChildContext(ChildFailed)` still says that the child failed.
 - **Decision:** Decision (2026-10-28): record the body's error type.
 - **Where:** `src/error.rs`, `ChildFnError::failure_wire` and `wire_error_for`; `src/child.rs`, `checkpoint_live_failure`.

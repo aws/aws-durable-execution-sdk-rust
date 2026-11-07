@@ -11,8 +11,10 @@
 //! its source's text. Walking [`source()`](std::error::Error::source)
 //! therefore never repeats text. To print the whole chain in one line, use
 //! the alternate form `{:#}`, which walks the source chain from that layer
-//! down. The message recorded on the wire is built from that same single
-//! flattening site.
+//! down. The message recorded on the wire is the message of the operation
+//! failure that the error propagates, when it propagates one, and is
+//! otherwise built from that same single flattening site (see
+//! [`wire_message`]).
 //!
 //! # Kinds classify, `source()` carries
 //!
@@ -47,8 +49,9 @@ const CHAIN_WALK_LIMIT: usize = 11;
 ///
 /// This is the **single flattening site**: every alternate (`{:#}`)
 /// `Display` implementation in this module and the wire-message builder
-/// ([`wire_error_for`]) funnel through it. No other code path joins an
-/// error's chain into one string.
+/// ([`wire_message`], for an error that propagates no recorded message)
+/// funnel through it. No other code path joins an error's chain into one
+/// string.
 pub(crate) fn write_chain(
     f: &mut fmt::Formatter<'_>,
     frame: &dyn fmt::Display,
@@ -128,7 +131,11 @@ impl WireError {
         self.error_type.as_deref()
     }
 
-    /// The wire `ErrorMessage`: the flattened, human-readable message.
+    /// The wire `ErrorMessage`: the human-readable message.
+    ///
+    /// A failure that propagates another operation's failure records that
+    /// operation's message. Any other failure records its error's chain,
+    /// flattened into one line.
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
     }
@@ -427,8 +434,10 @@ fn short_type_name(full: &str) -> String {
 /// Derives the wire failure record for an escaping error explicitly,
 /// with no `Debug` scraping.
 ///
-/// - `error_message` is the error's flattened source chain, built by the
-///   module's single flattening site ([`chain_string`]).
+/// - `error_message` is the error's recorded message ([`wire_message`]):
+///   the message of the first operation record its chain reaches through
+///   the SDK's propagation carriers, else its flattened source chain
+///   ([`chain_string`]).
 /// - `error_type` is taken from structured identity when the error *is*
 ///   one: an [`OperationError`] re-records its attached wire record's
 ///   type when it carries one (or a [`TypedError`]'s name from its
@@ -486,8 +495,8 @@ fn typed_error_name(err: &(dyn Error + 'static)) -> Option<String> {
 
 /// Like [`wire_error_for`], but with a caller-fixed wire `error_type`
 /// (used where the type is a protocol discriminator, e.g. the combinator
-/// replay markers). The message flattening and `error_data`/`stack_trace`
-/// chain walk are identical.
+/// replay markers). The message ([`wire_message`]) and the
+/// `error_data`/`stack_trace` chain walk are identical.
 pub(crate) fn wire_error_with_type(err: &(dyn Error + 'static), error_type: &str) -> WireError {
     let mut error_data = None;
     let mut stack_trace = Vec::new();
@@ -517,9 +526,59 @@ pub(crate) fn wire_error_with_type(err: &(dyn Error + 'static), error_type: &str
         walked += 1;
     }
 
-    WireError::new(Some(error_type), Some(chain_string(err)))
+    WireError::new(Some(error_type), Some(wire_message(err)))
         .with_error_data(error_data)
         .with_stack_trace(stack_trace)
+}
+
+/// The recorded message of an escaping error.
+///
+/// An error that propagates another operation's failure records that
+/// failure's recorded message, as JS does: the walk follows `source()`
+/// through the SDK's propagation carriers ([`OperationError`] without a
+/// record, the per-operation error structs, [`ChildFnError`] and
+/// [`ContextualError`]) and returns the message of the first record it
+/// reaches, an [`OperationError`] with a record or a [`ReplayedFailure`].
+/// It examines at most [`CHAIN_WALK_LIMIT`] errors, counting `err`.
+///
+/// Every other case returns the flattened chain ([`chain_string`]): a
+/// record without a message, any other error on the way (a
+/// [`TypedError`], a serde error or a user wrapper, whose text the
+/// message keeps), a carrier without a source, and a record past the
+/// limit.
+pub(crate) fn wire_message(err: &(dyn Error + 'static)) -> String {
+    let mut link = err;
+    for _ in 0..CHAIN_WALK_LIMIT {
+        if let Some(wire) = wire_identity(link) {
+            return wire
+                .error_message()
+                .map_or_else(|| chain_string(err), str::to_owned);
+        }
+        if !is_propagation_carrier(link) {
+            break;
+        }
+        match link.source() {
+            Some(source) => link = source,
+            None => break,
+        }
+    }
+    chain_string(err)
+}
+
+/// Whether `err` only carries another error on its way to a record, so the
+/// recorded-message walk follows its `source()`. An [`OperationError`]
+/// with a record never reaches this check.
+fn is_propagation_carrier(err: &(dyn Error + 'static)) -> bool {
+    err.is::<OperationError>()
+        || err.is::<StepError>()
+        || err.is::<WaitError>()
+        || err.is::<InvokeError>()
+        || err.is::<CallbackError>()
+        || err.is::<WaitForConditionError>()
+        || err.is::<ChildContextError>()
+        || err.is::<CombinatorError>()
+        || err.is::<ChildFnError>()
+        || err.is::<ContextualError>()
 }
 
 /// The error type of the fault that a retryable checkpoint failure records.
@@ -556,8 +615,8 @@ pub(crate) const SERIALIZATION_FAILED_ERROR_TYPE: &str = "SerializationError";
 ///
 /// The fixed [`SERIALIZATION_FAILED_ERROR_TYPE`] is what lets replay
 /// reconstruct the serialization classification (see the constant's doc);
-/// message flattening and the `error_data`/`stack_trace` chain walk are
-/// the standard [`wire_error_with_type`] behavior.
+/// the message ([`wire_message`]) and the `error_data`/`stack_trace` chain
+/// walk are the standard [`wire_error_with_type`] behavior.
 pub(crate) fn serialization_failure_wire(err: &(dyn Error + 'static)) -> WireError {
     wire_error_with_type(err, SERIALIZATION_FAILED_ERROR_TYPE)
 }
@@ -1903,7 +1962,9 @@ impl ChildFnError {
     /// The record is derived from the body error, not from this carrier.
     /// The carrier is an internal Rust type. Deriving from it would record
     /// its name as the type and prefix its own text to the message. So the
-    /// record follows [`wire_error_for`]'s rule applied to the body error.
+    /// record follows [`wire_error_for`]'s rule applied to the body error:
+    /// a body that propagates an operation failure records that failure's
+    /// recorded message ([`wire_message`]).
     pub(crate) fn failure_wire(&self) -> WireError {
         wire_error_for(&*self.source, "Error")
     }
@@ -1977,6 +2038,18 @@ const _: () = {
     assert_send_sync_static::<ChildFnError>();
     assert_send_sync_static::<crate::serdes::FileSystemSerdesError>();
 };
+
+/// A failed step's error as an operation returns it: a
+/// `Step(ExecutionFailed)` [`OperationError`] carrying `wire` as its record,
+/// whose source is a [`ReplayedFailure`] of the same record (test helper).
+#[cfg(test)]
+pub(crate) fn recorded_step_error(wire: WireError) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Step(StepError::new(
+        StepErrorKind::ExecutionFailed,
+        Some(ReplayedFailure::source_from(wire.clone())),
+    )))
+    .with_wire(wire)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2525,5 +2598,221 @@ mod tests {
         assert_eq!(source.to_string(), "checkpoint succeed");
         let inner = source.source().expect("keeps cause");
         assert_eq!(inner.to_string(), "user boom: io");
+    }
+
+    /// The recorded step of the `wire_message` tests: message `inner`.
+    fn recorded_step() -> OperationError {
+        recorded_step_error(WireError::new(Some("InnerType"), Some("inner")))
+    }
+
+    /// The flattened chain of [`recorded_step`].
+    const RECORDED_STEP_CHAIN: &str = "operation error: step: execution failed: inner";
+
+    #[test]
+    fn recorded_step_flattens_to_its_frames() {
+        assert_eq!(chain_string(&recorded_step()), RECORDED_STEP_CHAIN);
+    }
+
+    #[test]
+    fn wire_message_uses_the_first_record() {
+        assert_eq!(wire_message(&recorded_step()), "inner");
+
+        let contextual = ContextualError::source_from(
+            "ctx",
+            ReplayedFailure::source_from(WireError::new(Some("T"), Some("m"))),
+        );
+        assert_eq!(wire_message(&*contextual), "m");
+
+        let outer_with_message =
+            OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+                ChildContextErrorKind::ChildFailed,
+                Some(Box::new(recorded_step())),
+            )))
+            .with_wire(WireError::new(Some("OuterType"), Some("outer")));
+        assert_eq!(wire_message(&outer_with_message), "outer");
+
+        // A record without a message stops the walk: the deeper record's
+        // message is not used.
+        let outer_without_message =
+            OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+                ChildContextErrorKind::ChildFailed,
+                Some(Box::new(recorded_step())),
+            )))
+            .with_wire(WireError::new(Some("OuterType"), None::<String>));
+        assert_eq!(
+            wire_message(&outer_without_message),
+            "operation error: child_context: child failed: operation error: step: execution failed: inner"
+        );
+
+        let replayed_without_message =
+            ReplayedFailure::new(WireError::new(Some("T"), None::<String>));
+        assert_eq!(wire_message(&replayed_without_message), "T");
+
+        let empty = recorded_step_error(WireError::new(Some("T"), Some("")));
+        assert_eq!(wire_message(&empty), "");
+    }
+
+    /// A test wrapper of another crate's kind: not a propagation carrier.
+    #[derive(Debug)]
+    struct Wrapper(Source);
+    impl fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "wrapper")
+        }
+    }
+    impl Error for Wrapper {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&*self.0 as &(dyn Error + 'static))
+        }
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines)] // reason: one row per carrier and per stopping case
+    fn wire_message_walks_only_transparent_carriers() {
+        let boxed = || -> Source { Box::new(recorded_step()) };
+        let carriers: Vec<(&str, Box<dyn Error + 'static>)> = vec![
+            (
+                "OperationError without a record",
+                Box::new(OperationError::from_kind(OperationErrorKind::ChildContext(
+                    ChildContextError::new(ChildContextErrorKind::ChildFailed, Some(boxed())),
+                ))),
+            ),
+            (
+                "StepError",
+                Box::new(StepError::new(
+                    StepErrorKind::ExecutionFailed,
+                    Some(boxed()),
+                )),
+            ),
+            (
+                "WaitError",
+                Box::new(WaitError::new(
+                    WaitErrorKind::UnexpectedStatus(UnexpectedStatus::new("FAILED")),
+                    Some(boxed()),
+                )),
+            ),
+            (
+                "InvokeError",
+                Box::new(InvokeError::new(
+                    InvokeErrorKind::FunctionFailed,
+                    Some(boxed()),
+                )),
+            ),
+            (
+                "CallbackError",
+                Box::new(CallbackError::new(
+                    CallbackErrorKind::SubmitterFailed,
+                    Some(boxed()),
+                )),
+            ),
+            (
+                "WaitForConditionError",
+                Box::new(WaitForConditionError::new(
+                    WaitForConditionErrorKind::CheckFailed,
+                    Some(boxed()),
+                )),
+            ),
+            (
+                "ChildContextError",
+                Box::new(ChildContextError::new(
+                    ChildContextErrorKind::ChildFailed,
+                    Some(boxed()),
+                )),
+            ),
+            (
+                "CombinatorError",
+                Box::new(CombinatorError::new(
+                    CombinatorErrorKind::FirstSettledFailed,
+                    vec![boxed()],
+                )),
+            ),
+            ("ChildFnError", Box::new(ChildFnError::new(boxed()))),
+            (
+                "ContextualError",
+                ContextualError::source_from("ctx", boxed()),
+            ),
+        ];
+        for (name, carrier) in &carriers {
+            assert_eq!(wire_message(&**carrier), "inner", "{name}");
+        }
+
+        // A carrier without a source ends the walk.
+        let sourceless = StepError::new(StepErrorKind::ExecutionFailed, None);
+        assert_eq!(wire_message(&sourceless), "execution failed");
+
+        // Any other error stops the walk, and the message is the
+        // flattened chain.
+        let typed = TypedError::with_type("OuterType", recorded_step());
+        assert_eq!(
+            wire_message(&typed),
+            format!("OuterType: {RECORDED_STEP_CHAIN}")
+        );
+        let wrapper = Wrapper(boxed());
+        assert_eq!(
+            wire_message(&wrapper),
+            format!("wrapper: {RECORDED_STEP_CHAIN}")
+        );
+        let client = crate::client::ExecutionClientError::with_source(
+            crate::client::ExecutionClientErrorScope::Invocation,
+            "checkpoint failed",
+            recorded_step(),
+        );
+        assert_eq!(
+            wire_message(&client),
+            format!("durable: client: checkpoint failed: {RECORDED_STEP_CHAIN}")
+        );
+        let serde_error = match serde_json::from_str::<u32>("x") {
+            Err(e) => e,
+            Ok(v) => unreachable!("`x` is not a u32: {v}"),
+        };
+        let serialization = StepError::new(
+            StepErrorKind::SerializationFailed,
+            Some(Box::new(serde_error)),
+        );
+        assert_eq!(
+            wire_message(&serialization),
+            "serialization failed: expected value at line 1 column 1"
+        );
+
+        // The walk examines at most `CHAIN_WALK_LIMIT` errors.
+        let layered = |layers: usize| -> Source {
+            (0..layers).fold(boxed(), |source, _| {
+                ContextualError::source_from("ctx", source)
+            })
+        };
+        assert_eq!(wire_message(&*layered(10)), "inner");
+        let past_the_limit = layered(11);
+        assert_eq!(
+            wire_message(&*past_the_limit),
+            chain_string(&*past_the_limit)
+        );
+        assert_ne!(wire_message(&*past_the_limit), "inner");
+    }
+
+    #[test]
+    fn wire_message_preserves_non_message_fields() {
+        let inner_wire = || {
+            WireError::new(Some("InnerType"), Some("inner"))
+                .with_error_data(Some("inner-data"))
+                .with_stack_trace(vec!["inner-frame".to_owned()])
+        };
+        let child =
+            OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+                ChildContextErrorKind::ChildFailed,
+                Some(Box::new(recorded_step_error(inner_wire()))),
+            )));
+        let wire = wire_error_for(&child, "Error");
+        assert_eq!(wire.error_type(), Some("ChildContextError"));
+        assert_eq!(wire.error_message(), Some("inner"));
+        assert_eq!(wire.error_data(), Some("inner-data"));
+        assert_eq!(wire.stack_trace(), ["inner-frame"]);
+
+        let contextual =
+            ContextualError::source_from("serialize", recorded_step_error(inner_wire()));
+        let wire = serialization_failure_wire(&*contextual);
+        assert_eq!(wire.error_type(), Some("SerializationError"));
+        assert_eq!(wire.error_message(), Some("inner"));
+        assert_eq!(wire.error_data(), Some("inner-data"));
+        assert_eq!(wire.stack_trace(), ["inner-frame"]);
     }
 }
