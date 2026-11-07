@@ -1051,8 +1051,8 @@ let auth: PaymentAuth = auth.into_result()?;
 The operation records the same history as `parallel` over branches with
 the same names and outcomes: one parallel parent and one child context per
 branch. `ParallelMixedBuilder` takes `.max_concurrency(...)`,
-`.completion(...)`, `.nesting(...)`, `.result_serdes(...)` and `.spawn()`,
-as `ParallelBuilder` does. `.await` returns the batch's
+`.completion(...)`, `.nesting(...)`, `.result_serdes(...)`, `.summary(...)`
+and `.spawn()`, as `ParallelBuilder` does. `.await` returns the batch's
 `CompletionReason`. A handle whose branch settled holds the branch's value
 or error, whatever the parallel's own outcome. A handle whose branch never
 started, or still ran when the batch completed, returns a `NotCompleted`
@@ -1062,6 +1062,28 @@ returned future is awaited.
 The result serdes works as on `ParallelBuilder`: it is a `Serdes<String>`
 over the batch record's JSON text, and it defaults to `PassthroughSerdes`.
 `JsonSerdes` stores the record as a quoted JSON string.
+
+The summary receives a `BatchResult<BranchValue>`. A `BranchValue` shows
+nothing of its value, so the summary reads each value with its branch's
+key: take `handle.key()` before the set goes to `parallel_mixed`, and call
+`batch.value(&key)`, which returns `Some(&value)` for a branch that
+succeeded and `None` otherwise.
+
+```rust ignore
+let mut branches = BranchSet::new();
+let report = branches.add("report", |_child| async { Ok(build_report().await?) });
+let rows = branches.add("rows", |_child| async { Ok(load_rows().await?) });
+let (report_key, rows_key) = (report.key(), rows.key());
+
+ctx.parallel_mixed(branches)
+    .name("build-report")
+    .summary(move |batch| {
+        let report_len = batch.value(&report_key).map_or(0, String::len);
+        let row_count = batch.value(&rows_key).map_or(0, Vec::len);
+        format!("report: {report_len} bytes, rows: {row_count}")
+    })
+    .await?;
+```
 
 Pick the parallel form by the branch result types:
 

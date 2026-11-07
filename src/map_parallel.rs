@@ -774,6 +774,48 @@ impl<O> BatchResult<O> {
     }
 }
 
+impl BatchResult<crate::future::BranchValue> {
+    /// Returns the value of the branch that `key` names, when that branch
+    /// succeeded.
+    ///
+    /// This is how the summary of
+    /// [`ParallelMixedBuilder::summary`](crate::builders::ParallelMixedBuilder::summary)
+    /// reads a branch's typed value: take the key with
+    /// [`BranchHandle::key`](crate::BranchHandle::key) before the set goes
+    /// to [`DurableContext::parallel_mixed`](crate::DurableContext::parallel_mixed),
+    /// and pass it here. The value is what the branch's serdes decoded, as
+    /// [`BranchHandle::into_result`](crate::BranchHandle::into_result)
+    /// returns it.
+    ///
+    /// Returns `None` when the branch failed, was still running when the
+    /// batch completed, or never started, and for a key from another
+    /// [`BranchSet`](crate::BranchSet).
+    ///
+    /// The key's type fixes the type of the value, so a key of one type
+    /// cannot read a value of another:
+    ///
+    /// ```compile_fail
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::builders::map_parallel::{BatchResult, CompletionReason};
+    /// use durable::{BranchSet, BranchValue};
+    ///
+    /// let mut branches = BranchSet::new();
+    /// let count = branches.add("count", |_ctx| async { Ok(7_u32) });
+    /// let key = count.key();
+    /// let batch: BatchResult<BranchValue> =
+    ///     BatchResult::new(Vec::new(), CompletionReason::AllCompleted);
+    /// let _value: Option<&String> = batch.value(&key);
+    /// ```
+    pub fn value<T: 'static>(&self, key: &crate::BranchKey<T>) -> Option<&T> {
+        self.items
+            .iter()
+            .find(|item| item.index == key.index())?
+            .result
+            .as_ref()?
+            .of_branch(key)
+    }
+}
+
 /// Controls whether batch items run in real or virtual child contexts.
 ///
 /// [`NestingMode::Normal`] (the default) runs each item in its own child
@@ -1179,20 +1221,20 @@ impl MixedItemSerdes {
     }
 }
 
-impl Serdes<crate::future::MixedValue> for MixedItemSerdes {
+impl Serdes<crate::future::BranchValue> for MixedItemSerdes {
     async fn serialize(
         &self,
-        value: crate::future::MixedValue,
+        value: crate::future::BranchValue,
         context: SerdesContext,
     ) -> Result<String, BoxError> {
-        value.0.encode(context).await
+        value.encode(context).await
     }
 
     async fn deserialize(
         &self,
         wire: String,
         context: SerdesContext,
-    ) -> Result<crate::future::MixedValue, BoxError> {
+    ) -> Result<crate::future::BranchValue, BoxError> {
         let decoder = self
             .by_op_id
             .get(context.operation_id())
@@ -1219,7 +1261,7 @@ impl Serdes<crate::future::MixedValue> for MixedItemSerdes {
 /// no branch is skipped, because the item indexes of a recorded batch are
 /// not checked against the branch count.
 pub(crate) fn publish_outcome(
-    result: Result<BatchResult<crate::future::MixedValue>, OperationError>,
+    result: Result<BatchResult<crate::future::BranchValue>, OperationError>,
     decoders: &[Arc<dyn crate::future::BranchDecoder>],
 ) -> Result<CompletionReason, OperationError> {
     let batch = result?;
@@ -1229,7 +1271,7 @@ pub(crate) fn publish_outcome(
         match item.status {
             BatchItemStatus::Succeeded => {
                 if let Some(value) = item.result {
-                    value.0.publish();
+                    value.publish();
                 }
             }
             BatchItemStatus::Failed => {
@@ -8376,12 +8418,117 @@ mod tests {
         let err = serdes
             .deserialize("1".to_owned(), SerdesContext::new("other", "arn:test"))
             .await
-            .err()
-            .expect("an unknown operation ID is an error");
+            .expect_err("an unknown operation ID is an error");
         assert_eq!(
             err.to_string(),
             r#"parallel_mixed: no branch has operation ID "other""#
         );
+    }
+
+    /// `BatchResult::value` reads each succeeded branch with its own key,
+    /// whether a branch body or a decoder produced the value, and nothing
+    /// for a failed, started or never-started branch, for a key of another
+    /// set, or for an item that holds another branch's value.
+    #[tokio::test]
+    async fn batch_value_reads_each_success_by_its_key() {
+        use std::cell::Cell;
+
+        fn assert_send_debug<T: Send + std::fmt::Debug>() {}
+        assert_send_debug::<BatchResult<crate::BranchValue>>();
+
+        let mut set = crate::BranchSet::new();
+        let label = set.add("label", |_ctx| async { Ok("ready-value".to_owned()) });
+        let count = set.add("count", |_ctx| async { Ok(Cell::new(4242_u32)) });
+        let failed = set.add("failed", |_ctx| async { Ok(0_u32) });
+        let started = set.add("started", |_ctx| async { Ok(0_u32) });
+        let never = set.add("never", |_ctx| async { Ok(0_u32) });
+        let mut other = crate::BranchSet::new();
+        let other_label = other.add("label", |_ctx| async { Ok("other".to_owned()) });
+
+        let (bodies, decoders, _json) = set.into_parts();
+        let decode = |index: usize, wire: &str| {
+            let decoder = Arc::clone(decoders.get(index).expect("the set has the branch"));
+            let wire = wire.to_owned();
+            async move {
+                decoder
+                    .decode(wire, SerdesContext::new("item", "arn:test"))
+                    .await
+                    .expect("the wire is valid JSON of the branch's type")
+            }
+        };
+        let label_value = decode(0, r#""ready-value""#).await;
+        let (_, count_body) = bodies.into_iter().nth(1).expect("the set has branch 1");
+        let count_value = count_body
+            .start(test_ctx(CheckpointLog::empty()))
+            .await
+            .expect("the body succeeds");
+        let succeeded = |index: usize, name: &str, value| {
+            BatchItem::new(
+                index,
+                name.to_owned(),
+                BatchItemStatus::Succeeded,
+                Some(value),
+                None,
+                None,
+            )
+        };
+        let batch = BatchResult::new(
+            vec![
+                succeeded(0, "label", label_value),
+                succeeded(1, "count", count_value),
+                BatchItem::new(
+                    2,
+                    "failed".to_owned(),
+                    BatchItemStatus::Failed,
+                    None,
+                    Some("boom".to_owned()),
+                    Some("Error".to_owned()),
+                ),
+                BatchItem::new(
+                    3,
+                    "started".to_owned(),
+                    BatchItemStatus::Started,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            CompletionReason::AllCompleted,
+        );
+
+        assert_eq!(
+            batch.value(&label.key()).map(String::as_str),
+            Some("ready-value")
+        );
+        assert_eq!(batch.value(&count.key()).map(Cell::get), Some(4242));
+        assert_eq!(batch.value(&failed.key()), None);
+        assert_eq!(batch.value(&started.key()), None);
+        assert_eq!(batch.value(&never.key()), None);
+        assert_eq!(batch.value(&other_label.key()), None);
+
+        let first = batch.items.first().expect("the batch has item 0");
+        let first = format!("{first:?}");
+        assert!(
+            first.contains("result: Some(BranchValue { .. })"),
+            "{first}"
+        );
+        assert!(!first.contains("ready-value"), "{first}");
+        assert_eq!(
+            format!("{:?}", batch.results()),
+            "[BranchValue { .. }, BranchValue { .. }]"
+        );
+        let text = format!("{batch:?}");
+        assert!(text.contains("BranchValue { .. }"), "{text}");
+        assert!(!text.contains("ready-value"), "{text}");
+        assert!(!text.contains("4242"), "{text}");
+
+        // An item whose index names one branch but whose value belongs to
+        // another branch reads as nothing for the first branch's key.
+        let misplaced = BatchResult::new(
+            vec![succeeded(0, "label", decode(1, "4242").await)],
+            CompletionReason::AllCompleted,
+        );
+        assert_eq!(misplaced.value(&label.key()), None);
     }
 
     #[tokio::test]
@@ -8401,7 +8548,7 @@ mod tests {
             .deserialize("7".to_owned(), child)
             .await
             .expect("the ID 1-2 names branch 1");
-        value.0.publish();
+        value.publish();
         assert_eq!(second.into_result().expect("branch 1 holds a value"), 7);
     }
 
@@ -8417,7 +8564,7 @@ mod tests {
             format!("{:#}", batch_error("checkpoint failed"))
         );
         // A succeeded item without a value publishes nothing either.
-        let item = BatchItem::<crate::future::MixedValue>::new(
+        let item = BatchItem::<crate::future::BranchValue>::new(
             0,
             "only".to_owned(),
             BatchItemStatus::Succeeded,
@@ -8455,7 +8602,7 @@ mod tests {
         let handle = set.add("only", |_ctx| async { Ok(1_u32) });
         let (_bodies, decoders, _json) = set.into_parts();
         let failed = |index: usize| {
-            BatchItem::<crate::future::MixedValue>::new(
+            BatchItem::<crate::future::BranchValue>::new(
                 index,
                 format!("item-{index}"),
                 BatchItemStatus::Failed,
@@ -8504,7 +8651,7 @@ mod tests {
         assert!(is_tolerance_error(&err), "{err:?}");
         let err = collect_successful(batch()).expect_err("parallel fails the batch");
         assert!(is_tolerance_error(&err), "{err:?}");
-        let mixed = BatchResult::<crate::future::MixedValue>::new(
+        let mixed = BatchResult::<crate::future::BranchValue>::new(
             Vec::new(),
             CompletionReason::FailureToleranceExceeded,
         );

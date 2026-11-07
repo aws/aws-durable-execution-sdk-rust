@@ -1235,10 +1235,11 @@ pub struct ParallelMixedBuilder<RS = PassthroughSerdes> {
     nesting: NestingMode,
     branches: Vec<(
         Option<String>,
-        crate::future::BranchBody<crate::future::MixedValue>,
+        crate::future::BranchBody<crate::future::BranchValue>,
     )>,
     decoders: Arc<Vec<Arc<dyn crate::future::BranchDecoder>>>,
     json: Arc<[bool]>,
+    summary: Option<crate::map_parallel::BatchSummary<crate::future::BranchValue>>,
 }
 
 impl<RS> std::fmt::Debug for ParallelMixedBuilder<RS> {
@@ -1268,6 +1269,7 @@ impl ParallelMixedBuilder {
             branches,
             decoders,
             json,
+            summary: None,
         }
     }
 }
@@ -1356,6 +1358,7 @@ impl<RS> ParallelMixedBuilder<RS> {
             branches: self.branches,
             decoders: self.decoders,
             json: self.json,
+            summary: self.summary,
         }
     }
 
@@ -1365,6 +1368,68 @@ impl<RS> ParallelMixedBuilder<RS> {
     /// without per-branch context events.
     pub fn nesting(mut self, mode: NestingMode) -> Self {
         self.nesting = mode;
+        self
+    }
+
+    /// Sets a summary stored with the batch record when the batch result is
+    /// too large to checkpoint.
+    ///
+    /// Called only when the serialized result, as
+    /// [`result_serdes`](Self::result_serdes) returns it, is over 256 KiB,
+    /// once per write of that record, before the write is awaited. The batch
+    /// then records a summary of its outcome instead of the branch results,
+    /// and the summary's output is stored under the key `summary`, the last
+    /// key of the `ParallelResult` record. A batch record that fits is
+    /// written as usual, and the summary is not called.
+    ///
+    /// The summary receives the [`BatchResult`], with each started branch's
+    /// index, name, status and error and the completion reason, as
+    /// [`ParallelBuilder::summary`] does. Each item holds a
+    /// [`BranchValue`](crate::BranchValue), which exposes nothing of its
+    /// value: the summary reads each value with its branch's key, from
+    /// [`BranchHandle::key`](crate::BranchHandle::key), and
+    /// [`BatchResult::value`]. The handles receive their results only after
+    /// the batch completes, so they are empty while the summary runs.
+    ///
+    /// The output is observability only: replay never reads it. A replay
+    /// that rebuilds a completed batch does not call the summary; a batch
+    /// that is still running when an invocation resumes it calls the
+    /// summary when it completes with an oversized result. Keep it under
+    /// 256 KiB, because the service rejects a larger payload. A second call
+    /// replaces the first.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::BranchSet;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     let mut branches = BranchSet::new();
+    ///     let report = branches.add("report", |_ctx| async { Ok("x".repeat(300_000)) });
+    ///     let rows = branches.add("rows", |_ctx| async { Ok(vec![1_u64; 40_000]) });
+    ///     let (report_key, rows_key) = (report.key(), rows.key());
+    ///     ctx.parallel_mixed(branches)
+    ///         .name("build-report")
+    ///         .summary(move |batch| {
+    ///             let report_len = batch.value(&report_key).map_or(0, String::len);
+    ///             let row_count = batch.value(&rows_key).map_or(0, Vec::len);
+    ///             format!("report: {report_len} bytes, rows: {row_count}")
+    ///         })
+    ///         .await?;
+    ///     let report = report.into_result()?;
+    ///     let rows = rows.into_result()?;
+    ///     Ok(format!("{} bytes, {} rows", report.len(), rows.len()))
+    /// }
+    /// ```
+    pub fn summary(
+        mut self,
+        summary: impl Fn(&BatchResult<crate::future::BranchValue>) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.summary = Some(Arc::new(summary));
         self
     }
 
@@ -1422,7 +1487,7 @@ impl<RS> ParallelMixedBuilder<RS> {
     /// The lazy terminal of the full [`BatchResult`], shared by `.await`
     /// and `.spawn()`. So both run the same replay identity check and the
     /// same admission check.
-    fn batch_future(self) -> DurableFuture<BatchResult<crate::future::MixedValue>>
+    fn batch_future(self) -> DurableFuture<BatchResult<crate::future::BranchValue>>
     where
         RS: Serdes<String>,
     {
@@ -1431,7 +1496,7 @@ impl<RS> ParallelMixedBuilder<RS> {
 
     /// [`Self::batch_future`] with the start step run now, on the caller's
     /// task (see [`crate::start`]). `spawn_batch()` and `.spawn()` use it.
-    fn started_batch_future(self) -> DurableFuture<BatchResult<crate::future::MixedValue>>
+    fn started_batch_future(self) -> DurableFuture<BatchResult<crate::future::BranchValue>>
     where
         RS: Serdes<String>,
     {
@@ -1442,7 +1507,7 @@ impl<RS> ParallelMixedBuilder<RS> {
     fn batch_future_with(
         self,
         started: bool,
-    ) -> DurableFuture<BatchResult<crate::future::MixedValue>>
+    ) -> DurableFuture<BatchResult<crate::future::BranchValue>>
     where
         RS: Serdes<String>,
     {
@@ -1465,7 +1530,7 @@ impl<RS> ParallelMixedBuilder<RS> {
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
-            summary: None,
+            summary: self.summary,
             item_ids,
         };
 
@@ -2467,5 +2532,20 @@ mod tests {
             .as_ref()
             .expect("the parallel keeps the summary");
         assert_eq!(summary(&result), "second 0");
+
+        let mixed_result =
+            BatchResult::<crate::BranchValue>::new(Vec::new(), CompletionReason::AllCompleted);
+        let mut branches = crate::BranchSet::new();
+        let _a = branches.add("a", |_child| async { Ok(1_u32) });
+        let parallel_mixed = ctx
+            .parallel_mixed(branches)
+            .summary(|r| format!("first {}", r.total_count()))
+            .summary(|r| format!("second {}", r.total_count()))
+            .result_serdes(JsonSerdes);
+        let summary = parallel_mixed
+            .summary
+            .as_ref()
+            .expect("the parallel_mixed keeps the summary");
+        assert_eq!(summary(&mixed_result), "second 0");
     }
 }

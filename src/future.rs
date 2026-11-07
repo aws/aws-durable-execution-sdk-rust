@@ -7,6 +7,7 @@
 //! result future.
 
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1109,12 +1110,18 @@ impl<O: Send + 'static> Callback<O> {
 #[non_exhaustive]
 pub struct BranchSet {
     /// Each branch's caller name and erased body, in the order added.
-    branches: Vec<(Option<String>, BranchBody<MixedValue>)>,
+    branches: Vec<(Option<String>, BranchBody<BranchValue>)>,
     /// Each branch's decoder, at the branch's index.
     decoders: Vec<Arc<dyn BranchDecoder>>,
     /// Whether each branch uses the default JSON serdes, at its index.
     json: Vec<bool>,
+    /// The set's identity, shared by every key and value of its branches.
+    identity: Arc<SetIdentity>,
 }
+
+/// The identity of one [`BranchSet`]: each set allocates its own, and two
+/// identities are the same exactly when they are the same allocation.
+struct SetIdentity;
 
 impl Default for BranchSet {
     fn default() -> Self {
@@ -1143,6 +1150,7 @@ impl BranchSet {
             branches: Vec::new(),
             decoders: Vec::new(),
             json: Vec::new(),
+            identity: Arc::new(SetIdentity),
         }
     }
 
@@ -1254,20 +1262,32 @@ impl BranchSet {
         } else {
             name.clone()
         };
+        let key = BranchKey {
+            identity: Arc::clone(&self.identity),
+            index,
+            _marker: PhantomData,
+        };
         let slot: BranchSlot<T> = Arc::new(std::sync::Mutex::new(None));
         let serdes = Arc::new(serdes);
         let decoder = BranchShared {
             serdes: Arc::clone(&serdes),
             slot: Arc::clone(&slot),
+            identity: Arc::clone(&self.identity),
+            index,
         };
         let body_slot = Arc::clone(&slot);
+        let body_identity = Arc::clone(&self.identity);
         let branch = Branch::new(name, move |ctx: DurableContext| async move {
             let value = factory(ctx).await?;
-            Ok(MixedValue(Box::new(TypedBranchValue {
-                value,
-                serdes,
-                slot: body_slot,
-            })))
+            Ok(BranchValue {
+                value: Box::new(TypedBranchValue {
+                    value,
+                    serdes,
+                    slot: body_slot,
+                }),
+                identity: body_identity,
+                index,
+            })
         });
         self.branches.push(branch.into_parts());
         self.decoders.push(Arc::new(decoder));
@@ -1275,6 +1295,7 @@ impl BranchSet {
         BranchHandle {
             name: record_name,
             slot,
+            key,
         }
     }
 
@@ -1285,7 +1306,7 @@ impl BranchSet {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        Vec<(Option<String>, BranchBody<MixedValue>)>,
+        Vec<(Option<String>, BranchBody<BranchValue>)>,
         Arc<Vec<Arc<dyn BranchDecoder>>>,
         Arc<[bool]>,
     ) {
@@ -1307,6 +1328,8 @@ pub struct BranchHandle<T> {
     name: String,
     /// Shared with the branch: filled when the parallel's `.await` returns.
     slot: BranchSlot<T>,
+    /// The branch's key.
+    key: BranchKey<T>,
 }
 
 impl<T> std::fmt::Debug for BranchHandle<T> {
@@ -1320,6 +1343,18 @@ impl<T> std::fmt::Debug for BranchHandle<T> {
 }
 
 impl<T> BranchHandle<T> {
+    /// Returns the key that reads this branch's value from the
+    /// [`BatchResult`](crate::builders::map_parallel::BatchResult) a
+    /// [`ParallelMixedBuilder::summary`](crate::builders::ParallelMixedBuilder::summary)
+    /// receives, with
+    /// [`BatchResult::value`](crate::builders::map_parallel::BatchResult::value).
+    ///
+    /// Every call returns a key of the same branch.
+    #[must_use]
+    pub fn key(&self) -> BranchKey<T> {
+        self.key.clone()
+    }
+
     /// Returns the branch's result, without waiting.
     ///
     /// - `Ok(value)` when the branch succeeded. `value` is what the
@@ -1366,9 +1401,113 @@ fn not_completed_error(name: &str) -> OperationError {
     ))
 }
 
-/// The item type of `parallel_mixed`: one branch's value, erased, carrying
-/// its own encoder and its handle's slot (crate-internal).
-pub(crate) struct MixedValue(pub(crate) Box<dyn ErasedBranchValue>);
+/// The value of one branch of a [`BranchSet`], with its type erased: the
+/// item type of the [`BatchResult`](crate::builders::map_parallel::BatchResult) that a
+/// [`ParallelMixedBuilder::summary`](crate::builders::ParallelMixedBuilder::summary)
+/// receives.
+///
+/// A `BranchValue` exposes nothing of its value. Read the value with
+/// [`BatchResult::value`](crate::builders::map_parallel::BatchResult::value) and the key that
+/// [`BranchHandle::key`] returns. Its `Debug` text is `BranchValue { .. }`.
+pub struct BranchValue {
+    /// The value, with its serdes and its handle's slot.
+    value: Box<dyn ErasedBranchValue>,
+    /// The identity of the set the branch belongs to.
+    identity: Arc<SetIdentity>,
+    /// The branch's index in its set.
+    index: usize,
+}
+
+impl std::fmt::Debug for BranchValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BranchValue").finish_non_exhaustive()
+    }
+}
+
+impl BranchValue {
+    /// Encodes the value with its branch's serdes (internal).
+    pub(crate) fn encode(
+        self,
+        ctx: crate::serdes::SerdesContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, BoxError>> + Send>> {
+        self.value.encode(ctx)
+    }
+
+    /// Stores `Ok(value)` in the branch handle's slot (internal).
+    pub(crate) fn publish(self) {
+        self.value.publish();
+    }
+
+    /// Returns the value when it belongs to `key`'s branch (internal).
+    pub(crate) fn of_branch<T: 'static>(&self, key: &BranchKey<T>) -> Option<&T> {
+        if !Arc::ptr_eq(&self.identity, &key.identity) || self.index != key.index {
+            return None;
+        }
+        #[expect(clippy::expect_used)]
+        // reason: the set and the index name one branch, and that branch's
+        // body and decoder produce only values of the type of its key
+        let value = self
+            .value
+            .value()
+            .downcast_ref::<T>()
+            .expect("a branch's key has the type of the branch's values");
+        Some(value)
+    }
+}
+
+/// The key of one branch of a [`BranchSet`], which reads the branch's value
+/// from a [`BatchResult<BranchValue>`](crate::builders::map_parallel::BatchResult) with
+/// [`BatchResult::value`](crate::builders::map_parallel::BatchResult::value).
+///
+/// [`BranchHandle::key`] returns it. A key reads only values of its own
+/// branch: a key from another set returns `None`. It is `Clone`, `Send`
+/// and `Sync` for every branch type, and holds no value of type `T`.
+///
+/// A key's type is exactly its branch's type. Subtyping cannot turn a key
+/// of one type into a key of another, so a key never reads a value as a
+/// type the branch did not produce:
+///
+/// ```compile_fail,E0308
+/// use aws_durable_execution_sdk::BranchKey;
+///
+/// fn coerce(key: BranchKey<for<'a> fn(&'a ())>) -> BranchKey<fn(&'static ())> {
+///     key
+/// }
+/// ```
+pub struct BranchKey<T> {
+    /// The identity of the set the branch belongs to.
+    identity: Arc<SetIdentity>,
+    /// The branch's index in its set.
+    index: usize,
+    /// The branch's type, without owning a `T`. `fn(T) -> T` makes the key
+    /// invariant in `T`, so subtyping cannot change the type it reads.
+    _marker: PhantomData<fn(T) -> T>,
+}
+
+impl<T> BranchKey<T> {
+    /// The branch's index in its set (internal).
+    pub(crate) fn index(&self) -> usize {
+        self.index
+    }
+}
+
+impl<T> Clone for BranchKey<T> {
+    fn clone(&self) -> Self {
+        Self {
+            identity: Arc::clone(&self.identity),
+            index: self.index,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for BranchKey<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BranchKey")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
 
 /// A branch value whose type is erased (crate-internal).
 pub(crate) trait ErasedBranchValue: Send {
@@ -1379,6 +1518,8 @@ pub(crate) trait ErasedBranchValue: Send {
     ) -> Pin<Box<dyn Future<Output = Result<String, BoxError>> + Send>>;
     /// Stores `Ok(value)` in the branch handle's slot.
     fn publish(self: Box<Self>);
+    /// Returns the value.
+    fn value(&self) -> &dyn std::any::Any;
 }
 
 /// Decodes the values of one branch and fails its handle (crate-internal).
@@ -1388,7 +1529,7 @@ pub(crate) trait BranchDecoder: Send + Sync {
         &self,
         wire: String,
         ctx: crate::serdes::SerdesContext,
-    ) -> Pin<Box<dyn Future<Output = Result<MixedValue, BoxError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<BranchValue, BoxError>> + Send + '_>>;
     /// Stores `Err(err)` in the branch handle's slot.
     fn publish_error(&self, err: OperationError);
 }
@@ -1417,12 +1558,19 @@ where
         let Self { value, slot, .. } = *self;
         *lock_slot(&slot) = Some(Ok(value));
     }
+
+    fn value(&self) -> &dyn std::any::Any {
+        &self.value
+    }
 }
 
-/// One branch's serdes and handle slot: the branch's [`BranchDecoder`].
+/// One branch's serdes, handle slot, set identity and index: the branch's
+/// [`BranchDecoder`].
 struct BranchShared<T, S> {
     serdes: Arc<S>,
     slot: BranchSlot<T>,
+    identity: Arc<SetIdentity>,
+    index: usize,
 }
 
 impl<T, S> BranchDecoder for BranchShared<T, S>
@@ -1434,14 +1582,18 @@ where
         &self,
         wire: String,
         ctx: crate::serdes::SerdesContext,
-    ) -> Pin<Box<dyn Future<Output = Result<MixedValue, BoxError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<BranchValue, BoxError>> + Send + '_>> {
         Box::pin(async move {
             let value = self.serdes.deserialize(wire, ctx).await?;
-            Ok(MixedValue(Box::new(TypedBranchValue {
-                value,
-                serdes: Arc::clone(&self.serdes),
-                slot: Arc::clone(&self.slot),
-            })))
+            Ok(BranchValue {
+                value: Box::new(TypedBranchValue {
+                    value,
+                    serdes: Arc::clone(&self.serdes),
+                    slot: Arc::clone(&self.slot),
+                }),
+                identity: Arc::clone(&self.identity),
+                index: self.index,
+            })
         })
     }
 
@@ -1949,5 +2101,28 @@ mod tests {
             format!("{handle:?}"),
             r#"BranchHandle { name: "a", has_result: true, .. }"#
         );
+    }
+
+    /// Whether two keys name the same branch of the same set.
+    fn same_branch<T>(a: &BranchKey<T>, b: &BranchKey<T>) -> bool {
+        Arc::ptr_eq(&a.identity, &b.identity) && a.index == b.index
+    }
+
+    #[test]
+    fn branch_keys_name_their_branch_and_set() {
+        fn assert_clone_send_sync<K: Clone + Send + Sync>() {}
+        assert_clone_send_sync::<BranchKey<std::cell::Cell<String>>>();
+
+        let mut first = BranchSet::new();
+        let a = first.add("a", |_ctx| async { Ok(1_u32) });
+        let b = first.add("b", |_ctx| async { Ok(2_u32) });
+        let mut second = BranchSet::new();
+        let other_a = second.add("a", |_ctx| async { Ok(1_u32) });
+
+        assert!(same_branch(&a.key(), &a.key()));
+        assert!(same_branch(&a.key(), &a.key().clone()));
+        assert!(!same_branch(&a.key(), &b.key()));
+        assert!(!same_branch(&a.key(), &other_a.key()));
+        assert_eq!(format!("{:?}", b.key()), "BranchKey { index: 1, .. }");
     }
 }

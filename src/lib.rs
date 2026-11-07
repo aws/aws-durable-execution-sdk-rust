@@ -163,7 +163,7 @@ pub use self::error::{
     UnexpectedStatus, UnrecognizedStatus, WaitError, WaitErrorKind, WaitForConditionError,
     WaitForConditionErrorKind, WireError,
 };
-pub use self::future::{Branch, BranchHandle, BranchSet, DurableFuture};
+pub use self::future::{Branch, BranchHandle, BranchKey, BranchSet, BranchValue, DurableFuture};
 pub use self::operation::{InvocationStatus, OperationKind, OperationStatus};
 pub use self::operation_sub_type::{InvalidOperationSubType, OperationSubType};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};

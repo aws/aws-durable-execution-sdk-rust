@@ -1833,3 +1833,140 @@ async fn flat_nesting_history_equals_parallel() {
         );
     }
 }
+
+/// What the summary of [`parallel_mixed_summary_run`] saw in one call.
+#[derive(Debug, Clone, PartialEq)]
+struct SummaryCall {
+    text_len: Option<usize>,
+    numbers_len: Option<usize>,
+    other_set: Option<String>,
+    failed: Vec<(usize, String, Option<String>)>,
+    reason: CompletionReason,
+}
+
+/// What the handles of [`parallel_mixed_summary_run`] returned in one
+/// invocation: the text's length and the number count.
+type HandleValues = (usize, usize);
+
+/// Runs a `parallel_mixed` named `pm` with a summary. Branch `text`
+/// returns `text_len` bytes of text at once, branch `numbers` waits 1 s
+/// when `wait` is set and returns `numbers_len` numbers, and branch
+/// `fails` fails within the tolerance. When `wait` is set, the parent waits
+/// after the parallel. Returns each summary call, the handles' values of
+/// each invocation that read them, and the run.
+async fn parallel_mixed_summary_run(
+    text_len: usize,
+    numbers_len: usize,
+    wait: bool,
+) -> (Vec<SummaryCall>, Vec<HandleValues>, TestResult<()>) {
+    let calls: Log<SummaryCall> = log();
+    let handles: Log<HandleValues> = log();
+    let (calls_h, handles_h) = (Arc::clone(&calls), Arc::clone(&handles));
+    let result = run(move |(), ctx| {
+        let calls = Arc::clone(&calls_h);
+        let handles = Arc::clone(&handles_h);
+        async move {
+            let mut set = BranchSet::new();
+            let text = set.add("text", move |_ctx| async move { Ok("t".repeat(text_len)) });
+            let numbers = set.add("numbers", move |child: DurableContext| async move {
+                if wait {
+                    child.wait(Duration::from_secs(1)).name("slow").await?;
+                }
+                Ok(vec![1_234_567_u32; numbers_len])
+            });
+            let _fails = set.add("fails", |_ctx| async {
+                Err::<u32, BoxError>("boom".into())
+            });
+            let mut other = BranchSet::new();
+            let other_text = other.add("text", |_ctx| async { Ok("other".to_owned()) });
+            let (text_key, numbers_key, other_key) = (text.key(), numbers.key(), other_text.key());
+            ctx.parallel_mixed(set)
+                .name("pm")
+                .completion(CompletionConfig::with_tolerated_failure_count(1))
+                .summary(move |batch| {
+                    let call = SummaryCall {
+                        text_len: batch.value(&text_key).map(String::len),
+                        numbers_len: batch.value(&numbers_key).map(Vec::len),
+                        other_set: batch.value(&other_key).cloned(),
+                        failed: batch
+                            .failed()
+                            .map(|item| (item.index, item.name.clone(), item.error_message.clone()))
+                            .collect(),
+                        reason: batch.reason,
+                    };
+                    let output = format!("{call:?}");
+                    push(&calls, call);
+                    output
+                })
+                .await?;
+            push(
+                &handles,
+                (text.into_result()?.len(), numbers.into_result()?.len()),
+            );
+            if wait {
+                wait_then_replay(&ctx).await?;
+            }
+            Ok(())
+        }
+    })
+    .await;
+    (entries(&calls), entries(&handles), result)
+}
+
+/// Two branches of about 150 KiB each make the batch record too large to
+/// store. The summary runs once, in the invocation that completes the
+/// batch, and reads both values through their keys, although `text`
+/// completed in the invocation before. The rebuild in the third invocation
+/// does not call it, and the handles return their values both times.
+#[tokio::test]
+async fn oversized_parallel_mixed_records_the_summary() {
+    let (calls, handles, result) = parallel_mixed_summary_run(150_000, 19_000, true).await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    assert_eq!(result.invocation_count(), 3, "{result}");
+    let expected = SummaryCall {
+        text_len: Some(150_000),
+        numbers_len: Some(19_000),
+        other_set: None,
+        failed: vec![(2, "fails".to_owned(), Some("boom".to_owned()))],
+        reason: CompletionReason::AllCompleted,
+    };
+    assert_eq!(calls, vec![expected.clone()]);
+    assert_eq!(handles, vec![(150_000, 19_000), (150_000, 19_000)]);
+
+    let payload = op(&result, "pm")
+        .result()
+        .expect("the parallel has a payload");
+    let record: serde_json::Value = serde_json::from_str(payload).expect("the record is JSON");
+    assert_eq!(
+        record.get("type"),
+        Some(&serde_json::json!("ParallelResult"))
+    );
+    assert_eq!(record.get("totalCount"), Some(&serde_json::json!(3)));
+    assert_eq!(record.get("successCount"), Some(&serde_json::json!(2)));
+    assert_eq!(record.get("failureCount"), Some(&serde_json::json!(1)));
+    assert_eq!(record.get("itemStatuses"), Some(&serde_json::json!("SSF")));
+    let output = format!("{expected:?}");
+    assert_eq!(record.get("summary"), Some(&serde_json::json!(output)));
+    let last = format!(",\"summary\":{}}}", serde_json::Value::from(output));
+    assert!(
+        payload.ends_with(&last),
+        "summary is the last key: {payload}"
+    );
+}
+
+/// A batch record under the limit is stored as usual: the summary is not
+/// called, and the record has no `summary` key.
+#[tokio::test]
+async fn parallel_mixed_under_the_limit_skips_the_summary() {
+    let (calls, handles, result) = parallel_mixed_summary_run(10, 3, false).await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    assert_eq!(result.invocation_count(), 1, "{result}");
+    assert_eq!(calls, Vec::new());
+    assert_eq!(handles, vec![(10, 3)]);
+    let record = record(&result, "pm");
+    assert!(record.get("summary").is_none(), "{record}");
+    assert!(
+        record.get("all").is_some(),
+        "the record is inline: {record}"
+    );
+}
