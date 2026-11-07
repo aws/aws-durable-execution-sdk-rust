@@ -175,7 +175,9 @@
 //! starts and the clock does not move meanwhile. [`CloudRunner`] cannot hold
 //! the deployed function. It supports `wait_for_data` and the callback
 //! controls only with [`InvocationType::Event`], and reads the whole history
-//! every [`poll_interval`](CloudRunner::poll_interval).
+//! every [`poll_interval`](CloudRunner::poll_interval). It makes up to three
+//! attempts per `GetDurableExecution` call and per history page request, as
+//! JS does.
 //!
 //! This test pauses a run while a step runs and while it waits for a
 //! callback:
@@ -3170,6 +3172,15 @@ fn aws_error(err: BoxError) -> TestRunnerError {
 /// is a [`TestRunnerError`]. A durable execution that fails, times out or
 /// stops is an `Ok` [`TestResult`] with that [`ExecutionStatus`].
 ///
+/// The runner paces and retries its reads as the JS history poller does. It
+/// waits one [`poll_interval`](Self::poll_interval) before each
+/// `GetDurableExecution` poll, and one interval before each history page
+/// that follows a page with a next marker. Each `GetDurableExecution` call
+/// and each history page request makes up to three attempts on any error:
+/// the second starts 1000 ms after the first fails, the third 1450 ms after
+/// the second fails, and the third attempt's error is the call's error.
+/// `Invoke` and the callback calls make one attempt.
+///
 /// [`GetDurableExecution`]: https://docs.aws.amazon.com/lambda/latest/api/API_GetDurableExecution.html
 /// [`GetDurableExecutionHistory`]: https://docs.aws.amazon.com/lambda/latest/api/API_GetDurableExecutionHistory.html
 ///
@@ -3300,6 +3311,11 @@ impl CloudRunner {
     ///
     /// By default there is no limit: the runner polls until the execution
     /// ends or a Lambda call fails.
+    ///
+    /// A poll counts once however many attempts it makes (see
+    /// [`CloudRunner`]), and a history read of a live control counts once
+    /// however many pages and attempts it makes. The history read that
+    /// builds the final [`TestResult`] does not count.
     ///
     /// # Examples
     ///
@@ -3487,8 +3503,7 @@ impl CloudRunner {
                 tokio::time::sleep(self.poll_interval).await;
                 if cloud.take_poll() {
                     polls += 1;
-                    let out = api
-                        .send_get_durable_execution(&execution_arn)
+                    let out = with_read_retries(|| api.send_get_durable_execution(&execution_arn))
                         .await
                         .map_err(aws_error)?;
                     if !matches!(out.status(), WireExecutionStatus::Running) {
@@ -3597,16 +3612,53 @@ impl CloudRunner {
     }
 }
 
-/// Retrieves the full paginated execution history.
+/// The attempts [`with_read_retries`] makes, as JS
+/// `HistoryPoller.getMaxRetryAttempts`.
+const READ_ATTEMPTS: u32 = 3;
+
+/// The wait after `failed` failed attempts of a read, as JS
+/// `callWithRetries`: `(failed² - 1) × 150 + 1000` ms, so 1000 ms after the
+/// first failure and 1450 ms after the second.
+fn read_retry_delay(failed: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(u64::from(failed * failed - 1) * 150 + 1000)
+}
+
+/// Calls `call` until it succeeds, up to [`READ_ATTEMPTS`] times, waiting
+/// [`read_retry_delay`] after each failed attempt but the last. Any error
+/// fails an attempt, and the last attempt's error is the result.
+async fn with_read_retries<T, F, Fut>(mut call: F) -> Result<T, BoxError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, BoxError>>,
+{
+    let mut failed = 0;
+    loop {
+        match call().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                failed += 1;
+                if failed >= READ_ATTEMPTS {
+                    return Err(err);
+                }
+                tokio::time::sleep(read_retry_delay(failed)).await;
+            }
+        }
+    }
+}
+
+/// Retrieves the full paginated execution history. Each page request makes
+/// the attempts of [`with_read_retries`], and a page that follows a page
+/// with a next marker is requested `poll_interval` after that page arrived.
 async fn fetch_history<A: CloudApi>(
     api: &A,
     execution_arn: &str,
+    poll_interval: std::time::Duration,
 ) -> Result<Vec<Event>, TestRunnerError> {
     let mut events = Vec::new();
     let mut marker: Option<String> = None;
     loop {
-        let out = api
-            .send_get_durable_execution_history(execution_arn, marker.as_deref())
+        let page = marker.as_deref();
+        let out = with_read_retries(|| api.send_get_durable_execution_history(execution_arn, page))
             .await
             .map_err(aws_error)?;
         events.extend(out.events().iter().cloned());
@@ -3614,29 +3666,9 @@ async fn fetch_history<A: CloudApi>(
             Some(m) if !m.is_empty() => marker = Some(m.to_owned()),
             _ => break,
         }
+        tokio::time::sleep(poll_interval).await;
     }
     Ok(events)
-}
-
-/// Whether `err` is the `ResourceNotFoundException` of a
-/// `GetDurableExecutionHistory` call.
-fn is_history_not_found(err: &TestRunnerError) -> bool {
-    use aws_sdk_lambda::operation::get_durable_execution_history::GetDurableExecutionHistoryError;
-    let TestRunnerError::Aws(source) = err else {
-        return false;
-    };
-    source
-        .downcast_ref::<aws_sdk_lambda::error::SdkError<
-            GetDurableExecutionHistoryError,
-            aws_sdk_lambda::config::http::HttpResponse,
-        >>()
-        .and_then(aws_sdk_lambda::error::SdkError::as_service_error)
-        .is_some_and(|e| {
-            matches!(
-                e,
-                GetDurableExecutionHistoryError::ResourceNotFoundException(_)
-            )
-        })
 }
 
 /// The last terminal execution event of the history: `ExecutionSucceeded`,
@@ -14241,6 +14273,7 @@ mod tests {
         invokes: Mutex<Vec<InvokeRequest>>,
         execution_calls: Mutex<Vec<ExecutionCall>>,
         history_calls: Mutex<Vec<HistoryCall>>,
+        history_times: Mutex<Vec<tokio::time::Instant>>,
         calls: Mutex<Vec<FakeCall>>,
     }
 
@@ -14267,6 +14300,7 @@ mod tests {
                 invokes: Mutex::new(Vec::new()),
                 execution_calls: Mutex::new(Vec::new()),
                 history_calls: Mutex::new(Vec::new()),
+                history_times: Mutex::new(Vec::new()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -14328,6 +14362,33 @@ mod tests {
         fn history_calls(&self) -> Vec<HistoryCall> {
             self.history_calls.lock().expect("lock").clone()
         }
+
+        /// The milliseconds after `start` of every `GetDurableExecution`
+        /// request.
+        fn execution_ms(&self, start: tokio::time::Instant) -> Vec<u128> {
+            self.execution_calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|call| (call.at - start).as_millis())
+                .collect()
+        }
+
+        /// The milliseconds after `start` and the marker of every
+        /// `GetDurableExecutionHistory` request.
+        fn history_ms(&self, start: tokio::time::Instant) -> Vec<(u128, Option<String>)> {
+            let times = self.history_times.lock().expect("lock").clone();
+            times
+                .iter()
+                .zip(self.history_calls())
+                .map(|(at, call)| ((*at - start).as_millis(), call.marker))
+                .collect()
+        }
+    }
+
+    /// `(ms, None)` for each of `ms`: history requests without a marker.
+    fn unmarked(ms: &[u128]) -> Vec<(u128, Option<String>)> {
+        ms.iter().map(|ms| (*ms, None)).collect()
     }
 
     impl CloudApi for FakeApi {
@@ -14373,6 +14434,10 @@ mod tests {
                 execution_arn: execution_arn.to_owned(),
                 marker: marker.map(ToOwned::to_owned),
             });
+            self.history_times
+                .lock()
+                .expect("lock")
+                .push(tokio::time::Instant::now());
             let scripted = self.history.lock().expect("lock").pop_front();
             let (events, next_marker) = match scripted {
                 Some(page) => page?,
@@ -14496,35 +14561,136 @@ mod tests {
         assert_eq!(api.history_calls(), Vec::<HistoryCall>::new());
     }
 
+    /// Every `GetDurableExecution` attempt fails: the poll makes three
+    /// attempts, 1000 ms and then 1450 ms apart, and the run returns the
+    /// third error.
     #[tokio::test(start_paused = true)]
     async fn cloud_get_execution_error_is_aws() {
-        let api = Arc::new(FakeApi::new().with_execution(Err(fake_error("fake get"))));
+        let start = tokio::time::Instant::now();
+        let api = Arc::new(
+            FakeApi::new()
+                .with_execution(Err(fake_error("fake get 1")))
+                .with_execution(Err(fake_error("fake get 2")))
+                .with_execution(Err(fake_error("fake get 3"))),
+        );
         let err = CloudRunner::new("f")
             .run_with::<_, u32>(Arc::clone(&api), Vec::new())
             .await
             .expect_err("a runner error");
-        assert_aws(&err, "fake get");
-        assert_eq!(api.execution_arns(), vec![ARN.to_owned()]);
+        assert_aws(&err, "fake get 3");
+        assert_eq!(api.execution_arns(), vec![ARN.to_owned(); 3]);
+        assert_eq!(api.execution_ms(start), [1000, 2000, 3450]);
         assert_eq!(api.history_calls(), Vec::<HistoryCall>::new());
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cloud_get_execution_succeeds_on_the_third_attempt() {
+        let start = tokio::time::Instant::now();
+        let api = Arc::new(
+            FakeApi::new()
+                .with_execution(Err(fake_error("fake get 1")))
+                .with_execution(Err(fake_error("fake get 2")))
+                .with_execution(Ok(execution_output(
+                    WireExecutionStatus::Succeeded,
+                    Some("5"),
+                ))),
+        );
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(Arc::clone(&api), Vec::new())
+            .await
+            .expect("runner");
+        assert!(result.is_success());
+        assert_eq!(result.output(), Some(&5));
+        assert_eq!(api.execution_ms(start), [1000, 2000, 3450]);
+        assert_eq!(api.history_ms(start), unmarked(&[3450]));
+    }
+
+    /// Every history attempt fails: the page request makes three attempts,
+    /// and the run returns the third error.
+    #[tokio::test(start_paused = true)]
     async fn cloud_get_history_error_is_aws() {
+        let start = tokio::time::Instant::now();
         let api = Arc::new(
             FakeApi::new()
                 .with_execution(Ok(execution_output(
                     WireExecutionStatus::Succeeded,
                     Some("5"),
                 )))
-                .with_history(Err(fake_error("fake history"))),
+                .with_history_pages(vec![
+                    Err(fake_error("fake history 1")),
+                    Err(fake_error("fake history 2")),
+                    Err(fake_error("fake history 3")),
+                ]),
         );
         let err = CloudRunner::new("f")
             .run_with::<_, u32>(Arc::clone(&api), Vec::new())
             .await
             .expect_err("a runner error");
-        assert_aws(&err, "fake history");
-        assert_eq!(api.execution_arns(), vec![ARN.to_owned()]);
-        assert_eq!(api.history_calls(), one_history_call());
+        assert_aws(&err, "fake history 3");
+        assert_eq!(api.execution_ms(start), [1000]);
+        assert_eq!(api.history_ms(start), unmarked(&[1000, 2000, 3450]));
+    }
+
+    /// The page after a marker starts one poll interval after the marked
+    /// page, and its retries repeat the marker after their retry delays.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_history_retry_repeats_the_marker() {
+        let start = tokio::time::Instant::now();
+        let api = Arc::new(
+            FakeApi::new()
+                .with_execution(Ok(execution_output(
+                    WireExecutionStatus::Succeeded,
+                    Some("5"),
+                )))
+                .with_history_pages(vec![
+                    Ok((Vec::new(), Some("m1".to_owned()))),
+                    Err(fake_error("fake m1 1")),
+                    Err(fake_error("fake m1 2")),
+                    Ok((Vec::new(), None)),
+                ]),
+        );
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(Arc::clone(&api), Vec::new())
+            .await
+            .expect("runner");
+        assert!(result.is_success());
+        assert_eq!(api.execution_ms(start), [1000]);
+        let m1 = Some("m1".to_owned());
+        assert_eq!(
+            api.history_ms(start),
+            [
+                (1000, None),
+                (2000, m1.clone()),
+                (3000, m1.clone()),
+                (4450, m1)
+            ]
+        );
+    }
+
+    /// A status poll that retries counts once against the poll budget.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_retried_poll_counts_once() {
+        let start = tokio::time::Instant::now();
+        let api = Arc::new(
+            FakeApi::new()
+                .with_execution(Err(fake_error("fake get 1")))
+                .with_execution(Err(fake_error("fake get 2")))
+                .with_execution(Ok(execution_output(WireExecutionStatus::Running, None)))
+                .with_execution(Ok(execution_output(WireExecutionStatus::Running, None))),
+        );
+        let result = CloudRunner::new("f")
+            .max_poll_attempts(2)
+            .run_with::<_, u32>(Arc::clone(&api), Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.status(), ExecutionStatus::Running);
+        assert_eq!(api.execution_ms(start), [1000, 2000, 3450, 4450]);
+        assert_eq!(api.history_ms(start), unmarked(&[4450]));
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(
+            result.error().and_then(crate::WireError::error_message),
+            Some("execution fake-execution-arn still running after 2 polls")
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -15060,7 +15226,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cloud_poll_limit_history_error_is_aws() {
-        let api = Arc::new(FakeApi::new().with_history(Err(fake_error("fake history"))));
+        let api = Arc::new(
+            FakeApi::new()
+                .with_history_pages(Vec::new())
+                .repeat_history(Err("fake history")),
+        );
         let err = CloudRunner::new("f")
             .max_poll_attempts(1)
             .run_with::<_, u32>(Arc::clone(&api), Vec::new())
@@ -15199,9 +15369,9 @@ mod tests {
     }
 
     /// A `GetDurableExecution` failure of the `LambdaClient` implementation
-    /// of [`CloudApi`] is `TestRunnerError::Aws`, and its source is the SDK
-    /// error of that call.
-    #[tokio::test]
+    /// of [`CloudApi`] is `TestRunnerError::Aws` after three attempts, and
+    /// its source is the SDK error of that call.
+    #[tokio::test(start_paused = true)]
     async fn lambda_client_get_execution_error_is_aws() {
         use aws_sdk_lambda::operation::get_durable_execution::GetDurableExecutionError;
         use aws_smithy_mocks::{RuleMode, mock, mock_client};
@@ -15216,6 +15386,7 @@ mod tests {
                     aws_sdk_lambda::types::error::ResourceNotFoundException::builder().build(),
                 )
             })
+            .times(3)
             .build();
         let history = mock!(aws_sdk_lambda::Client::get_durable_execution_history)
             .then_output(|| GetHistoryOutput::builder().build().expect("history output"));
@@ -15225,7 +15396,6 @@ mod tests {
             [&invoke, &execution, &history]
         );
         let err = CloudRunner::new("f")
-            .poll_interval(std::time::Duration::ZERO)
             .lambda_client(client)
             .run::<_, u32>(())
             .await
@@ -15246,14 +15416,14 @@ mod tests {
             "{sdk:?}"
         );
         assert_eq!(invoke.num_calls(), 1);
-        assert_eq!(execution.num_calls(), 1);
+        assert_eq!(execution.num_calls(), 3);
         assert_eq!(history.num_calls(), 0);
     }
 
     /// A `GetDurableExecutionHistory` failure of the `LambdaClient`
-    /// implementation of [`CloudApi`] is `TestRunnerError::Aws`, and its
-    /// source is the SDK error of that call.
-    #[tokio::test]
+    /// implementation of [`CloudApi`] is `TestRunnerError::Aws` after three
+    /// attempts, and its source is the SDK error of that call.
+    #[tokio::test(start_paused = true)]
     async fn lambda_client_get_history_error_is_aws() {
         use aws_sdk_lambda::operation::get_durable_execution_history::GetDurableExecutionHistoryError;
         use aws_smithy_mocks::{RuleMode, mock, mock_client};
@@ -15272,6 +15442,7 @@ mod tests {
                     aws_sdk_lambda::types::error::ResourceNotFoundException::builder().build(),
                 )
             })
+            .times(3)
             .build();
         let client = mock_client!(
             aws_sdk_lambda,
@@ -15279,7 +15450,6 @@ mod tests {
             [&invoke, &execution, &history]
         );
         let err = CloudRunner::new("f")
-            .poll_interval(std::time::Duration::ZERO)
             .lambda_client(client)
             .run::<_, u32>(())
             .await
@@ -15303,7 +15473,7 @@ mod tests {
         );
         assert_eq!(invoke.num_calls(), 1);
         assert_eq!(execution.num_calls(), 1);
-        assert_eq!(history.num_calls(), 1);
+        assert_eq!(history.num_calls(), 3);
     }
 
     #[test]
@@ -19781,11 +19951,58 @@ mod tests {
     }
 
     /// A fake whose history reads answer `ResourceNotFoundException` while
-    /// `not_found` is above zero, then as `api` does.
+    /// `not_found` is above zero, then as `api` does. `reads` records the
+    /// time of every history read.
     struct LateExecution {
         api: FakeApi,
         not_found: Mutex<u32>,
-        reads: Mutex<u32>,
+        reads: Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl LateExecution {
+        /// A fake whose first `not_found` history reads fail, and whose
+        /// later reads return a started callback `approval`.
+        fn new(not_found: u32) -> Arc<Self> {
+            Arc::new(Self {
+                api: FakeApi::new()
+                    .with_history_pages(Vec::new())
+                    .repeat_history(Ok(callback_started_history())),
+                not_found: Mutex::new(not_found),
+                reads: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// The milliseconds after `start` of every history read.
+        fn read_ms(&self, start: tokio::time::Instant) -> Vec<u128> {
+            self.reads
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|at| (*at - start).as_millis())
+                .collect()
+        }
+    }
+
+    /// Asserts `err` is the `Aws` error of [`history_not_found`].
+    fn assert_history_not_found(err: &TestRunnerError) {
+        use aws_sdk_lambda::operation::get_durable_execution_history::GetDurableExecutionHistoryError;
+        assert!(matches!(err, TestRunnerError::Aws(_)), "{err:?}");
+        let source = std::error::Error::source(err).expect("a source");
+        let sdk = source
+            .downcast_ref::<aws_sdk_lambda::error::SdkError<
+                GetDurableExecutionHistoryError,
+                aws_sdk_lambda::config::http::HttpResponse,
+            >>()
+            .expect("the GetDurableExecutionHistory SDK error");
+        assert!(
+            matches!(
+                sdk.as_service_error(),
+                Some(GetDurableExecutionHistoryError::ResourceNotFoundException(
+                    _
+                ))
+            ),
+            "{sdk:?}"
+        );
     }
     impl CloudApi for LateExecution {
         async fn send_invoke(&self, request: InvokeRequest) -> Result<InvokeOutput, BoxError> {
@@ -19802,7 +20019,10 @@ mod tests {
             execution_arn: &str,
             marker: Option<&str>,
         ) -> Result<GetHistoryOutput, BoxError> {
-            *self.reads.lock().expect("lock") += 1;
+            self.reads
+                .lock()
+                .expect("lock")
+                .push(tokio::time::Instant::now());
             {
                 let mut not_found = self.not_found.lock().expect("lock");
                 if *not_found > 0 {
@@ -19829,19 +20049,13 @@ mod tests {
         }
     }
 
-    /// An execution that an `Event` invoke just started can be missing from
-    /// the service for a moment: until a history read succeeded,
-    /// `wait_for_data` reads a `ResourceNotFoundException` as no history
-    /// yet and polls again.
+    /// A `ResourceNotFoundException` fails a history attempt as any error
+    /// does, before and after the first successful read: a waiter retries it
+    /// twice, and the third one is the waiter's and the run's error.
     #[tokio::test(start_paused = true)]
-    async fn cloud_history_not_found_before_the_first_read_polls_again() {
-        let api = Arc::new(LateExecution {
-            api: FakeApi::new()
-                .with_history_pages(Vec::new())
-                .repeat_history(Ok(callback_started_history())),
-            not_found: Mutex::new(2),
-            reads: Mutex::new(0),
-        });
+    async fn cloud_wait_for_data_retries_a_not_found() {
+        let start = tokio::time::Instant::now();
+        let api = LateExecution::new(2);
         let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
         let approval = run.operation("approval");
         let op = approval
@@ -19849,27 +20063,69 @@ mod tests {
             .await
             .expect("the callback started");
         assert_eq!(op.kind(), OperationKind::Callback);
-        assert_eq!(*api.reads.lock().expect("lock"), 3);
-        // After a read succeeded, the execution exists, so a later
-        // `ResourceNotFoundException` is the run's terminal `Aws` error.
-        *api.not_found.lock().expect("lock") = 1;
+        assert_eq!(api.read_ms(start), [1000, 2000, 3450]);
+        *api.not_found.lock().expect("lock") = 3;
         let err = approval
             .wait_for_data(WaitingStatus::Completed)
             .await
-            .expect_err("a later not-found is an AWS error");
-        assert!(matches!(err, TestRunnerError::Aws(_)), "{err:?}");
+            .expect_err("the third not-found is an AWS error");
+        assert_history_not_found(&err);
+        assert_eq!(
+            api.read_ms(start),
+            [1000, 2000, 3450, 4450, 5450, 6900],
+            "six requests in all"
+        );
         let end = run.await.expect_err("the run gets the terminal error");
         assert_eq!(end.to_string(), err.to_string());
+    }
+
+    /// Three `ResourceNotFoundException` answers before the first read are
+    /// the waiter's error, and the waiter reads no fourth answer.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_wait_for_data_not_found_three_times_is_aws() {
+        let start = tokio::time::Instant::now();
+        let api = LateExecution::new(3);
+        let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
+        let err = run
+            .operation("approval")
+            .wait_for_data(WaitingStatus::Started)
+            .await
+            .expect_err("the third not-found is an AWS error");
+        assert_history_not_found(&err);
+        assert_eq!(api.read_ms(start), [1000, 2000, 3450]);
+        drop(run);
+    }
+
+    /// A waiter whose every history attempt fails returns the third error,
+    /// and so does the run, while the driver keeps its own pace.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_wait_for_data_history_error_is_aws() {
+        let start = tokio::time::Instant::now();
+        let api = Arc::new(FakeApi::new().with_history_pages(vec![
+            Err(fake_error("fake history 1")),
+            Err(fake_error("fake history 2")),
+            Err(fake_error("fake history 3")),
+        ]));
+        let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
+        let approval = run.operation("approval");
+        let (result, waited) = tokio::join!(run, approval.wait_for_data(WaitingStatus::Started));
+        let waited = waited.expect_err("the waiter fails");
+        assert_aws(&waited, "fake history 3");
+        let result = result.expect_err("the run fails");
+        assert_aws(&result, "fake history 3");
+        assert_eq!(api.execution_ms(start), [1000, 2000, 3000]);
+        assert_eq!(api.history_ms(start), unmarked(&[1000, 2000, 3450]));
     }
 
     /// A fake whose callback calls fail with `fake success`, `fake failure`
     /// and `fake heartbeat`. With a barrier, each callback call waits at it
     /// before it fails, so two calls fail together. The counter counts the
-    /// callback calls.
+    /// callback calls, and the inner fake records each one in its `calls`.
     struct FailingCallbacks(FakeApi, Option<Arc<tokio::sync::Barrier>>, AtomicU32);
 
     impl FailingCallbacks {
-        async fn meet(&self) {
+        async fn meet(&self, call: FakeCall) {
+            self.0.record(call);
             self.2.fetch_add(1, Ordering::SeqCst);
             if let Some(barrier) = &self.1 {
                 barrier.wait().await;
@@ -19908,16 +20164,22 @@ mod tests {
                 .send_get_durable_execution_history(execution_arn, marker)
                 .await
         }
-        async fn send_callback_success(&self, _: &str, _: Vec<u8>) -> Result<(), BoxError> {
-            self.meet().await;
+        async fn send_callback_success(&self, id: &str, result: Vec<u8>) -> Result<(), BoxError> {
+            self.meet(FakeCall::CallbackSuccess(id.to_owned(), result))
+                .await;
             Err(fake_error("fake success"))
         }
-        async fn send_callback_failure(&self, _: &str, _: ErrorObject) -> Result<(), BoxError> {
-            self.meet().await;
+        async fn send_callback_failure(
+            &self,
+            id: &str,
+            error: ErrorObject,
+        ) -> Result<(), BoxError> {
+            self.meet(FakeCall::CallbackFailure(id.to_owned(), error))
+                .await;
             Err(fake_error("fake failure"))
         }
-        async fn send_callback_heartbeat(&self, _: &str) -> Result<(), BoxError> {
-            self.meet().await;
+        async fn send_callback_heartbeat(&self, id: &str) -> Result<(), BoxError> {
+            self.meet(FakeCall::Heartbeat(id.to_owned())).await;
             Err(fake_error("fake heartbeat"))
         }
     }
@@ -19931,6 +20193,7 @@ mod tests {
             (1, "fake failure"),
             (2, "fake heartbeat"),
         ] {
+            let start = tokio::time::Instant::now();
             let api = failing_callbacks(None);
             let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
             let approval = run.operation("approval");
@@ -19945,6 +20208,35 @@ mod tests {
             }
             .expect_err("the callback call fails");
             assert_aws(&err, text);
+            // The control reads the history at once, then makes its one
+            // callback call.
+            assert_eq!(api.0.history_ms(start), unmarked(&[0]));
+            let calls = api.0.calls();
+            assert!(
+                matches!(
+                    (case, calls.as_slice()),
+                    (
+                        0,
+                        [
+                            FakeCall::Invoke,
+                            FakeCall::History,
+                            FakeCall::CallbackSuccess(..)
+                        ]
+                    ) | (
+                        1,
+                        [
+                            FakeCall::Invoke,
+                            FakeCall::History,
+                            FakeCall::CallbackFailure(..)
+                        ]
+                    ) | (
+                        2,
+                        [FakeCall::Invoke, FakeCall::History, FakeCall::Heartbeat(_)]
+                    )
+                ),
+                "{calls:?}"
+            );
+            assert_eq!(api.2.load(Ordering::SeqCst), 1, "one callback call");
             let later = approval
                 .wait_for_data(WaitingStatus::Started)
                 .await

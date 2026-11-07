@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use super::{
     BackendState, CallbackFailure, CallbackReply, CallbackReplyKind, CloudApi, CloudRunner,
     InvocationType, TestOperation, TestResult, TestRunnerError, aws_error, check_heartbeat,
-    fetch_history, fold_history, is_history_not_found, is_terminal_status, reply_live, snapshot_of,
+    fetch_history, fold_history, is_terminal_status, reply_live, snapshot_of,
     terminal_execution_event,
 };
 use crate::{OperationKind, OperationStatus};
@@ -1119,7 +1119,9 @@ impl OperationHandle {
     /// It returns at once when the status is already reached. Under
     /// [`LocalRunner`] it checks again after every checkpoint, invocation
     /// end, callback reply and clock advance. Under [`CloudRunner`] it reads
-    /// the whole history every `poll_interval`.
+    /// the whole history one `poll_interval` after the run knows the
+    /// execution ARN, then one `poll_interval` after each read that does not
+    /// reach `status`.
     ///
     /// # Errors
     ///
@@ -1368,20 +1370,6 @@ impl<A> CloudShared<A> {
         Err(winner)
     }
 
-    /// Whether `fetched` is a `ResourceNotFoundException` before any history
-    /// read of the run succeeded, in a run with no terminal runner error:
-    /// the service does not show the execution an `Event` invoke just
-    /// started yet, so `wait_for_data` polls again instead of failing.
-    pub(super) fn history_not_yet_visible(
-        &self,
-        fetched: &Result<Vec<Event>, TestRunnerError>,
-    ) -> bool {
-        let state = self.live.lock();
-        state.failure.is_none()
-            && state.cloud.fold.is_none()
-            && fetched.as_ref().is_err_and(is_history_not_found)
-    }
-
     /// Starts a Lambda call that needs no budget, as one transition: the
     /// terminal runner error, else a new ticket.
     pub(super) fn begin_request(&self) -> Result<u64, TestRunnerError> {
@@ -1442,7 +1430,7 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
         execution_arn: &str,
     ) -> Result<(Vec<Event>, Vec<TestOperation>), TestRunnerError> {
         let request = self.begin_request()?;
-        let fetched = fetch_history(api, execution_arn).await;
+        let fetched = fetch_history(api, execution_arn, self.poll_interval).await;
         self.finish_history(None, request, fetched)
     }
 
@@ -1455,9 +1443,12 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
         let (api, execution_arn) = self.until_target(registration).await?;
         match self.begin_history(false, true)? {
             HistoryStart::Read(request) => {
-                let fetched =
-                    await_in_flight(registration, request, fetch_history(&*api, &execution_arn))
-                        .await?;
+                let fetched = await_in_flight(
+                    registration,
+                    request,
+                    fetch_history(&*api, &execution_arn, self.poll_interval),
+                )
+                .await?;
                 let (_, ops) = self.finish_history(Some(registration.id), request, fetched)?;
                 Ok((api, ops))
             }
@@ -1489,6 +1480,9 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
         let registration = Registration::new(core, ControlKind::Cloud);
         let (api, execution_arn) = self.until_target(&registration).await?;
         loop {
+            // As the JS history poller, each read starts one poll interval
+            // after the ARN is known or after the previous read.
+            Self::drive_for(&registration, self.poll_interval).await;
             let request = match self.begin_history(true, true)? {
                 HistoryStart::Read(request) => request,
                 HistoryStart::Done(fold) => {
@@ -1496,19 +1490,19 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
                         .ok_or(TestRunnerError::OperationNotReached(status));
                 }
             };
-            let fetched =
-                await_in_flight(&registration, request, fetch_history(&*api, &execution_arn))
-                    .await?;
-            if !self.history_not_yet_visible(&fetched) {
-                let (events, ops) = self.finish_history(Some(registration.id), request, fetched)?;
-                if let Some(op) = reached_operation(selector, status, &ops) {
-                    return Ok(op);
-                }
-                if terminal_execution_event(&events).is_some() {
-                    return Err(TestRunnerError::OperationNotReached(status));
-                }
+            let fetched = await_in_flight(
+                &registration,
+                request,
+                fetch_history(&*api, &execution_arn, self.poll_interval),
+            )
+            .await?;
+            let (events, ops) = self.finish_history(Some(registration.id), request, fetched)?;
+            if let Some(op) = reached_operation(selector, status, &ops) {
+                return Ok(op);
             }
-            Self::drive_for(&registration, self.poll_interval).await;
+            if terminal_execution_event(&events).is_some() {
+                return Err(TestRunnerError::OperationNotReached(status));
+            }
         }
     }
 
