@@ -131,7 +131,7 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### `wait_for_callback` failure records
 
 - **JavaScript:** The outer record carries the error class name: `CallbackExternalError`, `CallbackSubmitterError` or `CallbackTimeoutError`.
-- **Rust:** The outer record carries one of `Callback.ExternalFailure`, `Callback.SubmitterFailed`, `Callback.Timeout`, `Callback.Heartbeat` and `Callback.Internal`; an external failure keeps the external message and error data and drops the external type, as in JavaScript. A timeout keeps the callback record's message and error data, with `Callback timed out` when the message is absent or empty, as in JavaScript. A payload that does not decode returns `CallbackErrorKind::DeserializationFailed` after the outer record succeeded with the raw payload.
+- **Rust:** The outer record carries one of `Callback.ExternalFailure`, `Callback.SubmitterFailed`, `Callback.Timeout`, `Callback.Heartbeat` and `Callback.Internal`. An external failure keeps the external message and error data, with `Callback failed` when the message is absent or empty, and drops the external type, as in JavaScript. A timeout keeps the callback record's message and error data, with `Callback timed out` when the message is absent or empty, as in JavaScript. A payload that does not decode returns `CallbackErrorKind::DeserializationFailed` after the outer record succeeded with the raw payload.
 - **Why:** A fixed type set is a closed protocol the SDK owns; each type maps to one error kind, live and on replay.
 - **Decision:** Decision (2026-10-28): record one of a fixed set of `Callback.*` types.
 - **Where:** `src/callback.rs`, `extract_wire_error`.
@@ -142,7 +142,7 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Rust:** A `TIMED_OUT` record whose error type is `Callback.Heartbeat` becomes `CallbackErrorKind::HeartbeatTimedOut`; every other `TIMED_OUT` becomes `TimedOut`.
 - **Why:** A handler can tell a missed heartbeat from an overall timeout.
 - **Decision:** Decision (2026-10-28): report a heartbeat timeout as its own kind.
-- **Where:** `src/callback.rs`, `timed_out_callback_error` and `classify_callback_error`.
+- **Where:** `src/callback.rs`, `timed_out_callback_error`.
 
 ### Serdes failure message
 
@@ -631,6 +631,22 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Why:** `CANCELLED` is terminal, and JavaScript's replay misses it, so a plugin opens a span it never closes.
 - **Decision:** JavaScript defect.
 - **Where:** `src/invoke.rs`, `recorded_outcome`.
+
+### Replayed CANCELLED or STOPPED callback
+
+- **JavaScript:** A callback whose record is already `CANCELLED` or `STOPPED` when it is created fires `onOperationStart` with `isReplay` true. It fires `onOperationEnd` with `isReplay` false only when its result is awaited.
+- **Rust:** Fires no start hook. It fires `on_operation_end` when the callback is created. `is_replay` is false only in the first invocation after the service changed the record, as JavaScript does for a `FAILED` record.
+- **Why:** Both statuses are terminal. In JavaScript, a handler that never awaits the result leaves the start hook without an end hook. Each later invocation that awaits the result also reports the same end as live.
+- **Decision:** JavaScript defect.
+- **Where:** `src/callback.rs`, `is_terminal_callback_status`.
+
+### Callback end hook error
+
+- **JavaScript:** A callback whose record is already `FAILED` or `TIMED_OUT` when it is created ends with the stored error rebuilt by `fromErrorObject`. An unknown type, such as `Declined` or `Callback.Timeout`, becomes `StepError`. An absent or empty message then becomes `Unknown error`. A record with no error field ends with no error. A callback that fails while its result is awaited ends with the error the result throws when its record carries an error field, and with no error otherwise.
+- **Rust:** `on_operation_end` of a failed callback carries the `wire()` of the error that `result()` returns, at creation and while the result waits. A record with no error field ends with no error.
+- **Why:** JavaScript can report an error class and message that differ from the error the callback result throws.
+- **Decision:** JavaScript defect.
+- **Where:** `src/callback.rs`, `callback_info`.
 
 ### Attempt-end timestamps
 

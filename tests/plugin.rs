@@ -2149,6 +2149,12 @@ struct CbRec {
 #[derive(Clone, Default)]
 struct Callbacks {
     recs: Arc<Mutex<Vec<CbRec>>>,
+    /// One record per operation that an `on_operation_change` call lists,
+    /// with the hook `change`.
+    changes: Arc<Mutex<Vec<CbRec>>>,
+    /// One record per `on_user_function_end` call, with the hook
+    /// `user_function_end` and the outcome's error.
+    user_function_ends: Arc<Mutex<Vec<CbRec>>>,
     count: Arc<AtomicUsize>,
 }
 
@@ -2187,13 +2193,21 @@ struct CallbacksPlugin {
 
 impl CallbacksPlugin {
     fn push(&self, hook: &'static str, info: &OperationInfo) {
+        if let Some(rec) = self.rec(hook, info) {
+            self.callbacks.recs.lock().unwrap().push(rec);
+        }
+    }
+
+    /// The record of `info` for `hook`, or `None` for an operation of
+    /// another kind.
+    fn rec(&self, hook: &'static str, info: &OperationInfo) -> Option<CbRec> {
         if !matches!(
             info.kind(),
             Some(OperationKind::Callback | OperationKind::Context | OperationKind::Step)
         ) {
-            return;
+            return None;
         }
-        let rec = CbRec {
+        Some(CbRec {
             shape: (
                 self.inv,
                 hook,
@@ -2209,8 +2223,7 @@ impl CallbacksPlugin {
                 .and_then(WireError::error_type)
                 .map(str::to_owned),
             error: info.error().cloned(),
-        };
-        self.callbacks.recs.lock().unwrap().push(rec);
+        })
     }
 }
 
@@ -2232,6 +2245,27 @@ impl Plugin for CallbacksPlugin {
 
     fn on_attempt_end(&self, info: &AttemptEndInfo) -> HookWork {
         self.push("attempt_end", info.operation());
+        Ok(None)
+    }
+
+    fn on_operation_change(&self, info: &durable::plugin::OperationChangeInfo) -> HookWork {
+        let recs = info
+            .updated_operations()
+            .iter()
+            .filter_map(|op| self.rec("change", op));
+        self.callbacks.changes.lock().unwrap().extend(recs);
+        Ok(None)
+    }
+
+    fn on_user_function_end(
+        &self,
+        info: &OperationInfo,
+        outcome: Result<(), &WireError>,
+    ) -> HookWork {
+        if let Some(mut rec) = self.rec("user_function_end", info) {
+            rec.error = outcome.err().cloned();
+            self.callbacks.user_function_ends.lock().unwrap().push(rec);
+        }
         Ok(None)
     }
 }
@@ -2509,41 +2543,174 @@ async fn wait_for_callback_hooks() {
     assert_eq!(end.sub_type.as_deref(), Some("WaitForCallback"));
 }
 
+/// `(type, message, data)` of a wire error.
+type WireFields = (Option<String>, Option<String>, Option<String>);
+
+/// The `(type, message, data)` of `wire`.
+fn wire_fields(wire: &WireError) -> WireFields {
+    (
+        wire.error_type().map(str::to_owned),
+        wire.error_message().map(str::to_owned),
+        wire.error_data().map(str::to_owned),
+    )
+}
+
+/// Runs a `wait_for_callback` named `approve` joined with step `s`, which
+/// sleeps 200 ms, and answers its callback with `failure` while `s`
+/// sleeps. The handler records the wire of every error the
+/// `wait_for_callback` returns, then a 1 s wait forces another
+/// invocation, which replays the failure.
+async fn run_failed_wait_for_callback(
+    callbacks: &Callbacks,
+    failure: durable::test_util::CallbackFailure,
+) -> (
+    durable::test_util::TestResult<String>,
+    Vec<Option<WireError>>,
+) {
+    let seen: Arc<Mutex<Vec<Option<WireError>>>> = Arc::default();
+    let handler_seen = Arc::clone(&seen);
+    let run = callbacks.runner().run(
+        move |_e: (), ctx: DurableContext| {
+            let seen = Arc::clone(&handler_seen);
+            async move {
+                let wfcb = ctx
+                    .wait_for_callback::<String>(|_step, _id| async { Ok(()) })
+                    .name("approve")
+                    .future();
+                let step = ctx
+                    .step(|_| async {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        Ok(1_u32)
+                    })
+                    .name("s")
+                    .future();
+                let (result, step) = tokio::join!(wfcb, step);
+                step?;
+                let err = result.expect_err("the callback failed");
+                seen.lock().unwrap().push(err.wire().cloned());
+                ctx.wait(Duration::from_secs(1)).await?;
+                Ok::<_, BoxError>("failed".to_owned())
+            }
+        },
+        (),
+    );
+    let approve = run.operation("approve");
+    approve
+        .wait_for_data(durable::test_util::WaitingStatus::Submitted)
+        .await
+        .expect("the submitter finished");
+    approve
+        .send_callback(durable::test_util::CallbackReply::failure(failure))
+        .await
+        .expect("sent");
+    let result = run.await.expect("runner");
+    let seen = seen.lock().unwrap().clone();
+    (result, seen)
+}
+
+/// A callback that fails while its `wait_for_callback` waits is listed by
+/// `on_operation_change` with `is_replay` `false` and its stored error
+/// fields. The callback's end hook is live and carries the normalized
+/// error, or none for a failure with no error field. The outer end hook and
+/// `on_user_function_end` carry the same `Callback.ExternalFailure` wire
+/// with `Callback failed`. A later invocation replays that wire and fires
+/// neither end hook.
 #[tokio::test]
 async fn wait_for_callback_failure_hooks() {
-    let callbacks = Callbacks::default();
-    let result = run_wait_for_callback(
-        &callbacks,
-        Some("approve"),
-        durable::test_util::CallbackReply::failure(durable::test_util::CallbackFailure::new(
-            "Declined", "no",
-        )),
-    )
-    .await;
-    assert!(result.is_failure());
-    let ends: Vec<_> = callbacks
-        .recs()
-        .into_iter()
-        .filter(|r| r.shape.0 == 2 && r.shape.1 == "end")
-        .map(|r| (r.shape.3, r.shape.5, r.error_type))
-        .collect();
-    assert_eq!(
-        ends,
-        [
-            (
-                Some("approve-callback".to_owned()),
-                FAILED,
-                Some("Declined".to_owned())
-            ),
-            // The outer record carries the fixed external-failure type; the
-            // external caller's type stays on the callback's own record.
-            (
-                Some("approve".to_owned()),
-                FAILED,
-                Some("Callback.ExternalFailure".to_owned())
-            ),
-        ]
-    );
+    let outer = |data: Option<&str>| {
+        (
+            Some("Callback.ExternalFailure".to_owned()),
+            Some("Callback failed".to_owned()),
+            data.map(str::to_owned),
+        )
+    };
+    let declined = |message: &str, data: Option<&str>| {
+        (
+            Some("Declined".to_owned()),
+            Some(message.to_owned()),
+            data.map(str::to_owned),
+        )
+    };
+    let cases = [
+        (
+            durable::test_util::CallbackFailure::default(),
+            None,
+            None,
+            outer(None),
+        ),
+        (
+            durable::test_util::CallbackFailure::new("Declined", "").with_error_data("d"),
+            Some(declined("", Some("d"))),
+            Some(declined("Callback failed", Some("d"))),
+            outer(Some("d")),
+        ),
+    ];
+    for (failure, stored, callback_end, outer_wire) in cases {
+        let callbacks = Callbacks::default();
+        let (result, seen) = run_failed_wait_for_callback(&callbacks, failure).await;
+        assert_eq!(result.output().map(String::as_str), Some("failed"));
+        assert!(result.invocation_count() >= 2, "the wait forces a replay");
+
+        // The change hook reports the stored record. The stored callback
+        // record carries no name, so the callback is found by its kind.
+        let changes: Vec<_> = callbacks
+            .changes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.shape.2 == CALLBACK && r.shape.5 == FAILED)
+            .cloned()
+            .collect();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let change = changes.first().unwrap();
+        assert!(!change.shape.4, "is_replay is false");
+        assert_eq!(change.error.as_ref().map(wire_fields), stored);
+
+        // The end hooks: one live callback end and one live outer end, in
+        // the first invocation only.
+        let ends: Vec<_> = callbacks
+            .recs()
+            .into_iter()
+            .filter(|r| r.shape.1 == "end" && r.shape.2 != STEP)
+            .collect();
+        let shapes: Vec<_> = ends
+            .iter()
+            .map(|r| (r.shape.0, r.shape.3.clone(), r.shape.4, r.shape.5))
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                (1, Some("approve-callback".to_owned()), false, FAILED),
+                (1, Some("approve".to_owned()), false, FAILED),
+            ]
+        );
+        let callback_rec = ends.first().unwrap();
+        assert_eq!(callback_rec.error.as_ref().map(wire_fields), callback_end);
+        let outer_rec = ends.get(1).unwrap();
+        assert_eq!(
+            outer_rec.error.as_ref().map(wire_fields),
+            Some(outer_wire.clone())
+        );
+
+        // `on_user_function_end` of the body receives the same wire.
+        let user_ends: Vec<_> = callbacks
+            .user_function_ends
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.shape.3.as_deref() == Some("approve"))
+            .cloned()
+            .collect();
+        assert_eq!(user_ends.len(), 1, "{user_ends:?}");
+        assert_eq!(user_ends.first().unwrap().error, outer_rec.error);
+
+        // Live and replayed errors carry that wire.
+        assert!(seen.len() >= 2, "{seen:?}");
+        for wire in &seen {
+            assert_eq!(wire.as_ref().map(wire_fields), Some(outer_wire.clone()));
+        }
+        assert!(seen.iter().all(|wire| *wire == outer_rec.error));
+    }
 }
 
 #[tokio::test]

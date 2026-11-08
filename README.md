@@ -774,6 +774,7 @@ A submitter that fails after its retry strategy stops surfaces as
 external failure with the type `Callback.ExternalFailure` and keeps the
 external message and error data, while `create_callback` keeps the
 external caller's type.
+In both builders, an absent or empty external message becomes `Callback failed`.
 Both `create_callback` and `wait_for_callback` keep a timed-out callback
 record's message and error data; an absent or empty message becomes
 `Callback timed out`, and `wait_for_callback` records the type
@@ -1857,7 +1858,7 @@ value in parentheses is the info's `is_replay`.
 | `wait_for_condition` | as `step` | as `step` | complete: attempt end, end. Continue: attempt end (`Succeeded`) only. Failure: attempt end, end | nothing |
 | `wait` | start (`false`) | start (`true`) | end (`false`), when it succeeds while it waits in the invocation | `SUCCEEDED`: end, `is_replay` = not listed in `updated_operations`; any other status: nothing |
 | `invoke` | start (`false`) | start (`true`) | end (`false`), when it reaches `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED` while it waits in the invocation | `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED`: end, `is_replay` = not listed in `updated_operations`; unknown status: nothing |
-| `create_callback` | start (`false`) | start (`true`) | end (`false`), when `result()` reads `SUCCEEDED`, `FAILED` or `TIMED_OUT` after waiting in the invocation | `SUCCEEDED`, `FAILED` or `TIMED_OUT`: end, `is_replay` = not listed in `updated_operations` |
+| `create_callback` | start (`false`) | start (`true`) | end (`false`), when `result()` reads `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED` after waiting in the invocation | `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED`: end, `is_replay` = not listed in `updated_operations` |
 | `run_in_child_context`, `with_retry` with its own record, each `attempt-N` of a `with_retry` in either mode, `map`, `parallel`, `parallel_mixed`, each map item, parallel branch and `parallel_mixed` branch, `wait_for_callback`, the combinators | start (`false`) before the body | start (`true`) before the body | end (`false`) after the terminal write | nothing, including a `ReplayChildren` reconstruction |
 | `run_in_child_context` with `virtual_context()`, and a virtual `with_retry` block | start (`is_replay` = the invocation's replay state) before the body, in every invocation | never, because a record at its ID fails replay | end (`is_replay` = the invocation's replay state) after the body returns, with no checkpoint write | never |
 

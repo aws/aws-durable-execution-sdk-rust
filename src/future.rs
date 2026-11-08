@@ -1039,14 +1039,14 @@ impl<O: Send + 'static> Callback<O> {
         }
     }
 
-    /// The future of a pending callback's result: it waits until the record
-    /// is terminal, then builds the outcome from it, as the create-time
-    /// replay does.
+    /// The future of a pending callback's result. It waits until the record
+    /// is terminal, then builds the outcome from it as creation-time replay
+    /// does.
     ///
-    /// The callback was created in this invocation, so a `SUCCEEDED`,
-    /// `FAILED` or `TIMED_OUT` record it reads changed in this invocation.
-    /// So it fires `on_operation_end` with `is_replay` `false` before the
-    /// outcome is built, as JS does after its status wait.
+    /// The record becomes terminal while this future waits in the
+    /// invocation. A `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or
+    /// `CANCELLED` record therefore fires `on_operation_end` with
+    /// `is_replay` false before the outcome is built.
     fn pending_result(
         ctx: DurableContext,
         wire_id: String,

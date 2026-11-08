@@ -1315,16 +1315,16 @@ impl fmt::Display for InvokeErrorKind {
 /// Error from a callback operation.
 ///
 /// Follows the graded external/internal split: external errors are
-/// caused by the caller's system (timeout, invalid data), internal
-/// errors are SDK/service failures. For an
+/// caused by the caller's system (timeout, invalid data), and internal
+/// errors are SDK or service failures. For an
 /// [`ExternalFailure`](CallbackErrorKind::ExternalFailure), the wire
 /// record is reachable through the error's
 /// [`source()`](std::error::Error::source) (a [`ReplayedFailure`]) and
-/// through [`OperationError::wire`]. From `create_callback`, that record
-/// holds every field the external caller supplied, its type included.
-/// From `wait_for_callback`, the record has the type
-/// `Callback.ExternalFailure` in place of the caller's type, and keeps the
-/// caller's message and error data.
+/// through [`OperationError::wire`]. From `create_callback`, it keeps
+/// the callback record's error type, error data and stack trace. From
+/// `wait_for_callback`, it has the type `Callback.ExternalFailure` and
+/// keeps the callback record's error data. Both keep a nonempty message
+/// and otherwise use `Callback failed`.
 ///
 /// # Examples
 ///
@@ -1419,17 +1419,19 @@ pub enum CallbackErrorKind {
     /// type `Callback.Heartbeat`.
     #[non_exhaustive]
     HeartbeatTimedOut,
-    /// The callback was completed with an external failure, or it ended
-    /// `CANCELLED` or `STOPPED`.
+    /// The callback record is `FAILED`, `CANCELLED` or `STOPPED`, whatever
+    /// its error type: an external system failed the callback, or the
+    /// service cancelled or stopped it.
     ///
-    /// The failure fields travel as wire data: read them from the error's
+    /// The failure fields travel as wire data. Read them from the error's
     /// [`source()`](std::error::Error::source) (a [`ReplayedFailure`]) or
     /// from [`OperationError::wire`]. From `create_callback`, the wire
-    /// record is the external caller's own record. From
-    /// `wait_for_callback`, the wire record has the type
-    /// `Callback.ExternalFailure` and keeps the external message and error
-    /// data; the external caller's type is on the callback operation's own
-    /// record in the history.
+    /// record keeps the callback record's error type, error data and stack
+    /// trace. It keeps a nonempty message and otherwise uses
+    /// `Callback failed`. From `wait_for_callback`, the wire record has the
+    /// type `Callback.ExternalFailure`. It keeps the callback record's error
+    /// data and the same normalized message. The callback operation's
+    /// stored record keeps the external type and original message field.
     #[non_exhaustive]
     ExternalFailure,
     /// The callback payload could not be deserialized.

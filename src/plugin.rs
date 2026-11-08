@@ -308,16 +308,17 @@ pub trait Plugin: Send + Sync {
     ///   or `READY` invoke, or a `STARTED` or `PENDING` callback;
     /// - a `SUCCEEDED` wait, an invoke with status `SUCCEEDED`, `FAILED`,
     ///   `TIMED_OUT`, `STOPPED` or `CANCELLED`, or a callback with status
-    ///   `SUCCEEDED`, `FAILED` or `TIMED_OUT`, fires `on_operation_end` on
-    ///   every replay. `is_replay` is `false` only in the first invocation
+    ///   `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED`, fires
+    ///   `on_operation_end` on every replay. `is_replay` is `false` only in the first invocation
     ///   after the service completed it, the one whose
     ///   [`InvocationInfo::updated_operations`] lists it. A replayed
     ///   callback fires it when it is created, before `result()` is
     ///   awaited;
     /// - a wait that becomes `SUCCEEDED`, an invoke that becomes one of
     ///   its terminal statuses, or a callback that becomes `SUCCEEDED`,
-    ///   `FAILED` or `TIMED_OUT` while its `result()` waits in the
-    ///   invocation, fires `on_operation_end` with `is_replay` `false`. A
+    ///   `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED` while its
+    ///   `result()` waits in the invocation, fires `on_operation_end` with
+    ///   `is_replay` `false`. A
     ///   callback fires it before `result()` returns;
     /// - a wait or a callback with any other status, and a callback record
     ///   without a callback ID, fire no hook.
@@ -463,16 +464,17 @@ pub trait Plugin: Send + Sync {
     ///   or `READY` invoke, or a `STARTED` or `PENDING` callback;
     /// - a `SUCCEEDED` wait, an invoke with status `SUCCEEDED`, `FAILED`,
     ///   `TIMED_OUT`, `STOPPED` or `CANCELLED`, or a callback with status
-    ///   `SUCCEEDED`, `FAILED` or `TIMED_OUT`, fires `on_operation_end` on
-    ///   every replay. `is_replay` is `false` only in the first invocation
+    ///   `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED`, fires
+    ///   `on_operation_end` on every replay. `is_replay` is `false` only in the first invocation
     ///   after the service completed it, the one whose
     ///   [`InvocationInfo::updated_operations`] lists it. A replayed
     ///   callback fires it when it is created, before `result()` is
     ///   awaited;
     /// - a wait that becomes `SUCCEEDED`, an invoke that becomes one of
     ///   its terminal statuses, or a callback that becomes `SUCCEEDED`,
-    ///   `FAILED` or `TIMED_OUT` while its `result()` waits in the
-    ///   invocation, fires `on_operation_end` with `is_replay` `false`. A
+    ///   `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED` while its
+    ///   `result()` waits in the invocation, fires `on_operation_end` with
+    ///   `is_replay` `false`. A
     ///   callback fires it before `result()` returns;
     /// - a wait or a callback with any other status, and a callback record
     ///   without a callback ID, fire no hook.
@@ -1732,8 +1734,15 @@ impl OperationInfo {
         self.result.as_deref()
     }
 
-    /// The recorded error, or `None` when the record carries no error
-    /// field. Use [`status`](Self::status) to detect a failure.
+    /// The error reported for the operation, or `None` when it reports no
+    /// error. Operation maps and `on_operation_change` report the stored
+    /// error. In `on_operation_end` for a failed callback whose record
+    /// carries at least one error field, this is the
+    /// [`OperationError::wire`](crate::OperationError::wire) of the error
+    /// that the callback result returns. An absent or empty message becomes
+    /// `Callback failed`, or `Callback timed out` for a `TIMED_OUT` record.
+    /// A callback record with no error field still reports `None`. Use
+    /// [`status`](Self::status) to detect a failure.
     pub fn error(&self) -> Option<&WireError> {
         self.error.as_ref()
     }
@@ -3867,6 +3876,8 @@ pub(crate) mod test_support {
         pub(crate) result: Option<String>,
         /// For an attempt-end hook, its error message.
         pub(crate) error: Option<String>,
+        /// The operation info's complete `error()`.
+        pub(crate) info_error: Option<crate::WireError>,
         /// What the probe returned when the hook ran.
         pub(crate) probe: String,
     }
@@ -3938,6 +3949,7 @@ pub(crate) mod test_support {
                     .and_then(super::AttemptEndInfo::error)
                     .and_then(crate::WireError::error_message)
                     .map(str::to_owned),
+                info_error: info.error().cloned(),
                 probe,
             });
         }

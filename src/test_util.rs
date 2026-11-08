@@ -8128,6 +8128,47 @@ mod tests {
         );
     }
 
+    /// An external failure with no message, or an empty one, gives the
+    /// outer `Callback.ExternalFailure` record the message
+    /// `Callback failed`, live and on replay, and leaves the callback's
+    /// own record unchanged.
+    #[tokio::test]
+    async fn wfcb_external_failure_without_message_same_kind_live_and_replay() {
+        let cases = [
+            (CallbackFailure::default(), None, None, None),
+            (
+                CallbackFailure::new("Declined", "").with_error_data("d"),
+                Some("Declined"),
+                Some(""),
+                Some("d"),
+            ),
+        ];
+        for (failure, stored_type, stored_message, data) in cases {
+            let runner = LocalRunner::new().callback(CallbackReply::failure(failure));
+            let run =
+                run_wfcb_classification(runner, Submitter::Succeeds, "ExternalFailure", "external")
+                    .await;
+            assert!(run.result.is_success(), "{:?}", run.result.error_message());
+            let entry = (
+                "ExternalFailure".to_owned(),
+                Some("Callback.ExternalFailure".to_owned()),
+                Some("Callback failed".to_owned()),
+                data.map(ToOwned::to_owned),
+            );
+            assert_eq!(run.seen, [entry.clone(), entry]);
+            let stored = callback_record(&run.result);
+            assert_eq!(stored.error_type(), stored_type);
+            assert_eq!(stored.error_message(), stored_message);
+            assert_eq!(stored.error().and_then(crate::WireError::error_data), data);
+            let outer = run
+                .result
+                .operation("approve")
+                .expect("the wait_for_callback is recorded");
+            assert_eq!(outer.error_type(), Some("Callback.ExternalFailure"));
+            assert_eq!(outer.error_message(), Some("Callback failed"));
+        }
+    }
+
     #[tokio::test]
     async fn wfcb_submitter_failure_same_kind_live_and_replay() {
         // The recorded message omits a `TypedError`'s name; the live
@@ -8658,6 +8699,7 @@ mod tests {
             .expect("runner");
 
         assert!(result.is_failure(), "{:?}", result.error_message());
+        assert_eq!(result.error_message(), Some("Callback failed"));
         let cb_op = callback_record(&result);
         assert_eq!(cb_op.status(), OperationStatus::Failed);
         assert_eq!(cb_op.error_type(), None);
