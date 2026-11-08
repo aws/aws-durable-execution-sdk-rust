@@ -23,6 +23,11 @@ keywords = ["aws", "lambda", "durable-execution", "workflow"]
 [lib]
 name = "aws_durable_execution_sdk"
 
+# docs.rs documents every feature, so the `test_util` module (feature
+# `test-util`) appears there too.
+[package.metadata.docs.rs]
+all-features = true
+
 # Types from other crates that are deliberately part of this crate's public
 # API. `cargo +nightly check-external-types` (wired into ci.yml) fails the
 # build when a foreign type outside this list reaches the public surface,

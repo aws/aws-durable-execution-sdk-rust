@@ -19,7 +19,7 @@ a crate that depends on it can use edition 2018 or later.
 
 ```toml
 [dependencies]
-aws-durable-execution-sdk = { git = "https://github.com/aws/aws-durable-execution-sdk-rust" }
+aws-durable-execution-sdk = "0.2"
 lambda_runtime = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros"] }
