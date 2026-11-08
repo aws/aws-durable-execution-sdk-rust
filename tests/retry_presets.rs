@@ -141,3 +141,61 @@ fn partial_linear_builder_fills_js_linear_values() {
     assert_eq!(capped.max_attempts(), 2);
     assert_eq!(capped.initial_delay(), Duration::from_secs(1));
 }
+
+/// Retries a body error until attempt 3, one second apart, and never
+/// retries an interrupted attempt.
+fn body_error_strategy(err: &durable::StepError, attempt: u32) -> durable::RetryDecision {
+    if matches!(err.kind(), durable::StepErrorKind::Interrupted { .. }) || attempt >= 3 {
+        durable::RetryDecision::Stop
+    } else {
+        durable::RetryDecision::retry(Duration::from_secs(1))
+    }
+}
+
+/// The public constructors build the errors a strategy receives, so a test
+/// calls a strategy directly, and the same strategy then drives a step.
+#[tokio::test]
+async fn public_step_error_constructors_test_a_strategy() {
+    assert_eq!(
+        body_error_strategy(&durable::StepError::execution_failed("throttled"), 1),
+        durable::RetryDecision::retry(Duration::from_secs(1))
+    );
+    assert_eq!(
+        body_error_strategy(&durable::StepError::interrupted(), 1),
+        durable::RetryDecision::Stop
+    );
+
+    let runs = Arc::new(AtomicU32::new(0));
+    let runs_h = Arc::clone(&runs);
+    let result = LocalRunner::new()
+        .run(
+            move |_: serde_json::Value, ctx: DurableContext| {
+                let runs = Arc::clone(&runs_h);
+                async move {
+                    let value = ctx
+                        .step(move |step_ctx| {
+                            let runs = Arc::clone(&runs);
+                            async move {
+                                runs.fetch_add(1, Ordering::SeqCst);
+                                let attempt = step_ctx.attempt();
+                                if attempt >= 3 {
+                                    Ok(attempt * 10)
+                                } else {
+                                    Err::<u32, BoxError>(format!("fail {attempt}").into())
+                                }
+                            }
+                        })
+                        .name("flaky")
+                        .retry_strategy(body_error_strategy)
+                        .await?;
+                    Ok::<_, BoxError>(value)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner completes");
+    assert_eq!(result.status(), ExecutionStatus::Succeeded, "{result}");
+    assert_eq!(result.output(), Some(&30));
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+}

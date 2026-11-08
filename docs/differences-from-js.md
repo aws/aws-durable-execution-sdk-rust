@@ -194,6 +194,14 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Same capability in Rust form.
 - **Where:** `src/context.rs`, `wait_for_condition`; `src/builders/wait_for_condition.rs`, `WaitForConditionBuilder`.
 
+### Closure argument order
+
+- **JavaScript:** A [`waitForCondition` check](https://github.com/aws/aws-durable-execution-sdk-js/blob/67549feacd5568ea305b7c2d533d3549974f8c9c/packages/aws-durable-execution-sdk-js/src/types/wait-condition.ts#L13-L16) receives `(state, context)`, and a [`waitForCallback` submitter](https://github.com/aws/aws-durable-execution-sdk-js/blob/67549feacd5568ea305b7c2d533d3549974f8c9c/packages/aws-durable-execution-sdk-js/src/types/callback.ts#L56-L67) receives `(callbackId, context)`.
+- **Rust:** A `wait_for_condition` check receives `(StepContext, S)`, and a `wait_for_callback` submitter receives `(StepContext, String)`.
+- **Why:** Every Rust SDK closure that receives a context takes it first; step, child and map closures do too.
+- **Decision:** Same capability in Rust form.
+- **Where:** `src/context.rs`, `DurableContext::wait_for_condition` and `DurableContext::wait_for_callback`.
+
 ### `WaitStrategyConfig.timeoutSeconds`
 
 - **JavaScript:** Declared and never read.
@@ -315,6 +323,14 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Why:** Structured per-item errors carry the item index, the operation name and the error value.
 - **Decision:** Decision (2026-08-09, [Rust SDK #15: BatchResult: status should be an enum; errors() loses error identity and item association](https://github.com/aws/aws-durable-execution-sdk-rust/issues/15)): carry the recorded name on every item and item error.
 - **Where:** `src/map_parallel.rs`, `BatchItem`.
+
+### Map function arguments
+
+- **JavaScript:** The [`MapFunc`](https://github.com/aws/aws-durable-execution-sdk-js/blob/67549feacd5568ea305b7c2d533d3549974f8c9c/packages/aws-durable-execution-sdk-js/src/types/batch.ts#L385-L390) receives `(context, item, index, array)`, and `array` is the input array.
+- **Rust:** The closure receives `(DurableContext, I, usize)`. A closure that reads other inputs captures an `Arc<[I]>` of them, as the rustdoc of `DurableContext::map` shows.
+- **Why:** `map` takes its items by value and moves each one into the closure call for that item, so the batch keeps no input array to pass.
+- **Decision:** Same capability in Rust form.
+- **Where:** `src/context.rs`, `DurableContext::map`.
 
 ### Failure percentage arithmetic
 

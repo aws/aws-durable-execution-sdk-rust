@@ -65,7 +65,17 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 Build it with [cargo-lambda](https://www.cargo-lambda.info/), which the
 Lambda Developer Guide documents for
 [packaging Rust functions](https://docs.aws.amazon.com/lambda/latest/dg/rust-package.html).
-Install it with `pip3 install cargo-lambda` or `cargo install cargo-lambda`.
+Install it with one of these commands. Each of them also installs Zig, the
+toolchain cargo-lambda builds with by default, when the system has none.
+
+```sh
+pip3 install cargo-lambda
+brew install cargo-lambda/tap/cargo-lambda
+curl -fsSL https://cargo-lambda.info/install.sh | sh
+```
+
+`cargo install cargo-lambda` installs no Zig. After it, install Zig;
+`cargo lambda system --install-zig` lists the installers for your system.
 
 ```sh
 cargo lambda build --release --x86-64
@@ -1937,6 +1947,7 @@ assert_eq!(result.output(), Some(&42));
 `TestResult` also reports the invocation count and every recorded operation,
 so a test can assert that a step ran once across replays.
 `result.operation("charge")` returns the first operation with that name, and `TestOperation::error()` returns its full error record, including error data.
+`TestOperation::result_json::<T>()` decodes a JSON result, `wait_duration()` returns a wait's recorded duration, and `is_wait_for_callback()` tells the context of a `wait_for_callback` apart from other child contexts.
 `TestOperation::kind()` and `TestOperation::status()` return `OperationKind`
 and `OperationStatus`, so a test checks
 `op.status() == OperationStatus::Succeeded`.

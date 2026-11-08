@@ -42,7 +42,7 @@ use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 
 use crate::context::DurableContext;
-use crate::error::{ChildFnError, OperationError, StepError, StepErrorKind};
+use crate::error::{ChildFnError, OperationError, StepError};
 use crate::future::DurableFuture;
 use crate::serdes::Serdes;
 use crate::{BoxError, RetryDecision, RetryStrategy};
@@ -199,7 +199,7 @@ where
         // Live and replayed failures carry the same recorded failure (the
         // replay path reads the recorded error), so a strategy that
         // inspects the error decides identically across invocations.
-        let step_err = StepError::new(StepErrorKind::ExecutionFailed, Some(Box::new(err)));
+        let step_err = StepError::execution_failed(err);
         match strategy(&step_err, attempt) {
             RetryDecision::Retry { delay } => {
                 // Durable wait between attempts: checkpointed, and the
@@ -225,8 +225,8 @@ where
 
 /// Takes the attempt's error back out of the step error the strategy saw.
 #[expect(clippy::expect_used)]
-// reason: `retry_loop` builds the step error with `Some(Box<OperationError>)`
-// as its source, so both the source and the downcast are always present.
+// reason: `retry_loop` builds the step error with
+// `StepError::execution_failed` of an `OperationError`, which is its source, so both the source and the downcast are always present.
 fn last_error(step_err: StepError) -> OperationError {
     *step_err
         .into_source()
@@ -283,6 +283,63 @@ mod tests {
             OperationErrorKind::ChildContext(child)
                 if matches!(child.kind(), ChildContextErrorKind::Internal)
         ));
+    }
+
+    /// A failed attempt reaches the strategy as
+    /// `StepError::execution_failed` of the attempt's error.
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn failed_with_retry_attempt_gives_strategy_step_error_execution_failed() {
+        type Seen = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+        let seen: Seen = Arc::default();
+        let returned: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let (seen_in, returned_in) = (Arc::clone(&seen), Arc::clone(&returned));
+        crate::test_util::LocalRunner::new()
+            .run(
+                move |(): (), ctx: DurableContext| {
+                    let (seen, returned) = (Arc::clone(&seen_in), Arc::clone(&returned_in));
+                    async move {
+                        let err = ctx
+                            .with_retry(|_child, _attempt| async {
+                                Err::<u32, BoxError>("boom".into())
+                            })
+                            .name("block")
+                            .retry_strategy(move |err, _attempt| {
+                                let source =
+                                    std::error::Error::source(err).map(ToString::to_string);
+                                seen.lock()
+                                    .expect("strategy log lock")
+                                    .push((err.kind().to_string(), source));
+                                RetryDecision::Stop
+                            })
+                            .await
+                            .expect_err("the block fails");
+                        // The block's child failure has the last attempt's
+                        // error as its source.
+                        *returned.lock().expect("returned lock") = std::error::Error::source(&err)
+                            .and_then(std::error::Error::source)
+                            .map(ToString::to_string);
+                        Ok::<(), BoxError>(())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("the run finishes");
+
+        let attempt_error = returned.lock().expect("returned lock").clone();
+        assert!(
+            attempt_error.is_some(),
+            "the block returned its attempt's error"
+        );
+        let expected = StepError::execution_failed(attempt_error.clone().unwrap_or_default());
+        assert_eq!(
+            *seen.lock().expect("strategy log lock"),
+            [(
+                expected.kind().to_string(),
+                std::error::Error::source(&expected).map(ToString::to_string),
+            )]
+        );
     }
 
     /// Only an unwrapped or virtual block with a non-empty name prefixes its

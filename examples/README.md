@@ -30,8 +30,15 @@ build host's glibc, and a binary built on a host newer than the
 `provided.al2023` runtime (glibc 2.34) fails to start there at all.
 
 ```sh
-pip3 install cargo-lambda     # or: cargo install cargo-lambda
+pip3 install cargo-lambda
+# or: brew install cargo-lambda/tap/cargo-lambda
+# or: curl -fsSL https://cargo-lambda.info/install.sh | sh
 ```
+
+Each of these also installs Zig, the toolchain cargo-lambda builds with by
+default, when the system has none. `cargo install cargo-lambda` installs no
+Zig; after it, install Zig. `cargo lambda system --install-zig` lists the
+installers for your system.
 
 ```sh
 # Build a family (default: all families). Produces publish/<example>/bootstrap.

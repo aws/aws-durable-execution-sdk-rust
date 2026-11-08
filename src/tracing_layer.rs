@@ -965,7 +965,8 @@ where
 ///    case, it writes one [`TopLevelJson`] record per event: a JSON object
 ///    with the fields at the top level and a `timestamp`, the UTC time to
 ///    the millisecond. Otherwise it writes text without the target and the
-///    time.
+///    time, and [`SpanFieldsInPlace`] keeps each span field in that text
+///    once, with the value recorded last.
 ///
 /// The `fmt` layer is filtered by [`DefaultFilter`]: the `EnvFilter`, then
 /// [`ReplayFilterLayer`], with the SDK's replay-tracking spans always
@@ -996,10 +997,178 @@ where
         Box::new(registry.with(layer.with_filter(filter)))
     } else {
         let layer = subscriber::fmt::layer()
+            .fmt_fields(TextFields::default())
             .with_target(false)
             .without_time()
-            .with_writer(writer);
+            .with_writer(writer)
+            .and_then(SpanFieldsInPlace);
         Box::new(registry.with(layer.with_filter(filter)))
+    }
+}
+
+/// The field formatter of the default subscriber's text branch.
+///
+/// It formats fields as `DefaultFields` does, but adds nothing to a span's
+/// formatted fields when a value is recorded after the span was created:
+/// [`SpanFieldsInPlace`], which runs after the `fmt` layer, rewrites them
+/// instead. So a line shows each field of a span once.
+#[derive(Debug, Default)]
+struct TextFields(subscriber::fmt::format::DefaultFields);
+
+impl<'w> subscriber::fmt::format::FormatFields<'w> for TextFields {
+    fn format_fields<R: subscriber::field::RecordFields>(
+        &self,
+        writer: Writer<'w>,
+        fields: R,
+    ) -> std::fmt::Result {
+        self.0.format_fields(writer, fields)
+    }
+
+    fn add_fields(
+        &self,
+        _current: &'w mut FormattedFields<Self>,
+        _fields: &tracing::span::Record<'_>,
+    ) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
+/// Each formatted field of a span of the text branch, by name, in the
+/// order the span first showed them.
+struct TextSpanFields(Vec<(&'static str, String)>);
+
+/// Keeps one entry per field in the formatted fields of each span of the
+/// default subscriber's text branch.
+///
+/// `tracing-subscriber`'s default field formatter appends a value recorded
+/// after a span's creation, so the SDK's `isReplay` record would show
+/// `isReplay=true isReplay=false`. This layer stores each field's formatted
+/// text when the span is created, replaces a field's text when a value is
+/// recorded, at the position the span first showed it, and rewrites the
+/// span's formatted fields from the stored texts.
+///
+/// A field's `Debug` or `Display` implementation can return an error. When
+/// the `fmt` layer could not format a span's fields, it stores no formatted
+/// fields, and this layer leaves the span alone. When this layer cannot
+/// format a field at the span's creation, it stores no texts, so the span
+/// keeps the formatted fields of the `fmt` layer and later records change
+/// nothing. A recorded value that fails to format leaves its field's
+/// earlier text in place.
+struct SpanFieldsInPlace;
+
+impl<S> subscriber::Layer<S> for SpanFieldsInPlace
+where
+    S: tracing::Subscriber + for<'a> subscriber::registry::LookupSpan<'a>,
+{
+    #[expect(clippy::expect_used)]
+    // reason: the registry calls this hook for a span it stores.
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: subscriber::layer::Context<'_, S>) {
+        let span = ctx.span(id).expect("the registry stores the new span");
+        let mut extensions = span.extensions_mut();
+        let Some(formatted) = extensions.get_mut::<FormattedFields<TextFields>>() else {
+            return;
+        };
+        let mut fields = Vec::new();
+        let mut texts = FieldTexts {
+            formatted,
+            fields: &mut fields,
+            result: Ok(()),
+        };
+        attrs.record(&mut texts);
+        if texts.result.is_ok() {
+            extensions.insert(TextSpanFields(fields));
+        }
+    }
+
+    #[expect(clippy::expect_used)]
+    // reason: the registry calls this hook for a span it stores, and
+    // `on_new_span` stores the span's texts only beside formatted fields,
+    // which nothing removes.
+    fn on_record(
+        &self,
+        id: &Id,
+        values: &tracing::span::Record<'_>,
+        ctx: subscriber::layer::Context<'_, S>,
+    ) {
+        let span = ctx.span(id).expect("the registry stores the recorded span");
+        let mut extensions = span.extensions_mut();
+        let Some(TextSpanFields(mut fields)) = extensions.remove::<TextSpanFields>() else {
+            return;
+        };
+        let formatted = extensions
+            .get_mut::<FormattedFields<TextFields>>()
+            .expect("the span's texts are stored beside its formatted fields");
+        // A value that fails to format stores no text, so its field keeps
+        // its earlier text, and the other recorded values still apply.
+        values.record(&mut FieldTexts {
+            formatted,
+            fields: &mut fields,
+            result: Ok(()),
+        });
+        let joined: Vec<&str> = fields.iter().map(|(_, text)| text.as_str()).collect();
+        formatted.fields = joined.join(" ");
+        extensions.insert(TextSpanFields(fields));
+    }
+}
+
+/// Formats each visited field alone, as `DefaultFields` does, and stores
+/// its text in `fields`: in place of an earlier text of the same name, or
+/// at the end.
+///
+/// The text is written through `formatted`'s writer, so it has the ANSI
+/// settings the span's fields were formatted with. `formatted`'s own text
+/// is put back after each field. A field whose formatting fails stores no
+/// text and sets `result` to the error.
+struct FieldTexts<'a> {
+    formatted: &'a mut FormattedFields<TextFields>,
+    fields: &'a mut Vec<(&'static str, String)>,
+    result: std::fmt::Result,
+}
+
+impl FieldTexts<'_> {
+    fn store(
+        &mut self,
+        field: &tracing::field::Field,
+        write: impl FnOnce(&mut subscriber::fmt::format::DefaultVisitor<'_>),
+    ) {
+        use subscriber::field::VisitOutput as _;
+
+        let saved = std::mem::take(&mut self.formatted.fields);
+        let mut visitor =
+            subscriber::fmt::format::DefaultVisitor::new(self.formatted.as_writer(), true);
+        write(&mut visitor);
+        let result = visitor.finish();
+        let text = std::mem::replace(&mut self.formatted.fields, saved);
+        if let Err(error) = result {
+            self.result = Err(error);
+            return;
+        }
+        match self
+            .fields
+            .iter_mut()
+            .find(|(name, _)| *name == field.name())
+        {
+            Some((_, old)) => *old = text,
+            None => self.fields.push((field.name(), text)),
+        }
+    }
+}
+
+impl tracing::field::Visit for FieldTexts<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.store(field, |v| v.record_str(field, value));
+    }
+
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        self.store(field, |v| v.record_error(field, value));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.store(field, |v| v.record_debug(field, value));
     }
 }
 
@@ -1883,6 +2052,149 @@ pub(crate) mod tests {
         assert!(invocations >= 2, "the wait must suspend: {invocations}");
         assert_eq!(count_message(&output, "before"), 1, "{output}");
         assert_eq!(count_message(&output, "after"), 1, "{output}");
+    }
+
+    /// The text format shows a field recorded after the span's creation
+    /// once, with its latest value, where the span first showed it.
+    #[test]
+    fn default_text_replaces_recorded_span_fields_in_place() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "INFO",
+            "",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            let span = tracing::info_span!(
+                "phase",
+                stage = "one",
+                stable = "keep",
+                late = tracing::field::Empty
+            );
+            span.record("stage", "two");
+            span.record("late", "set");
+            let _entered = span.enter();
+            tracing::info!("inside");
+        }
+
+        let output = captured(&buffer);
+        let line = output
+            .lines()
+            .find(|line| line.contains("inside"))
+            .expect("the line is written");
+        assert!(line.contains(r#"stage="two""#), "{line}");
+        assert!(!line.contains(r#"stage="one""#), "{line}");
+        assert_eq!(line.matches("stable").count(), 1, "{line}");
+        assert!(
+            line.find("stage").expect("stage") < line.find("stable").expect("stable"),
+            "{line}"
+        );
+        // A field first recorded after creation goes after the others.
+        assert!(
+            line.find("stable").expect("stable") < line.find(r#"late="set""#).expect("late"),
+            "{line}"
+        );
+    }
+
+    /// A `Debug` value whose formatting fails on the calls `fail_on` names,
+    /// counted from 1, and writes `ok` on the others.
+    struct FailingDebug {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_on: &'static [usize],
+    }
+
+    impl FailingDebug {
+        fn new(fail_on: &'static [usize]) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_on,
+            }
+        }
+    }
+
+    impl std::fmt::Debug for FailingDebug {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if self.fail_on.contains(&call) {
+                return Err(std::fmt::Error);
+            }
+            f.write_str("ok")
+        }
+    }
+
+    /// Runs `body` under the default text subscriber and returns the line
+    /// that holds the message `inside`.
+    fn text_line(body: impl FnOnce()) -> String {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "INFO",
+            "",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            body();
+        }
+        let output = captured(&buffer);
+        output
+            .lines()
+            .find(|line| line.contains("inside"))
+            .expect("the line is written")
+            .to_owned()
+    }
+
+    /// When the `fmt` layer cannot format a span's fields, it stores none,
+    /// and the text format still writes the span's records.
+    #[test]
+    fn default_text_writes_a_span_whose_fields_fail_to_format() {
+        let line = text_line(|| {
+            let value = FailingDebug::new(&[1]);
+            let span = tracing::info_span!("phase", flaky = ?value, stage = "one");
+            span.record("stage", "two");
+            let _entered = span.enter();
+            tracing::info!("inside");
+        });
+        assert!(line.contains("inside"), "{line}");
+    }
+
+    /// When a span field fails to format alone at the span's creation, the
+    /// span keeps the fields the `fmt` layer formatted, and a later record
+    /// does not rewrite them.
+    #[test]
+    fn default_text_keeps_span_fields_that_fail_to_format_alone() {
+        let line = text_line(|| {
+            let value = FailingDebug::new(&[2]);
+            let span = tracing::info_span!("phase", flaky = ?value, stage = "one");
+            span.record("stage", "two");
+            let _entered = span.enter();
+            tracing::info!("inside");
+        });
+        assert!(line.contains(r#"stage="one""#), "{line}");
+        assert!(!line.contains(r#"stage="two""#), "{line}");
+        assert!(line.contains("flaky=ok"), "{line}");
+    }
+
+    /// A recorded value that fails to format adds no text, and a later
+    /// record still replaces its field in place.
+    #[test]
+    fn default_text_ignores_a_recorded_value_that_fails_to_format() {
+        let line = text_line(|| {
+            let span = tracing::info_span!("phase", stage = "one", late = tracing::field::Empty);
+            span.record("stage", "two");
+            span.record("late", tracing::field::debug(FailingDebug::new(&[1])));
+            span.record("stage", "three");
+            let _entered = span.enter();
+            tracing::info!("inside");
+        });
+        assert!(line.contains(r#"stage="three""#), "{line}");
+        assert_eq!(line.matches("stage").count(), 1, "{line}");
+        assert!(!line.contains("late"), "{line}");
     }
 
     /// A `WARN` threshold disables `INFO` records, and the SDK creates its

@@ -17,7 +17,9 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use crate::builders::{Backoff, JitterStrategy, RetryStrategyConfig};
 use crate::context::{DurableContext, StepContext, SubmittedWrite};
 use crate::engine::{CheckpointStatus, OperationId};
-use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
+use crate::error::{
+    OperationError, OperationErrorKind, STEP_INTERRUPTED_MESSAGE, StepError, StepErrorKind,
+};
 use crate::plugin::UserBody;
 use crate::serdes::SerdesContext;
 use crate::start::StartStep;
@@ -605,7 +607,6 @@ where
                     self.sub_type.as_str(),
                     self.plugin_name.as_deref(),
                     self.retry_strategy.as_ref(),
-                    StepErrorKind::Interrupted,
                     interrupted_failure(),
                     attempt,
                 )
@@ -706,7 +707,7 @@ where
             )
             .await
             .map(StepSettled::Done),
-            Err(failure) => {
+            Err((err, wire)) => {
                 handle_failure(
                     &self.ctx,
                     wire_id,
@@ -714,8 +715,7 @@ where
                     self.sub_type.as_str(),
                     self.plugin_name.as_deref(),
                     self.retry_strategy.as_ref(),
-                    StepErrorKind::ExecutionFailed,
-                    failure,
+                    (StepError::execution_failed(err), wire),
                     attempt,
                 )
                 .await?;
@@ -844,10 +844,11 @@ async fn handle_success<O, S: Serdes<O>>(
 
 /// Handles a failed step: consult retry strategy, checkpoint accordingly.
 ///
-/// `kind` is `StepErrorKind::ExecutionFailed` when the body returned
-/// `err`, and `StepErrorKind::Interrupted` when an `AtMostOncePerRetry`
-/// attempt started but recorded no outcome. The retry strategy sees
-/// `kind`, and the error returned when the strategy stops carries it.
+/// `step_err` is `StepError::execution_failed` of the body's error when
+/// the body failed, and `StepError::interrupted()` when an
+/// `AtMostOncePerRetry` attempt started but recorded no outcome. The retry
+/// strategy sees `step_err`, and the step returns it when the strategy
+/// stops.
 ///
 /// Returns `Ok(())` once a `RETRY` is recorded: the caller then waits for
 /// the retry timer. Returns the step error once a `FAIL` is recorded.
@@ -859,19 +860,17 @@ async fn handle_failure(
     sub_type: &str,
     plugin_name: Option<&str>,
     retry_strategy: Option<&RetryStrategy>,
-    kind: StepErrorKind,
-    (err, wire): (BoxError, crate::error::WireError),
+    (step_err, wire): (StepError, crate::error::WireError),
     attempt: u32,
 ) -> Result<(), OperationError> {
-    // `wire` is the failure record derived once for `err`: by the runner
+    // `wire` is the failure record derived once for the error: by the runner
     // for a live attempt, by `interrupted_failure` for an interrupted one.
     // The RETRY or FAIL record and the attempt-end hooks all use it.
     // A plugin sees no hook for an interrupted attempt, as JS: no hook saw
     // that attempt start in this invocation.
     let plugins = ctx
         .plugins()
-        .filter(|_| !matches!(kind, StepErrorKind::Interrupted));
-    let step_err = StepError::new(kind, Some(err));
+        .filter(|_| !matches!(step_err.kind(), StepErrorKind::Interrupted));
     // Fires the attempt-end hooks once the outcome write returned `Ok`.
     let attempt_ended = |status: crate::OperationStatus, ends_operation: bool| {
         if let Some(plugins) = plugins {
@@ -943,10 +942,10 @@ async fn handle_failure(
 
 /// The error and wire of an interrupted attempt. No body ran, so this
 /// path derives its own wire, with the type the JS SDK records.
-fn interrupted_failure() -> (BoxError, crate::error::WireError) {
-    let err: BoxError = STEP_INTERRUPTED_MESSAGE.into();
-    let wire = crate::error::wire_error_for(&*err, STEP_INTERRUPTED_ERROR_TYPE);
-    (err, wire)
+fn interrupted_failure() -> (StepError, crate::error::WireError) {
+    let message: BoxError = STEP_INTERRUPTED_MESSAGE.into();
+    let wire = crate::error::wire_error_for(&*message, STEP_INTERRUPTED_ERROR_TYPE);
+    (StepError::interrupted(), wire)
 }
 
 // Update builders
@@ -1192,10 +1191,6 @@ const STEP_FALLBACK_ERROR_TYPE: &str = "Error";
 /// The wire `ErrorType` recorded for an `AtMostOncePerRetry` attempt that
 /// started but recorded no outcome. It is the name the JS SDK records.
 const STEP_INTERRUPTED_ERROR_TYPE: &str = "StepInterruptedError";
-
-/// The wire `ErrorMessage` recorded for an interrupted `AtMostOncePerRetry`
-/// attempt. It is the message the JS SDK records.
-const STEP_INTERRUPTED_MESSAGE: &str = "The step execution process was initiated but failed to reach completion due to an interruption.";
 
 #[cfg(test)]
 #[expect(clippy::panic)]
@@ -2983,6 +2978,36 @@ mod tests {
         assert!(
             !executed.load(Ordering::SeqCst),
             "closure should NOT execute when AtMostOncePerRetry and replay=Started"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_attempt_gives_strategy_step_error_interrupted() {
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ctx, _client) = context_over(vec![step_record(CheckpointStatus::Started, 0, None)]);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let strategy: RetryStrategy = Box::new(move |err: &StepError, _attempt: u32| {
+            let source = std::error::Error::source(err).map(ToString::to_string);
+            seen_clone
+                .lock()
+                .expect("strategy log lock")
+                .push((err.kind().to_string(), source));
+            RetryDecision::Stop
+        });
+        let exec = at_most_once_over_started(ctx, Some(strategy), executed);
+
+        exec.execute()
+            .await
+            .expect_err("an interrupted attempt with no retry fails");
+
+        let expected = StepError::interrupted();
+        assert_eq!(
+            *seen.lock().expect("strategy log lock"),
+            [(
+                expected.kind().to_string(),
+                std::error::Error::source(&expected).map(ToString::to_string),
+            )]
         );
     }
 

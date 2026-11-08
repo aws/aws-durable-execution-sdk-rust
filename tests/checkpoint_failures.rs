@@ -962,3 +962,50 @@ async fn retryable_flush_failure_fails_invocation_and_reinvocation_converges() {
          (AtLeastOncePerRetry): nothing further was written for it"
     );
 }
+
+/// Runs one step under `runner`.
+async fn run_one_step(runner: LocalRunner) -> durable::test_util::TestResult<String> {
+    runner
+        .run(
+            |_event: serde_json::Value, ctx: durable::DurableContext| async move {
+                let out = ctx
+                    .step(|_| async { Ok("recorded".to_owned()) })
+                    .name("only")
+                    .await?;
+                Ok::<_, durable::BoxError>(out)
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner")
+}
+
+/// Each checkpoint fault setter replaces the whole fault an earlier one
+/// set: its skip, its count and whether it is retryable.
+#[tokio::test]
+async fn fault_setters_replace_the_whole_fault() {
+    // `fail_next_checkpoints(1)` rejects the first call non-retryably,
+    // whatever skip and retryability an earlier setter chose.
+    let next = run_one_step(
+        LocalRunner::new()
+            .fail_checkpoints_after_retryable(1, 1)
+            .fail_next_checkpoints(1),
+    )
+    .await;
+    assert!(next.is_failure(), "{next}");
+    assert_eq!(next.invocation_count(), 1);
+    assert_eq!(next.error_type(), Some(CHECKPOINT_EXECUTION_FAILED));
+
+    // A later retryable fault replaces the earlier one completely.
+    let replaced = run_one_step(
+        LocalRunner::new()
+            .fail_next_checkpoints(1)
+            .fail_checkpoints_after_retryable(1, 1),
+    )
+    .await;
+    let alone = run_one_step(LocalRunner::new().fail_checkpoints_after_retryable(1, 1)).await;
+    assert_eq!(replaced.status(), alone.status());
+    assert_eq!(replaced.output(), alone.output());
+    assert_eq!(replaced.invocation_count(), alone.invocation_count());
+    assert!(alone.is_success(), "{alone}");
+}

@@ -940,6 +940,11 @@ impl fmt::Display for OperationErrorKind {
     }
 }
 
+/// The wire `ErrorMessage` recorded for an interrupted `AtMostOncePerRetry`
+/// attempt, and the `source()` text of [`StepError::interrupted`]. It is the
+/// message the JS SDK records.
+pub(crate) const STEP_INTERRUPTED_MESSAGE: &str = "The step execution process was initiated but failed to reach completion due to an interruption.";
+
 /// Error from a step operation.
 ///
 /// Use [`kind()`](Self::kind) to determine the failure mode and
@@ -970,6 +975,58 @@ impl StepError {
     /// Returns the specific kind of step error.
     pub fn kind(&self) -> &StepErrorKind {
         &self.kind
+    }
+
+    /// Creates the error a retry strategy receives for a step body, a
+    /// `wait_for_callback` submitter or a `with_retry` attempt that
+    /// returned `source`.
+    ///
+    /// Its kind is [`StepErrorKind::ExecutionFailed`], and its
+    /// [`source()`](std::error::Error::source) is `source`. A test uses it
+    /// to call a retry strategy with the error the SDK passes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use aws_durable_execution_sdk::{RetryDecision, StepError, StepErrorKind};
+    ///
+    /// /// Retries a body error twice, one second apart, and never retries an
+    /// /// interrupted attempt.
+    /// fn strategy(err: &StepError, attempt: u32) -> RetryDecision {
+    ///     if matches!(err.kind(), StepErrorKind::Interrupted { .. }) || attempt >= 3 {
+    ///         RetryDecision::Stop
+    ///     } else {
+    ///         RetryDecision::retry(Duration::from_secs(1))
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(
+    ///     strategy(&StepError::execution_failed("throttled"), 1),
+    ///     RetryDecision::retry(Duration::from_secs(1))
+    /// );
+    /// assert_eq!(strategy(&StepError::execution_failed("throttled"), 3), RetryDecision::Stop);
+    /// assert_eq!(strategy(&StepError::interrupted(), 1), RetryDecision::Stop);
+    /// ```
+    #[must_use]
+    pub fn execution_failed(source: impl Into<crate::BoxError>) -> Self {
+        Self::new(StepErrorKind::ExecutionFailed, Some(source.into()))
+    }
+
+    /// Creates the error a retry strategy receives for an interrupted
+    /// `AtMostOncePerRetry` attempt.
+    ///
+    /// Its kind is [`StepErrorKind::Interrupted`], and its
+    /// [`source()`](std::error::Error::source) displays the message the SDK
+    /// records for an interrupted attempt: `The step execution process was
+    /// initiated but failed to reach completion due to an interruption.`
+    #[must_use]
+    pub fn interrupted() -> Self {
+        Self::new(
+            StepErrorKind::Interrupted,
+            Some(STEP_INTERRUPTED_MESSAGE.into()),
+        )
     }
 
     /// Creates a `StepError` from its kind and source (internal).
@@ -1018,8 +1075,9 @@ impl Error for StepError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StepErrorKind {
-    /// The step body returned an error, and the retry strategy stopped.
-    /// The error's `source()` is the body's error.
+    /// The step body returned an error. A retry strategy receives this kind
+    /// for the body's error, and the step returns it once the strategy
+    /// stops. The error's `source()` is the body's error.
     #[non_exhaustive]
     ExecutionFailed,
     /// A serialization or deserialization error occurred.
@@ -2295,6 +2353,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn step_error_constructors_build_strategy_inputs() {
+        let failed = StepError::execution_failed("throttled");
+        assert!(matches!(failed.kind(), StepErrorKind::ExecutionFailed));
+        assert_eq!(
+            failed.source().map(ToString::to_string).as_deref(),
+            Some("throttled")
+        );
+
+        let interrupted = StepError::interrupted();
+        assert!(matches!(interrupted.kind(), StepErrorKind::Interrupted));
+        assert_eq!(
+            interrupted.source().map(ToString::to_string).as_deref(),
+            Some(
+                "The step execution process was initiated but failed to reach completion due to an interruption."
+            )
+        );
     }
 
     #[test]

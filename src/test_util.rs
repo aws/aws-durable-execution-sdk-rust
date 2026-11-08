@@ -490,6 +490,41 @@ impl TestOperation {
         self.result.as_deref()
     }
 
+    /// The [`result`](Self::result) payload decoded as JSON, the format
+    /// [`JsonSerdes`](crate::JsonSerdes) writes.
+    ///
+    /// Returns `Ok(None)` when the operation stored no result, which
+    /// includes a [`CloudRunner`] result that recorded history withheld
+    /// because it was oversized, and the decoding error when the payload is
+    /// not JSON of `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`serde_json::Error`] of a payload that does not decode
+    /// into `T`.
+    pub fn result_json<T: DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
+        self.result.as_deref().map(serde_json::from_str).transpose()
+    }
+
+    /// Returns `true` for the child context of a `wait_for_callback`: an
+    /// [`OperationKind::Context`] whose [`sub_type`](Self::sub_type) is
+    /// `WaitForCallback`.
+    pub fn is_wait_for_callback(&self) -> bool {
+        self.kind == RunnerKind::Context
+            && self.sub_type.as_deref() == Some(crate::callback::WFCB_SUB_TYPE)
+    }
+
+    /// The recorded duration of a wait, in whole seconds.
+    ///
+    /// `None` for an operation of any other kind, and for a wait that
+    /// recorded no duration.
+    pub fn wait_duration(&self) -> Option<std::time::Duration> {
+        match self.details() {
+            TestOperationDetails::Wait(wait) => wait.duration(),
+            _ => None,
+        }
+    }
+
     /// The recorded error, if the operation stored one: its type, message,
     /// error data and stack trace.
     pub fn error(&self) -> Option<&crate::WireError> {
@@ -2061,6 +2096,12 @@ impl LocalRunner {
     /// event is emitted for the rejected write (see
     /// [`crate::observability`]).
     ///
+    /// It is [`fail_checkpoints_after(0, count)`](Self::fail_checkpoints_after).
+    ///
+    /// One checkpoint fault applies at a time: this call replaces the fault
+    /// that an earlier `fail_next_checkpoints`, `fail_checkpoints_after` or
+    /// `fail_checkpoints_after_retryable` call set.
+    ///
     /// # Examples
     ///
     /// ```
@@ -2070,9 +2111,8 @@ impl LocalRunner {
     /// # drop(runner);
     /// ```
     #[must_use]
-    pub fn fail_next_checkpoints(mut self, count: usize) -> Self {
-        self.checkpoint_failures = count;
-        self
+    pub fn fail_next_checkpoints(self, count: usize) -> Self {
+        self.fail_checkpoints_after(0, count)
     }
 
     /// Like [`fail_next_checkpoints`](Self::fail_next_checkpoints), but
@@ -2083,6 +2123,10 @@ impl LocalRunner {
     /// first and its outcome second, so `fail_checkpoints_after(1, 1)`
     /// rejects exactly the step's outcome write, while the `START` before
     /// it persists.
+    ///
+    /// One checkpoint fault applies at a time: this call replaces the fault
+    /// that an earlier `fail_next_checkpoints`, `fail_checkpoints_after` or
+    /// `fail_checkpoints_after_retryable` call set.
     ///
     /// # Examples
     ///
@@ -2108,6 +2152,10 @@ impl LocalRunner {
     /// sends no further checkpoint in it; the runner then re-invokes,
     /// exactly as the durable service does, and replay resumes from the
     /// recorded state.
+    ///
+    /// One checkpoint fault applies at a time: this call replaces the fault
+    /// that an earlier `fail_next_checkpoints`, `fail_checkpoints_after` or
+    /// `fail_checkpoints_after_retryable` call set.
     ///
     /// # Examples
     ///
@@ -13894,6 +13942,118 @@ mod tests {
             Some(ops[2].id())
         );
         assert!(result.operation("absent").is_none());
+    }
+
+    #[test]
+    fn checkpoint_fault_setters_replace_all_fault_fields() {
+        let fault = |r: &LocalRunner| {
+            (
+                r.checkpoint_failure_skip,
+                r.checkpoint_failures,
+                r.checkpoint_failures_retryable,
+                r.withdraw_after,
+            )
+        };
+        let next = LocalRunner::new()
+            .withdraw_checkpoints_after(4)
+            .fail_checkpoints_after_retryable(2, 3)
+            .fail_next_checkpoints(1);
+        assert_eq!(fault(&next), (0, 1, false, Some(4)));
+
+        let after = LocalRunner::new()
+            .withdraw_checkpoints_after(4)
+            .fail_checkpoints_after_retryable(2, 3)
+            .fail_checkpoints_after(5, 6);
+        assert_eq!(fault(&after), (5, 6, false, Some(4)));
+
+        let retryable = LocalRunner::new()
+            .withdraw_checkpoints_after(4)
+            .fail_checkpoints_after(2, 3)
+            .fail_next_checkpoints(7)
+            .fail_checkpoints_after_retryable(5, 6);
+        assert_eq!(fault(&retryable), (5, 6, true, Some(4)));
+    }
+
+    #[test]
+    fn typed_accessors_read_folded_cloud_history() {
+        use aws_sdk_lambda::types::WaitStartedDetails;
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Order {
+            id: u32,
+        }
+        let events = vec![
+            Event::builder()
+                .event_type(EventType::StepStarted)
+                .id("step")
+                .event_id(1)
+                .build(),
+            Event::builder()
+                .event_type(EventType::StepSucceeded)
+                .id("step")
+                .event_id(2)
+                .step_succeeded_details(
+                    StepSucceededDetails::builder()
+                        .result(EventResult::builder().payload(r#"{"id":7}"#).build())
+                        .build(),
+                )
+                .build(),
+            Event::builder()
+                .event_type(EventType::ContextStarted)
+                .id("wfcb")
+                .sub_type("WaitForCallback")
+                .event_id(3)
+                .build(),
+            Event::builder()
+                .event_type(EventType::StepStarted)
+                .id("custom")
+                .sub_type("WaitForCallback")
+                .event_id(4)
+                .build(),
+            Event::builder()
+                .event_type(EventType::WaitStarted)
+                .id("wait")
+                .event_id(5)
+                .wait_started_details(
+                    WaitStartedDetails::builder()
+                        .duration(10)
+                        .scheduled_end_timestamp(DateTime::from_secs(10))
+                        .build()
+                        .expect("wait details"),
+                )
+                .build(),
+            Event::builder()
+                .event_type(EventType::WaitSucceeded)
+                .id("bare-wait")
+                .event_id(6)
+                .build(),
+        ];
+        let ops = fold_history(&events);
+        assert_eq!(ops.len(), 5, "{ops:?}");
+        let (step, wfcb, custom, wait, bare_wait) = (&ops[0], &ops[1], &ops[2], &ops[3], &ops[4]);
+
+        assert_eq!(
+            step.result_json::<Order>().expect("decodes"),
+            Some(Order { id: 7 })
+        );
+        assert!(step.result_json::<String>().is_err());
+        assert_eq!(wfcb.result_json::<Order>().expect("no result"), None);
+
+        assert!(wfcb.is_wait_for_callback());
+        assert!(!custom.is_wait_for_callback());
+        assert!(!step.is_wait_for_callback());
+
+        assert_eq!(
+            wait.wait_duration(),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(bare_wait.wait_duration(), None);
+        assert_eq!(step.wait_duration(), None);
+
+        // A non-wait reports no duration even when its wait detail holds
+        // one: the accessor reads the detail of the operation's kind.
+        let mut not_a_wait = TestOperation::started("s".to_owned(), RunnerKind::Step);
+        not_a_wait.wait.duration = Some(std::time::Duration::from_secs(3));
+        assert_eq!(not_a_wait.wait_duration(), None);
     }
 
     #[test]

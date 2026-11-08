@@ -26,7 +26,9 @@
 #
 # Requires:
 #   - Rust toolchain
-#   - cargo-lambda (pip3 install cargo-lambda, or cargo install cargo-lambda)
+#   - cargo-lambda and Zig: pip3 install cargo-lambda,
+#     brew install cargo-lambda/tap/cargo-lambda, or
+#     curl -fsSL https://cargo-lambda.info/install.sh | sh
 #
 # Usage:
 #   ./build_examples.sh [operation...]
@@ -63,9 +65,10 @@ It is the single build path for this workspace, locally and in CI: it pins the
 glibc version the handler binaries link against so they start on the
 provided.al2023 runtime regardless of which host built them.
 
-Install it with one of:
+Each of these installs it, and the Zig toolchain it builds with:
     pip3 install cargo-lambda
-    cargo install cargo-lambda
+    brew install cargo-lambda/tap/cargo-lambda
+    curl -fsSL https://cargo-lambda.info/install.sh | sh
 EOF
     exit 1
 fi
