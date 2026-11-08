@@ -172,9 +172,10 @@ pub(super) fn callback_target<'a>(
     }
 }
 
-/// Whether the driver finished, as the runner futures see it. A terminal
-/// runner error is kept apart, in [`RunState::failure`], because it can
-/// come after the driver finished.
+/// Whether the driver finished with a [`TestResult`], as the runner futures
+/// see it. A run failure is kept apart, in [`RunState::failure`]: the driver
+/// ends with it instead of a `TestResult`, or the run fails before the
+/// driver starts. A control's own failed Lambda call is neither.
 #[derive(Default)]
 pub(super) enum RunEnd {
     /// The driver has not finished.
@@ -245,7 +246,10 @@ pub(super) enum ControlPhase {
     /// Ready with `ControlValue`; it no longer waits.
     Ready(ControlValue),
     /// A `CloudRunner` Lambda call with the ticket `request` is in flight,
-    /// and `waker` wakes the control when the run fails meanwhile.
+    /// and `waker` wakes the control when the run fails meanwhile. A
+    /// pending `wait_for_data` then returns the run failure and drops its
+    /// call; a callback control keeps awaiting its call (see
+    /// [`await_in_flight`]).
     InFlight {
         request: u64,
         waker: std::task::Waker,
@@ -312,18 +316,21 @@ pub(super) struct CloudState {
 #[derive(Debug)]
 pub(super) struct RunState {
     pub(super) next_id: u64,
-    /// The run's terminal runner error: the first one recorded, by the
-    /// driver or by a control, before or after the driver finished. Every
-    /// control commits its outcome against it (see [`RunState::commit`]).
+    /// The run failure: the first runner error of the run itself, recorded
+    /// by [`RunCore::failed`] before the driver starts or by
+    /// [`RunCore::poll_driver`] when the driver returns it. A control's own
+    /// failed Lambda call is never recorded here. `LocalRunner` controls
+    /// and waits that started while the run was active commit their
+    /// outcome against it (see [`RunState::commit`]).
     pub(super) failure: Option<TestRunnerError>,
     pub(super) end: RunEnd,
     /// The live controls, by ID.
     pub(super) controls: BTreeMap<u64, Control>,
     pub(super) local: LocalState,
     pub(super) cloud: CloudState,
-    /// In-crate test seam: an error that the next [`RunState::commit`]
-    /// records as the terminal runner error before it decides, as another
-    /// control would record it just before the commit.
+    /// In-crate test seam: a run failure that the next [`RunState::commit`]
+    /// records before it decides, as a concurrent failure of the run would
+    /// be recorded just before the commit.
     #[cfg(test)]
     pub(super) fail_at_commit: Option<TestRunnerError>,
 }
@@ -375,9 +382,15 @@ impl RunState {
         })
     }
 
-    /// Marks the control `id` as pending with `waker`, unless the run has a
-    /// terminal runner error, the control is ready, or it no longer exists.
-    /// Returns `None` then, else whether the registration opened the hold.
+    /// Marks the control `id` as pending with `waker`, unless the run
+    /// failed, the control is ready, or it no longer exists. Returns `None`
+    /// then, else whether the registration opened the hold.
+    ///
+    /// Refusing after a run failure leaves no control without an outcome:
+    /// a `wait_for_data` first polled after the failure decides from the
+    /// stored operations before it registers, and a `CloudRunner` callback
+    /// control after the failure needs the driver for nothing, because it
+    /// makes its calls only once the target was published.
     pub(super) fn register(&mut self, id: u64, waker: &std::task::Waker) -> Option<bool> {
         if self.failure.is_some() {
             return None;
@@ -407,9 +420,11 @@ impl RunState {
             .collect()
     }
 
-    /// Records `err` as the run's terminal runner error unless one is
-    /// already recorded. Returns the recorded one, and the wakers of every
-    /// pending or in-flight control, to wake after the lock is released.
+    /// Records `err` as the run failure unless one is already recorded.
+    /// Only a failure of the run itself is recorded here, never the failed
+    /// Lambda call of a control. Returns the recorded failure, and the
+    /// wakers of every pending or in-flight control, to wake after the lock
+    /// is released.
     pub(super) fn record_failure(
         &mut self,
         err: TestRunnerError,
@@ -418,14 +433,17 @@ impl RunState {
         (winner, self.wakers())
     }
 
-    /// Commits the outcome of a control: the run's terminal runner error
-    /// when it has one, else `candidate`.
+    /// Commits the outcome of a control: the run failure when there is
+    /// one, else `candidate`.
     ///
-    /// Every control returns through a commit under the state lock, and
-    /// any state change its outcome makes happens under the same lock after
-    /// the commit. So a terminal error recorded before the commit wins over
-    /// every other outcome, and one recorded after it finds the control
-    /// already decided.
+    /// `LocalRunner` controls and `wait_for_data` calls that started while
+    /// the run was active return through a commit under the state lock, and
+    /// any state change their outcome makes happens under the same lock
+    /// after the commit. So a run failure recorded before the commit wins
+    /// over every other outcome, and one recorded after it finds the
+    /// control already decided. A `CloudRunner` callback control and a
+    /// `wait_for_data` first polled after the run failed return their own
+    /// outcome without a commit.
     pub(super) fn commit<T>(
         &mut self,
         candidate: Result<T, TestRunnerError>,
@@ -769,16 +787,29 @@ impl RunCore {
         self.live.lock().controls.remove(&id);
     }
 
-    /// The terminal runner error, if the run has one.
+    /// The run failure, if the run has one.
+    #[cfg(test)]
     pub(super) fn terminal_error(&self) -> Option<TestRunnerError> {
         self.live.lock().failure.clone()
     }
 
-    /// `Err` with the terminal runner error, if the run has one. A
-    /// `CloudRunner` control checks it before it makes a Lambda call; its
-    /// outcome is still decided by its commit.
-    pub(super) fn check_failure(&self) -> Result<(), TestRunnerError> {
-        self.terminal_error().map_or(Ok(()), Err)
+    /// The decision of a `wait_for_data` call when it is first polled, as
+    /// one transition: `None` while the run has no failure, so the call
+    /// waits as usual; else the operation `selector` names in the stored
+    /// operations when it reached `status`, or else the run failure. It
+    /// makes no Lambda call, polls no driver and spends no budget.
+    pub(super) fn late_wait(
+        &self,
+        selector: &Selector,
+        status: WaitingStatus,
+    ) -> Option<Result<TestOperation, TestRunnerError>> {
+        let state = self.live.lock();
+        let err = state.failure.clone()?;
+        let ops = match &self.engine {
+            Engine::Local => snapshot_of(&state.local.records),
+            Engine::Cloud(_) => state.cloud.fold.clone().unwrap_or_default(),
+        };
+        Some(reached_operation(selector, status, &ops).ok_or(err))
     }
 
     /// Whether the run ended, with a `TestResult` or a runner error.
@@ -795,18 +826,20 @@ impl RunCore {
         self.live.lock().commit(candidate)
     }
 
-    /// The precondition of `pause` and `resume`, read from `state`:
-    /// [`TestRunnerError::Unsupported`] under [`CloudRunner`], else
-    /// [`RunState::run_in_progress`].
+    /// The precondition of `pause` and `resume`, decided on `state`:
+    /// [`TestRunnerError::Unsupported`] under [`CloudRunner`], whether the
+    /// run failed or not, else [`RunState::run_in_progress`] committed
+    /// against the run failure.
     pub(super) fn pause_precondition(
         &self,
-        state: &RunState,
+        state: &mut RunState,
         name: &'static str,
     ) -> Result<(), TestRunnerError> {
         if matches!(self.engine, Engine::Cloud(_)) {
             return Err(TestRunnerError::Unsupported(CLOUD_PAUSE_UNSUPPORTED));
         }
-        state.run_in_progress(name)
+        let precondition = state.run_in_progress(name);
+        state.commit(precondition)
     }
 
     /// The operations of the run now: the backend's records under
@@ -860,29 +893,56 @@ pub(super) async fn drive_until<T>(
     .await
 }
 
+/// Which `CloudRunner` control makes a Lambda call, which decides how a run
+/// failure affects the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ControlRole {
+    /// A `wait_for_data` that started while the run was active. A run
+    /// failure ends it: it starts no read after the failure, and a read in
+    /// flight is dropped.
+    Wait,
+    /// A callback control with a published target. It is independent of a
+    /// run failure: it starts its reads and calls after the failure, and
+    /// keeps awaiting a call in flight.
+    Callback,
+}
+
 /// Awaits `call`, the Lambda call with the ticket `request` of the control
 /// `registration`, outside every lock.
 ///
-/// While `call` is pending the control is in flight: a terminal runner
-/// error recorded meanwhile wakes it, and it returns that error and drops
-/// `call`. Otherwise it returns the call's output, which the caller then
-/// finishes against the state (see [`CloudShared::finish_history`] and
+/// While `call` is pending the control is in flight, and a run failure
+/// recorded meanwhile wakes it. For [`ControlRole::Wait`] it then returns
+/// the run failure and drops `call`, also when `call` would be ready on
+/// that poll: a wait checks the run failure before it polls `call`. For [`ControlRole::Callback`] it keeps
+/// awaiting `call`, and stays pending while `call` never settles. Otherwise
+/// it returns the call's output, which the caller then finishes against the
+/// state (see [`CloudShared::finish_history`] and
 /// [`CloudShared::finish_call`]). While it waits, the control polls the
 /// driver, as every control does.
 pub(super) async fn await_in_flight<T>(
     registration: &Registration<'_>,
+    role: ControlRole,
     request: u64,
     call: impl Future<Output = T>,
 ) -> Result<T, TestRunnerError> {
     let core = registration.core;
     let mut call = std::pin::pin!(call);
     std::future::poll_fn(|cx| {
+        // A wait checks the run failure before it polls `call`, so a call
+        // that would be ready on this poll is still dropped unconsumed.
+        if role == ControlRole::Wait
+            && let Some(err) = &core.live.lock().failure
+        {
+            return std::task::Poll::Ready(Err(err.clone()));
+        }
         if let std::task::Poll::Ready(output) = call.as_mut().poll(cx) {
             return std::task::Poll::Ready(Ok(output));
         }
         {
             let mut state = core.live.lock();
-            if let Some(err) = &state.failure {
+            if role == ControlRole::Wait
+                && let Some(err) = &state.failure
+            {
                 return std::task::Poll::Ready(Err(err.clone()));
             }
             if let Some(control) = state.controls.get_mut(&registration.id) {
@@ -992,17 +1052,18 @@ impl<O> RunHandle<O> {
     ///
     /// # Errors
     ///
-    /// - The run's terminal runner error, if it has one.
-    /// - [`TestRunnerError::RunFinished`] once the run finished.
-    /// - [`TestRunnerError::Unsupported`] under [`CloudRunner`].
+    /// - Under [`LocalRunner`], the run's runner error, if the run failed.
+    /// - Under [`LocalRunner`], [`TestRunnerError::RunFinished`] once the
+    ///   run finished.
+    /// - [`TestRunnerError::Unsupported`] under [`CloudRunner`], always,
+    ///   also after the run failed.
     pub async fn pause(&self) -> Result<(), TestRunnerError> {
         let shared = &*self.shared;
         let registration = Registration::new(shared, ControlKind::Pause);
         let id = registration.id;
         {
             let mut state = shared.live.lock();
-            let precondition = shared.pause_precondition(&state, "pause");
-            state.commit(precondition)?;
+            shared.pause_precondition(&mut state, "pause")?;
             state.local.paused = true;
             // The end of this invocation makes the pause ready, in the
             // transition that ends it, before the driver decides what to
@@ -1028,25 +1089,29 @@ impl<O> RunHandle<O> {
     ///
     /// # Errors
     ///
-    /// - The run's terminal runner error, if it has one.
-    /// - [`TestRunnerError::RunFinished`] once the run finished.
-    /// - [`TestRunnerError::Unsupported`] under [`CloudRunner`].
+    /// - Under [`LocalRunner`], the run's runner error, if the run failed.
+    /// - Under [`LocalRunner`], [`TestRunnerError::RunFinished`] once the
+    ///   run finished.
+    /// - [`TestRunnerError::Unsupported`] under [`CloudRunner`], always,
+    ///   also after the run failed.
     // reason: `pause` and `resume` are both async, as in JS
     #[expect(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn resume(&self) -> Result<(), TestRunnerError> {
         let shared = &*self.shared;
         {
             let mut state = shared.live.lock();
-            let precondition = shared.pause_precondition(&state, "resume");
-            state.commit(precondition)?;
+            shared.pause_precondition(&mut state, "resume")?;
             state.local.paused = false;
         }
         shared.live.notify.notify_waiters();
         Ok(())
     }
 
-    /// The run's end, once the driver produced one: the terminal runner
-    /// error, or the `TestResult` the first time it is taken.
+    /// The run's end, once there is one: the run failure, or the
+    /// `TestResult` the first time it is taken. A control's own failed call
+    /// is never recorded as the run's end, so it replaces neither. After
+    /// the `TestResult` was taken, this returns `None`, and polling the
+    /// handle again stays pending.
     pub(super) fn take_end(&self) -> Option<Result<TestResult<O>, TestRunnerError>>
     where
         O: Send + 'static,
@@ -1115,7 +1180,9 @@ impl OperationHandle {
     /// The operation now, or `None` while no operation matches the handle.
     ///
     /// Under [`CloudRunner`] it is the operation in the last history the
-    /// runner read.
+    /// runner read successfully. A runner error does not clear the stored
+    /// operations, so after a failed run this still returns the
+    /// [`LocalRunner`] records or the newest history [`CloudRunner`] read.
     pub fn snapshot(&self) -> Option<TestOperation> {
         self.shared
             .operations()
@@ -1132,9 +1199,19 @@ impl OperationHandle {
     /// execution ARN, then one `poll_interval` after each read that does not
     /// reach `status`.
     ///
+    /// The call starts when its future is first polled.
+    ///
     /// # Errors
     ///
-    /// - The run's terminal runner error, if it has one.
+    /// - The run's runner error, when the run fails while the call is
+    ///   pending.
+    /// - The run's runner error, when the call is first polled after the run
+    ///   failed and the stored operation does not reach `status`. When it
+    ///   does, the call returns the stored operation instead, without a
+    ///   Lambda call.
+    /// - [`TestRunnerError::Aws`] when a [`CloudRunner`] history read of
+    ///   this call fails. It belongs only to this call: the run goes on, and
+    ///   other controls are not affected.
     /// - [`TestRunnerError::OperationNotReached`] when the execution ended,
     ///   or a configured [`CloudRunner::max_poll_attempts`] budget is spent,
     ///   before the operation reached `status`.
@@ -1150,6 +1227,12 @@ impl OperationHandle {
                 .wait_for_data(&self.shared, &self.selector, status)
                 .await;
         }
+        // A call first polled after the run failed decides from the stored
+        // records, without a commit, so reached data is not replaced by
+        // the failure.
+        if let Some(late) = shared.late_wait(&self.selector, status) {
+            return late;
+        }
         let registration = Registration::new(
             shared,
             ControlKind::Data {
@@ -1159,7 +1242,9 @@ impl OperationHandle {
         );
         let id = registration.id;
         // Each outcome is decided and committed in one transition on the
-        // run's state, the state a checkpoint is applied to.
+        // run's state, the state a checkpoint is applied to. This call
+        // started while the run was active, so a run failure recorded
+        // before the commit wins over ready data.
         drive_until(&registration, |_| {
             let mut state = shared.live.lock();
             let ready = state.take_ready_data(id).or_else(|| {
@@ -1190,7 +1275,11 @@ impl OperationHandle {
     ///
     /// # Errors
     ///
-    /// - The run's terminal runner error, if it has one.
+    /// - Under [`LocalRunner`], the run's runner error, if the run failed.
+    /// - Under [`CloudRunner`], the run's runner error, when the run fails
+    ///   before the invoke published the execution ARN. Once it is
+    ///   published, the control goes on after a run failure, and returns
+    ///   its own outcome: success, or one of the errors below.
     /// - [`TestRunnerError::OperationNotFound`],
     ///   [`TestRunnerError::NotACallback`] and
     ///   [`TestRunnerError::CallbackNotPending`] when there is no pending
@@ -1200,7 +1289,9 @@ impl OperationHandle {
     /// - [`TestRunnerError::Unsupported`] under [`CloudRunner`] with
     ///   [`InvocationType::RequestResponse`], and for
     ///   [`CallbackReply::timeout`] and [`CallbackReply::heartbeat_timeout`].
-    /// - [`TestRunnerError::Aws`] when a Lambda call fails.
+    /// - [`TestRunnerError::Aws`] when a [`CloudRunner`] history read or
+    ///   callback call of this control fails. It belongs only to this
+    ///   control: the run goes on, and other controls are not affected.
     pub async fn send_callback(&self, reply: CallbackReply) -> Result<(), TestRunnerError> {
         let shared = &*self.shared;
         if let Engine::Cloud(cloud) = &shared.engine {
@@ -1322,111 +1413,115 @@ impl<A> CloudShared<A> {
         self.live.lock().cloud.used
     }
 
-    /// Starts a history read as one transition: the terminal runner error,
-    /// else [`HistoryStart::Done`] when `check_finished` and the run
-    /// finished, or when `take_budget` and the budget is spent, else a new
-    /// ticket.
-    pub(super) fn begin_history(
-        &self,
-        check_finished: bool,
-        take_budget: bool,
-    ) -> Result<HistoryStart, TestRunnerError> {
+    /// Starts a history read of a control with `role` as one transition.
+    ///
+    /// For [`ControlRole::Wait`]: the run failure, else
+    /// [`HistoryStart::Done`] when the run finished or the budget is spent,
+    /// else a new ticket. A pending wait starts no read after the run
+    /// failed.
+    ///
+    /// For [`ControlRole::Callback`]: [`HistoryStart::Done`] when the budget
+    /// is spent, else a new ticket, whether the run failed or not.
+    ///
+    /// A read that starts spends one poll of the budget, however many pages
+    /// and attempts it makes, and also when it fails.
+    pub(super) fn begin_history(&self, role: ControlRole) -> Result<HistoryStart, TestRunnerError> {
         let mut state = self.live.lock();
-        if let Some(err) = &state.failure {
-            return Err(err.clone());
+        if role == ControlRole::Wait {
+            if let Some(err) = &state.failure {
+                return Err(err.clone());
+            }
+            if matches!(state.end, RunEnd::Finished(_)) {
+                return Ok(HistoryStart::Done(state.cloud.fold.clone()));
+            }
         }
-        let finished = matches!(state.end, RunEnd::Finished(_));
-        if (check_finished && finished) || (take_budget && !state.take_poll()) {
+        if !state.take_poll() {
             return Ok(HistoryStart::Done(state.cloud.fold.clone()));
         }
         state.cloud.next_request += 1;
         Ok(HistoryStart::Read(state.cloud.next_request))
     }
 
-    /// Finishes the history read `request` of the control `id`, or of the
-    /// driver when `id` is `None`, with `fetched`, as one transition. The
-    /// terminal runner error wins. A failed read records its error as the
-    /// run's terminal runner error. A successful read becomes the run's fold
-    /// unless a newer read already finished, and its own events and
-    /// operations are returned.
+    /// Finishes the history read `request` of the control `reader`, an ID
+    /// and a role, or of the driver when `reader` is `None`, with
+    /// `fetched`, as one transition.
+    ///
+    /// A wait whose run failed meanwhile returns the run failure and
+    /// discards the read, so a pending wait stores no fold after the
+    /// failure. Otherwise a failed read returns its error to the reader
+    /// without recording it: the driver's error reaches
+    /// [`RunCore::poll_driver`], which records it as the run failure, and a
+    /// control's error belongs to that control. A failed read leaves the
+    /// fold as it is. A successful read becomes the run's fold unless a
+    /// newer read already finished, also when a callback control read it
+    /// after the run failed, and its own events and operations are
+    /// returned.
     pub(super) fn finish_history(
         &self,
-        id: Option<u64>,
+        reader: Option<(u64, ControlRole)>,
         request: u64,
         fetched: Result<Vec<Event>, TestRunnerError>,
     ) -> Result<(Vec<Event>, Vec<TestOperation>), TestRunnerError> {
-        let (winner, wakers) = {
-            let mut state = self.live.lock();
-            if let Some(id) = id {
-                state.settle_in_flight(id, request);
-            }
-            if let Some(err) = &state.failure {
+        let mut state = self.live.lock();
+        if let Some((id, role)) = reader {
+            state.settle_in_flight(id, request);
+            if role == ControlRole::Wait
+                && let Some(err) = &state.failure
+            {
                 return Err(err.clone());
             }
-            match fetched {
-                Ok(events) => {
-                    let ops = fold_history(&events);
-                    if request > state.cloud.fold_request {
-                        state.cloud.fold = Some(ops.clone());
-                        state.cloud.fold_request = request;
-                    }
-                    return Ok((events, ops));
-                }
-                Err(err) => state.record_failure(err),
-            }
-        };
-        wake(wakers);
-        Err(winner)
+        }
+        let events = fetched?;
+        let ops = fold_history(&events);
+        if request > state.cloud.fold_request {
+            state.cloud.fold = Some(ops.clone());
+            state.cloud.fold_request = request;
+        }
+        Ok((events, ops))
     }
 
-    /// Starts a Lambda call that needs no budget, as one transition: the
-    /// terminal runner error, else a new ticket.
-    pub(super) fn begin_request(&self) -> Result<u64, TestRunnerError> {
+    /// Starts a Lambda call that needs no budget, as one transition: a new
+    /// ticket. The driver's final history read and a callback control's
+    /// callback call use it; a callback control with a published target
+    /// makes its call also after the run failed.
+    pub(super) fn begin_request(&self) -> u64 {
         let mut state = self.live.lock();
-        if let Some(err) = &state.failure {
-            return Err(err.clone());
-        }
         state.cloud.next_request += 1;
-        Ok(state.cloud.next_request)
+        state.cloud.next_request
     }
 
     /// Finishes the callback call `request` of the control `id` with
-    /// `sent`, as one transition: the terminal runner error wins, a failed
-    /// call records its error as the run's terminal runner error, and a
-    /// successful call is committed.
+    /// `sent`, as one transition: it ends the in-flight phase and returns
+    /// the call's own outcome. A failed call is neither recorded as the run
+    /// failure nor committed against it.
     pub(super) fn finish_call(
         &self,
         id: u64,
         request: u64,
         sent: Result<(), TestRunnerError>,
     ) -> Result<(), TestRunnerError> {
-        let (winner, wakers) = {
-            let mut state = self.live.lock();
-            state.settle_in_flight(id, request);
-            match sent {
-                Ok(()) => return state.commit(Ok(())),
-                Err(err) => state.record_failure(err),
-            }
-        };
-        wake(wakers);
-        Err(winner)
+        self.live.lock().settle_in_flight(id, request);
+        sent
     }
 }
 
 impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
     /// Polls the driver as the control `registration` until the invoke
-    /// returned the execution ARN.
+    /// returned the execution ARN. A published target is returned also
+    /// when the run failed after it was published. Without one, the run
+    /// failure is returned.
     pub(super) async fn until_target(
         &self,
         registration: &Registration<'_>,
     ) -> Result<(Arc<A>, String), TestRunnerError> {
         drive_until(registration, |_| {
             let state = self.live.lock();
-            if let Some(err) = &state.failure {
-                return Some(Err(err.clone()));
+            if let Some(arn) = &state.cloud.execution_arn
+                && let Some(api) = self.api.get()
+            {
+                return Some(Ok((Arc::clone(api), arn.clone())));
             }
-            let arn = state.cloud.execution_arn.clone()?;
-            self.api.get().map(|api| Ok((Arc::clone(api), arn)))
+            state.failure.clone().map(Err)
         })
         .await
     }
@@ -1438,27 +1533,33 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
         api: &A,
         execution_arn: &str,
     ) -> Result<(Vec<Event>, Vec<TestOperation>), TestRunnerError> {
-        let request = self.begin_request()?;
+        let request = self.begin_request();
         let fetched = fetch_history(api, execution_arn, self.poll_interval).await;
         self.finish_history(None, request, fetched)
     }
 
     /// The operations a callback control reads: a fresh history read when
-    /// the budget allows one, else the newest fold.
+    /// the budget allows one, else the newest fold. Once the target is
+    /// published, a run failure changes neither.
     pub(super) async fn control_operations(
         &self,
         registration: &Registration<'_>,
     ) -> Result<(Arc<A>, Vec<TestOperation>), TestRunnerError> {
         let (api, execution_arn) = self.until_target(registration).await?;
-        match self.begin_history(false, true)? {
+        match self.begin_history(ControlRole::Callback)? {
             HistoryStart::Read(request) => {
                 let fetched = await_in_flight(
                     registration,
+                    ControlRole::Callback,
                     request,
                     fetch_history(&*api, &execution_arn, self.poll_interval),
                 )
                 .await?;
-                let (_, ops) = self.finish_history(Some(registration.id), request, fetched)?;
+                let (_, ops) = self.finish_history(
+                    Some((registration.id, ControlRole::Callback)),
+                    request,
+                    fetched,
+                )?;
                 Ok((api, ops))
             }
             HistoryStart::Done(fold) => Ok((api, fold.ok_or(TestRunnerError::OperationNotFound)?)),
@@ -1476,25 +1577,21 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
         .await;
     }
 
+    /// The outcome of a `wait_for_data` that started while the run was
+    /// active; the wrapper commits it against the run failure.
     async fn wait_for_data_outcome(
         &self,
         core: &RunCore,
         selector: &Selector,
         status: WaitingStatus,
     ) -> Result<TestOperation, TestRunnerError> {
-        core.check_failure()?;
-        if self.invocation_type == InvocationType::RequestResponse {
-            return Err(TestRunnerError::Unsupported(
-                WAIT_FOR_DATA_REQUEST_RESPONSE_UNSUPPORTED,
-            ));
-        }
         let registration = Registration::new(core, ControlKind::Cloud);
         let (api, execution_arn) = self.until_target(&registration).await?;
         loop {
             // As the JS history poller, each read starts one poll interval
             // after the ARN is known or after the previous read.
             Self::drive_for(&registration, self.poll_interval).await;
-            let request = match self.begin_history(true, true)? {
+            let request = match self.begin_history(ControlRole::Wait)? {
                 HistoryStart::Read(request) => request,
                 HistoryStart::Done(fold) => {
                     return reached_operation(selector, status, &fold.unwrap_or_default())
@@ -1503,11 +1600,13 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
             };
             let fetched = await_in_flight(
                 &registration,
+                ControlRole::Wait,
                 request,
                 fetch_history(&*api, &execution_arn, self.poll_interval),
             )
             .await?;
-            let (events, ops) = self.finish_history(Some(registration.id), request, fetched)?;
+            let (events, ops) =
+                self.finish_history(Some((registration.id, ControlRole::Wait)), request, fetched)?;
             if let Some(op) = reached_operation(selector, status, &ops) {
                 return Ok(op);
             }
@@ -1517,13 +1616,15 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
         }
     }
 
+    /// The outcome of `send_callback`: the `Unsupported` checks first, then
+    /// the target rule of [`until_target`](Self::until_target), then the
+    /// control's own validation and calls.
     async fn send_callback_outcome(
         &self,
         core: &RunCore,
         selector: &Selector,
         reply: CallbackReply,
     ) -> Result<(), TestRunnerError> {
-        core.check_failure()?;
         if self.invocation_type == InvocationType::RequestResponse {
             return Err(TestRunnerError::Unsupported(
                 SEND_CALLBACK_REQUEST_RESPONSE_UNSUPPORTED,
@@ -1545,11 +1646,12 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
             return Err(TestRunnerError::CallbackNotPending);
         }
         let id = callback_id(target)?;
-        let request = self.begin_request()?;
+        let request = self.begin_request();
         let sent = match call {
             CallbackCall::Success(payload) => {
                 await_in_flight(
                     &registration,
+                    ControlRole::Callback,
                     request,
                     api.send_callback_success(&id, payload.into_bytes()),
                 )
@@ -1558,6 +1660,7 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
             CallbackCall::Failure(failure) => {
                 await_in_flight(
                     &registration,
+                    ControlRole::Callback,
                     request,
                     api.send_callback_failure(&id, failure.error_object()),
                 )
@@ -1567,12 +1670,13 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
         self.finish_call(registration.id, request, sent.map_err(aws_error))
     }
 
+    /// The outcome of `send_callback_heartbeat`, decided as
+    /// [`send_callback_outcome`](Self::send_callback_outcome) decides.
     async fn send_heartbeat_outcome(
         &self,
         core: &RunCore,
         selector: &Selector,
     ) -> Result<(), TestRunnerError> {
-        core.check_failure()?;
         if self.invocation_type == InvocationType::RequestResponse {
             return Err(TestRunnerError::Unsupported(
                 SEND_CALLBACK_HEARTBEAT_REQUEST_RESPONSE_UNSUPPORTED,
@@ -1581,9 +1685,14 @@ impl<A: CloudApi + Send + Sync + 'static> CloudShared<A> {
         let registration = Registration::new(core, ControlKind::Cloud);
         let (api, ops) = self.control_operations(&registration).await?;
         let id = callback_id(callback_target(selector, &ops)?)?;
-        let request = self.begin_request()?;
-        let sent =
-            await_in_flight(&registration, request, api.send_callback_heartbeat(&id)).await?;
+        let request = self.begin_request();
+        let sent = await_in_flight(
+            &registration,
+            ControlRole::Callback,
+            request,
+            api.send_callback_heartbeat(&id),
+        )
+        .await?;
         self.finish_call(registration.id, request, sent.map_err(aws_error))
     }
 }
@@ -1603,9 +1712,20 @@ impl<A: CloudApi + Send + Sync + 'static> CloudControl for CloudShared<A> {
         selector: &'a Selector,
         status: WaitingStatus,
     ) -> ControlFuture<'a, TestOperation> {
-        Box::pin(
-            async move { core.commit(self.wait_for_data_outcome(core, selector, status).await) },
-        )
+        Box::pin(async move {
+            if self.invocation_type == InvocationType::RequestResponse {
+                return Err(TestRunnerError::Unsupported(
+                    WAIT_FOR_DATA_REQUEST_RESPONSE_UNSUPPORTED,
+                ));
+            }
+            // A call first polled after the run failed decides from the
+            // newest fold; one that started while the run was active
+            // commits its outcome against a run failure.
+            if let Some(late) = core.late_wait(selector, status) {
+                return late;
+            }
+            core.commit(self.wait_for_data_outcome(core, selector, status).await)
+        })
     }
 
     fn send_callback<'a>(
@@ -1614,9 +1734,9 @@ impl<A: CloudApi + Send + Sync + 'static> CloudControl for CloudShared<A> {
         selector: &'a Selector,
         reply: CallbackReply,
     ) -> ControlFuture<'a, ()> {
-        Box::pin(
-            async move { core.commit(self.send_callback_outcome(core, selector, reply).await) },
-        )
+        // A callback control returns its own outcome: once the target is
+        // published, it is independent of a run failure.
+        Box::pin(self.send_callback_outcome(core, selector, reply))
     }
 
     fn send_heartbeat<'a>(
@@ -1624,7 +1744,7 @@ impl<A: CloudApi + Send + Sync + 'static> CloudControl for CloudShared<A> {
         core: &'a RunCore,
         selector: &'a Selector,
     ) -> ControlFuture<'a, ()> {
-        Box::pin(async move { core.commit(self.send_heartbeat_outcome(core, selector).await) })
+        Box::pin(self.send_heartbeat_outcome(core, selector))
     }
 }
 

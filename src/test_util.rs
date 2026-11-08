@@ -2471,8 +2471,7 @@ impl LocalRunner {
     ///
     /// # Errors
     ///
-    /// Awaiting the handle returns these runner errors, and so does every
-    /// other future of the run:
+    /// Awaiting the handle returns these runner errors, the run failures:
     ///
     /// - [`TestRunnerError::EventSerialization`] when `event` does not
     ///   serialize.
@@ -2480,6 +2479,15 @@ impl LocalRunner {
     ///   succeeded execution does not decode into `O`.
     /// - [`TestRunnerError::UnexpectedEnvelope`] when a response envelope
     ///   has a status other than `SUCCEEDED`, `FAILED` and `PENDING`.
+    ///
+    /// A [`wait_for_data`](OperationHandle::wait_for_data) pending when the
+    /// run fails returns the run failure. One first polled after the run
+    /// failed returns the stored operation when it already reached the
+    /// requested status, and the run failure otherwise.
+    /// [`send_callback`](OperationHandle::send_callback),
+    /// [`send_callback_heartbeat`](OperationHandle::send_callback_heartbeat),
+    /// [`pause`](RunHandle::pause) and [`resume`](RunHandle::resume) return
+    /// the run failure.
     ///
     /// An invocation fault is not a runner error: the runner invokes again,
     /// as the service does.
@@ -3407,7 +3415,7 @@ impl CloudRunner {
     /// with [`ExecutionStatus::Running`]. A value of `0` counts as `1`.
     ///
     /// By default there is no limit: the runner polls until the execution
-    /// ends or a Lambda call fails.
+    /// ends or a `GetDurableExecution` poll fails.
     ///
     /// A poll counts once however many attempts it makes (see
     /// [`CloudRunner`]), and a history read of a live control counts once
@@ -3484,17 +3492,39 @@ impl CloudRunner {
     ///
     /// # Errors
     ///
-    /// Awaiting the handle returns these runner errors, and so does every
-    /// other future of the run:
+    /// Awaiting the handle returns these runner errors, the run failures.
+    /// Only the run's own calls cause one:
     ///
     /// - [`TestRunnerError::EventSerialization`] when `event` does not
     ///   serialize.
-    /// - [`TestRunnerError::Aws`] when `Invoke`, `GetDurableExecution` or
-    ///   `GetDurableExecutionHistory` fails.
+    /// - [`TestRunnerError::Aws`] when `Invoke` fails, when the third
+    ///   attempt of a `GetDurableExecution` poll fails, or when the history
+    ///   read that builds the [`TestResult`] fails.
     /// - [`TestRunnerError::NoExecutionArn`] when the invoke response has no
     ///   execution ARN.
     /// - [`TestRunnerError::OutputDeserialization`] when the output of a
     ///   succeeded execution does not decode into `O`.
+    ///
+    /// A [`wait_for_data`](OperationHandle::wait_for_data) pending when the
+    /// run fails returns the run failure. One first polled after the run
+    /// failed returns the operation in the newest history read when it
+    /// already reached the requested status, and the run failure otherwise.
+    ///
+    /// A [`send_callback`](OperationHandle::send_callback) or
+    /// [`send_callback_heartbeat`](OperationHandle::send_callback_heartbeat)
+    /// returns the run failure when the run fails before the invoke
+    /// returned the execution ARN. Once the ARN is known, it goes on after
+    /// a run failure and returns its own outcome.
+    ///
+    /// [`pause`](RunHandle::pause) and [`resume`](RunHandle::resume), every
+    /// control under [`InvocationType::RequestResponse`], and
+    /// [`CallbackReply::timeout`] and [`CallbackReply::heartbeat_timeout`]
+    /// return their [`TestRunnerError::Unsupported`] error, also after a run
+    /// failure.
+    ///
+    /// A failed history read or callback call of a control returns
+    /// [`TestRunnerError::Aws`] from that control only. It is not a run
+    /// failure: the run goes on, and the other controls are not affected.
     ///
     /// # Examples
     ///
@@ -6521,7 +6551,10 @@ fn render_update(update: &OperationUpdate) -> String {
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::live::{
-        ControlKind, ControlPhase, DriverFuture, HistoryStart, Registration, RunEnd,
+        CLOUD_PAUSE_UNSUPPORTED, CLOUD_TIMEOUT_REPLY_UNSUPPORTED, ControlKind, ControlPhase,
+        ControlRole, DriverFuture, HistoryStart, Registration, RunEnd,
+        SEND_CALLBACK_HEARTBEAT_REQUEST_RESPONSE_UNSUPPORTED,
+        SEND_CALLBACK_REQUEST_RESPONSE_UNSUPPORTED, WAIT_FOR_DATA_REQUEST_RESPONSE_UNSUPPORTED,
         await_in_flight, status_reached,
     };
     use super::*;
@@ -18910,7 +18943,8 @@ mod tests {
 
     /// A control that is ready, or no longer exists, is not registered and
     /// does not poll the driver. A control that is not ready is registered
-    /// and polls it. A terminal runner error makes every control ready.
+    /// and polls it. After a run failure no control registers, so none
+    /// polls the driver.
     #[test]
     fn a_ready_control_neither_registers_nor_polls() {
         let (backend, live) = live_backend();
@@ -19672,28 +19706,63 @@ mod tests {
         assert!(poll, "the result was already taken");
     }
 
+    /// A `LocalRunner` run that completes the step `s` and then returns an
+    /// output that does not decode. A wait pending when the run fails
+    /// returns that error. A later wait returns `s` for every status `s`
+    /// reached, and the error for an operation that never existed. The
+    /// callback, heartbeat, `pause` and `resume` controls keep returning
+    /// the error.
     #[tokio::test]
-    async fn output_deserialization_reaches_every_runner_future() {
+    async fn local_waits_after_run_failure_use_snapshot_first() {
         let mut run = LocalRunner::new().run(
-            |(), _ctx: DurableContext| async move { Ok::<_, BoxError>(SerializedAs::Text) },
+            |(), ctx: DurableContext| async move {
+                ctx.step(|_| async { Ok(1_u32) }).name("s").await?;
+                Ok::<_, BoxError>(SerializedAs::Text)
+            },
             (),
         );
         let s = run.operation("s");
-        let err = (&mut run).await.expect_err("the output does not decode");
+        let ghost = run.operation("ghost");
+        let (pending, end) = tokio::join!(ghost.wait_for_data(WaitingStatus::Started), &mut run);
+        let err = end.expect_err("the output does not decode");
         assert!(
             matches!(err, TestRunnerError::OutputDeserialization(_)),
             "{err:?}"
         );
-        let waited = s
-            .wait_for_data(WaitingStatus::Started)
-            .await
-            .expect_err("terminal error");
-        assert_eq!(waited.to_string(), err.to_string());
-        let paused = run
-            .pause()
-            .await
-            .expect_err("terminal error, not RunFinished");
-        assert_eq!(paused.to_string(), err.to_string());
+        assert_same_error(&pending.expect_err("the pending wait"), &err);
+        for status in [
+            WaitingStatus::Started,
+            WaitingStatus::Submitted,
+            WaitingStatus::Completed,
+        ] {
+            let op = s.wait_for_data(status).await.expect("stored data");
+            assert_eq!(op.status(), OperationStatus::Succeeded);
+            assert_eq!(op.name(), Some("s"));
+        }
+        assert_same_error(
+            &ghost
+                .wait_for_data(WaitingStatus::Started)
+                .await
+                .expect_err("never reached"),
+            &err,
+        );
+        assert_same_error(
+            &s.send_callback(CallbackReply::raw("1"))
+                .await
+                .expect_err("send_callback"),
+            &err,
+        );
+        assert_same_error(
+            &s.send_callback_heartbeat().await.expect_err("heartbeat"),
+            &err,
+        );
+        assert_same_error(&run.pause().await.expect_err("pause"), &err);
+        assert_same_error(&run.resume().await.expect_err("resume"), &err);
+        assert_eq!(
+            s.snapshot().map(|op| op.status()),
+            Some(OperationStatus::Succeeded),
+            "the failure keeps the records"
+        );
     }
 
     /// An output that serializes as a string and deserializes only from a
@@ -20074,30 +20143,46 @@ mod tests {
         assert_eq!(calls.last(), Some(&FakeCall::History));
     }
 
+    /// A waiter whose history read fails returns its own error, and the
+    /// run goes on. A waiter pending when a status poll fails on its third
+    /// attempt, and the `RunHandle`, return that run failure.
     #[tokio::test(start_paused = true)]
-    async fn cloud_aws_error_reaches_every_runner_future() {
+    async fn cloud_run_failure_is_not_replaced_by_a_control_failure() {
+        let running = || Ok(execution_output(WireExecutionStatus::Running, None));
         let api = Arc::new(
             FakeApi::new()
-                .with_history_pages(Vec::new())
-                .repeat_history(Err("fake history")),
+                .with_execution(running())
+                .with_execution(running())
+                .with_execution(running())
+                .with_execution(Err(fake_error("fake execution 1")))
+                .with_execution(Err(fake_error("fake execution 2")))
+                .with_execution(Err(fake_error("fake execution 3")))
+                .with_history_pages(vec![
+                    Err(fake_error("fake history 1")),
+                    Err(fake_error("fake history 2")),
+                    Err(fake_error("fake history 3")),
+                ])
+                .repeat_history(Ok(Vec::new())),
         );
+        let start = tokio::time::Instant::now();
         let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
-        let a = run.operation("a");
-        let b = run.operation("b");
-        let (result, a_done, b_done) = tokio::join!(
-            run,
-            a.wait_for_data(WaitingStatus::Started),
-            b.wait_for_data(WaitingStatus::Completed)
+        let approval = run.operation("approval");
+        let ghost = run.operation("ghost");
+        let (end, (own, pending)) = tokio::join!(run, async {
+            let own = approval.wait_for_data(WaitingStatus::Started).await;
+            let pending = ghost.wait_for_data(WaitingStatus::Completed).await;
+            (own, pending)
+        });
+        assert_aws(&own.expect_err("the waiter's read fails"), "fake history 3");
+        let end = end.expect_err("the status poll fails");
+        assert_aws(&end, "fake execution 3");
+        let pending = pending.expect_err("the pending waiter gets the run failure");
+        assert_aws(&pending, "fake execution 3");
+        assert_eq!(pending.to_string(), end.to_string());
+        assert_eq!(
+            api.execution_ms(start),
+            [1000, 2000, 3000, 4000, 5000, 6450]
         );
-        let errors = [
-            result.expect_err("run"),
-            a_done.expect_err("a"),
-            b_done.expect_err("b"),
-        ];
-        for err in &errors {
-            assert_aws(err, "fake history");
-            assert_eq!(err.to_string(), errors[0].to_string());
-        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -20419,7 +20504,8 @@ mod tests {
 
     /// A `ResourceNotFoundException` fails a history attempt as any error
     /// does, before and after the first successful read: a waiter retries it
-    /// twice, and the third one is the waiter's and the run's error.
+    /// twice, and the third one is that waiter's error only. A later waiter
+    /// still reads the history.
     #[tokio::test(start_paused = true)]
     async fn cloud_wait_for_data_retries_a_not_found() {
         let start = tokio::time::Instant::now();
@@ -20443,8 +20529,17 @@ mod tests {
             [1000, 2000, 3450, 4450, 5450, 6900],
             "six requests in all"
         );
-        let end = run.await.expect_err("the run gets the terminal error");
-        assert_eq!(end.to_string(), err.to_string());
+        let op = approval
+            .wait_for_data(WaitingStatus::Started)
+            .await
+            .expect("the run goes on");
+        assert_eq!(op.id(), "c");
+        assert_eq!(
+            api.read_ms(start),
+            [1000, 2000, 3450, 4450, 5450, 6900, 7900]
+        );
+        assert!(run.shared.terminal_error().is_none());
+        drop(run);
     }
 
     /// Three `ResourceNotFoundException` answers before the first read are
@@ -20464,25 +20559,38 @@ mod tests {
         drop(run);
     }
 
-    /// A waiter whose every history attempt fails returns the third error,
-    /// and so does the run, while the driver keeps its own pace.
+    /// A waiter whose every history attempt fails returns the third error.
+    /// It is the waiter's only: the driver keeps its one-second status
+    /// polls, and the run succeeds.
     #[tokio::test(start_paused = true)]
     async fn cloud_wait_for_data_history_error_is_aws() {
         let start = tokio::time::Instant::now();
-        let api = Arc::new(FakeApi::new().with_history_pages(vec![
-            Err(fake_error("fake history 1")),
-            Err(fake_error("fake history 2")),
-            Err(fake_error("fake history 3")),
-        ]));
+        let running = || Ok(execution_output(WireExecutionStatus::Running, None));
+        let api = Arc::new(
+            FakeApi::new()
+                .with_execution(running())
+                .with_execution(running())
+                .with_execution(running())
+                .with_execution(Ok(execution_output(
+                    WireExecutionStatus::Succeeded,
+                    Some("7"),
+                )))
+                .with_history_pages(vec![
+                    Err(fake_error("fake history 1")),
+                    Err(fake_error("fake history 2")),
+                    Err(fake_error("fake history 3")),
+                    Ok((Vec::new(), None)),
+                ]),
+        );
         let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
         let approval = run.operation("approval");
         let (result, waited) = tokio::join!(run, approval.wait_for_data(WaitingStatus::Started));
         let waited = waited.expect_err("the waiter fails");
         assert_aws(&waited, "fake history 3");
-        let result = result.expect_err("the run fails");
-        assert_aws(&result, "fake history 3");
-        assert_eq!(api.execution_ms(start), [1000, 2000, 3000]);
-        assert_eq!(api.history_ms(start), unmarked(&[1000, 2000, 3450]));
+        let result = result.expect("the run succeeds");
+        assert_eq!(result.output(), Some(&7));
+        assert_eq!(api.execution_ms(start), [1000, 2000, 3000, 4000]);
+        assert_eq!(api.history_ms(start), unmarked(&[1000, 2000, 3450, 4000]));
     }
 
     /// A fake whose callback calls fail with `fake success`, `fake failure`
@@ -20511,6 +20619,56 @@ mod tests {
             barrier,
             AtomicU32::new(0),
         ))
+    }
+
+    /// A [`failing_callbacks`] fake whose first status poll answers
+    /// `SUCCEEDED` with the output `7`.
+    fn failing_callbacks_then_success(
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    ) -> Arc<FailingCallbacks> {
+        let api = failing_callbacks(barrier);
+        api.0
+            .executions
+            .lock()
+            .expect("lock")
+            .push_back(Ok(execution_output(
+                WireExecutionStatus::Succeeded,
+                Some("7"),
+            )));
+        api
+    }
+
+    /// A [`FakeApi`] whose first three status poll attempts fail with
+    /// `fake execution 1`, `2` and `3`, so the poll at 1000 ms fails the
+    /// run at 3450 ms, and whose every history read returns a started
+    /// callback `approval`.
+    fn failing_polls() -> FakeApi {
+        FakeApi::new()
+            .with_execution(Err(fake_error("fake execution 1")))
+            .with_execution(Err(fake_error("fake execution 2")))
+            .with_execution(Err(fake_error("fake execution 3")))
+            .with_history_pages(Vec::new())
+            .repeat_history(Ok(callback_started_history()))
+    }
+
+    /// Asserts that `err` is `Unsupported` with `text`.
+    #[track_caller]
+    fn assert_unsupported(err: &TestRunnerError, text: &str) {
+        assert!(
+            matches!(err, TestRunnerError::Unsupported(t) if *t == text),
+            "{err:?}"
+        );
+    }
+
+    /// Asserts that `err` is `expected`: the same variant and text.
+    #[track_caller]
+    fn assert_same_error(err: &TestRunnerError, expected: &TestRunnerError) {
+        assert_eq!(
+            std::mem::discriminant(err),
+            std::mem::discriminant(expected),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), expected.to_string());
     }
 
     impl CloudApi for FailingCallbacks {
@@ -20554,15 +20712,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cloud_callback_error_is_aws() {
-        // Each callback API error is the run's terminal runner error: the
-        // call returns it, and so do the `RunHandle` and a later control.
+        // Each callback API error belongs to its call: the call returns it,
+        // a later control still works, and the run succeeds.
         for (case, text) in [
             (0_u8, "fake success"),
             (1, "fake failure"),
             (2, "fake heartbeat"),
         ] {
             let start = tokio::time::Instant::now();
-            let api = failing_callbacks(None);
+            let api = failing_callbacks_then_success(None);
             let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
             let approval = run.operation("approval");
             let err = match case {
@@ -20608,77 +20766,112 @@ mod tests {
             let later = approval
                 .wait_for_data(WaitingStatus::Started)
                 .await
-                .expect_err("a later control gets the terminal error");
-            assert_aws(&later, text);
-            let end = run.await.expect_err("the run gets the terminal error");
-            assert_aws(&end, text);
-            assert_eq!(end.to_string(), err.to_string());
+                .expect("a later wait reaches the callback");
+            assert_eq!(later.id(), "c");
+            let result = run.await.expect("the run succeeds");
+            assert!(result.is_success());
+            assert_eq!(result.output(), Some(&7));
+            assert_eq!(api.2.load(Ordering::SeqCst), 1, "no other callback call");
         }
     }
 
-    /// Every control of `run` and `approval`, in a fixed order: `pause`,
-    /// `resume`, `wait_for_data`, a raw reply, a timeout reply, a heartbeat
-    /// and the `RunHandle`.
-    async fn every_control_error(
-        run: &mut RunHandle<u32>,
-        approval: &OperationHandle,
-    ) -> Vec<TestRunnerError> {
-        vec![
-            run.pause().await.expect_err("pause"),
-            run.resume().await.expect_err("resume"),
-            approval
-                .wait_for_data(WaitingStatus::Started)
-                .await
-                .expect_err("wait_for_data"),
-            approval
-                .send_callback(CallbackReply::raw("1"))
-                .await
-                .expect_err("send_callback"),
-            approval
-                .send_callback(CallbackReply::timeout())
-                .await
-                .expect_err("timeout reply"),
-            approval
-                .send_callback_heartbeat()
-                .await
-                .expect_err("heartbeat"),
-            run.await.expect_err("run"),
-        ]
-    }
-
-    /// A `CloudRunner` whose event did not serialize returns that error from
-    /// every control, before the `Unsupported` errors of `pause`, `resume`,
-    /// a timeout reply and `RequestResponse`, and makes no AWS request.
+    /// The run failures before the invoke published the execution ARN:
+    /// an event that does not serialize, a failed `Invoke` and an invoke
+    /// response without an ARN. Under `InvocationType::Event` a wait and a
+    /// callback control return the run failure, because no target exists.
+    /// Under `RequestResponse` they return their `Unsupported` errors, and
+    /// so do timeout replies, `pause` and `resume` under both. No history or
+    /// callback call is made.
     #[tokio::test(start_paused = true)]
-    async fn cloud_pre_driver_error_wins_every_control() {
-        for runner in [event_runner(), CloudRunner::new("f")] {
-            let api = failing_callbacks(None);
-            let mut run = runner.start::<_, u32, _>(
-                {
-                    let api = Arc::clone(&api);
-                    async move { api }
-                },
-                serde_json::to_vec(&Unserializable),
-            );
-            let approval = run.operation("approval");
-            let errors = every_control_error(&mut run, &approval).await;
-            for err in &errors {
+    async fn cloud_pre_target_run_failures_keep_their_cause() {
+        for row in 0_u8..3 {
+            for runner in [event_runner(), CloudRunner::new("f")] {
+                let api = failing_callbacks(None);
+                let mut run = match row {
+                    0 => runner.start::<_, u32, _>(
+                        {
+                            let api = Arc::clone(&api);
+                            async move { api }
+                        },
+                        serde_json::to_vec(&Unserializable),
+                    ),
+                    1 => {
+                        *api.0.invoke.lock().expect("lock") = Some(Err(fake_error("fake invoke")));
+                        runner.run_with::<_, u32>(Arc::clone(&api), Vec::new())
+                    }
+                    _ => {
+                        *api.0.invoke.lock().expect("lock") = Some(Ok(invoke_output(None)));
+                        runner.run_with::<_, u32>(Arc::clone(&api), Vec::new())
+                    }
+                };
+                let approval = run.operation("approval");
+                let end = (&mut run).await.expect_err("the run fails");
+                match row {
+                    0 => assert!(
+                        matches!(end, TestRunnerError::EventSerialization(_)),
+                        "{end:?}"
+                    ),
+                    1 => assert_aws(&end, "fake invoke"),
+                    _ => assert!(matches!(end, TestRunnerError::NoExecutionArn), "{end:?}"),
+                }
+                let wait = approval
+                    .wait_for_data(WaitingStatus::Started)
+                    .await
+                    .expect_err("wait_for_data");
+                let send = approval
+                    .send_callback(CallbackReply::raw("1"))
+                    .await
+                    .expect_err("send_callback");
+                let heartbeat = approval
+                    .send_callback_heartbeat()
+                    .await
+                    .expect_err("heartbeat");
+                let event = runner.invocation_type == InvocationType::Event;
+                if event {
+                    for err in [&wait, &send, &heartbeat] {
+                        assert_same_error(err, &end);
+                    }
+                } else {
+                    assert_unsupported(&wait, WAIT_FOR_DATA_REQUEST_RESPONSE_UNSUPPORTED);
+                    assert_unsupported(&send, SEND_CALLBACK_REQUEST_RESPONSE_UNSUPPORTED);
+                    assert_unsupported(
+                        &heartbeat,
+                        SEND_CALLBACK_HEARTBEAT_REQUEST_RESPONSE_UNSUPPORTED,
+                    );
+                }
+                for reply in [CallbackReply::timeout(), CallbackReply::heartbeat_timeout()] {
+                    let err = approval.send_callback(reply).await.expect_err("timeout");
+                    let text = if event {
+                        CLOUD_TIMEOUT_REPLY_UNSUPPORTED
+                    } else {
+                        SEND_CALLBACK_REQUEST_RESPONSE_UNSUPPORTED
+                    };
+                    assert_unsupported(&err, text);
+                }
+                for err in [
+                    run.pause().await.expect_err("pause"),
+                    run.resume().await.expect_err("resume"),
+                ] {
+                    assert_unsupported(&err, CLOUD_PAUSE_UNSUPPORTED);
+                }
+                assert_same_error(&(&mut run).await.expect_err("the run failure"), &end);
+                let calls = api.0.calls();
                 assert!(
-                    matches!(err, TestRunnerError::EventSerialization(_)),
-                    "{err:?}"
+                    calls.iter().all(|call| matches!(call, FakeCall::Invoke)),
+                    "{calls:?}"
                 );
-                assert_eq!(err.to_string(), errors[0].to_string());
+                assert_eq!(api.2.load(Ordering::SeqCst), 0);
             }
-            assert_eq!(api.0.calls(), Vec::<FakeCall>::new());
-            assert_eq!(api.2.load(Ordering::SeqCst), 0);
         }
     }
 
     /// A callback API failure after the driver returned a `Running` result
-    /// (its poll budget spent) is still the run's terminal error: every later
-    /// control returns it, before `Unsupported`, and makes no AWS request.
+    /// (its poll budget spent) fails only that call. A heartbeat fails with
+    /// its own error, a reached wait reads the last fold, the `Unsupported`
+    /// controls keep their errors, and the consumed `RunHandle` stays
+    /// pending.
     #[tokio::test(start_paused = true)]
-    async fn cloud_callback_error_after_the_result_is_terminal() {
+    async fn cloud_callback_error_after_the_result_fails_only_that_call() {
         let api = failing_callbacks(None);
         let mut run = event_runner()
             .max_poll_attempts(2)
@@ -20690,59 +20883,340 @@ mod tests {
             .expect("started");
         let result = (&mut run).await.expect("the result");
         assert_eq!(result.status(), ExecutionStatus::Running);
+        let history = history_fetches(&api.0.calls());
         let err = approval
             .send_callback(CallbackReply::raw("1"))
             .await
             .expect_err("the callback call fails");
         assert_aws(&err, "fake success");
-        let calls = api.0.calls();
-        let callback_calls = api.2.load(Ordering::SeqCst);
-        let errors = every_control_error(&mut run, &approval).await;
-        for later in &errors {
-            assert_aws(later, "fake success");
+        let err = approval
+            .send_callback_heartbeat()
+            .await
+            .expect_err("the heartbeat fails");
+        assert_aws(&err, "fake heartbeat");
+        assert_eq!(api.2.load(Ordering::SeqCst), 2, "both calls were made");
+        let op = approval
+            .wait_for_data(WaitingStatus::Started)
+            .await
+            .expect("the last fold");
+        assert_eq!(op.id(), "c");
+        assert_eq!(
+            history_fetches(&api.0.calls()),
+            history,
+            "the spent budget starts no read"
+        );
+        let err = approval
+            .send_callback(CallbackReply::timeout())
+            .await
+            .expect_err("timeout reply");
+        assert_unsupported(&err, CLOUD_TIMEOUT_REPLY_UNSUPPORTED);
+        for err in [
+            run.pause().await.expect_err("pause"),
+            run.resume().await.expect_err("resume"),
+        ] {
+            assert_unsupported(&err, CLOUD_PAUSE_UNSUPPORTED);
         }
-        assert_eq!(api.0.calls(), calls, "no later AWS request");
-        assert_eq!(api.2.load(Ordering::SeqCst), callback_calls);
+        assert!(run.shared.terminal_error().is_none());
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(Pin::new(&mut run).poll(cx).is_pending())
+        })
+        .await;
+        assert!(pending, "the result was already taken");
     }
 
-    /// Two callback calls that fail together return the same error: the
-    /// first one recorded, which the `RunHandle` returns too.
+    /// Two callback calls that fail together return their own errors: both
+    /// calls are made, and the run succeeds.
     #[tokio::test(start_paused = true)]
-    async fn cloud_competing_callback_errors_return_the_first() {
-        let api = failing_callbacks(Some(Arc::new(tokio::sync::Barrier::new(2))));
+    async fn cloud_concurrent_callback_errors_are_separate() {
+        let api = failing_callbacks_then_success(Some(Arc::new(tokio::sync::Barrier::new(2))));
         let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
         let approval = run.operation("approval");
         let (success, failure) = tokio::join!(
             approval.send_callback(CallbackReply::raw("1")),
             approval.send_callback(CallbackReply::failure(CallbackFailure::default())),
         );
-        let success = success.expect_err("success fails");
-        let failure = failure.expect_err("failure fails");
+        assert_aws(&success.expect_err("success fails"), "fake success");
+        assert_aws(&failure.expect_err("failure fails"), "fake failure");
         assert_eq!(api.2.load(Ordering::SeqCst), 2, "both calls were sent");
-        assert_eq!(success.to_string(), failure.to_string());
-        let end = run.await.expect_err("the run gets the terminal error");
-        assert_eq!(end.to_string(), success.to_string());
+        let calls = api.0.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, FakeCall::CallbackSuccess(..)))
+                && calls
+                    .iter()
+                    .any(|call| matches!(call, FakeCall::CallbackFailure(..))),
+            "{calls:?}"
+        );
+        let result = run.await.expect("the run succeeds");
+        assert_eq!(result.output(), Some(&7));
     }
 
-    /// A fake whose callback history is that of [`failing_callbacks`], and
-    /// whose heartbeat fails with `fake heartbeat`. One call is held at a
-    /// gate after it signals `entered`: the history read with the 0-based
+    /// A callback whose history read fails on its third attempt returns
+    /// that error and makes no callback call. A second callback reads the
+    /// history at once and sends its reply, and the run succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_callback_history_error_fails_only_that_call() {
+        let start = tokio::time::Instant::now();
+        let running = || Ok(execution_output(WireExecutionStatus::Running, None));
+        let api = Arc::new(
+            FakeApi::new()
+                .with_execution(running())
+                .with_execution(running())
+                .with_execution(Ok(execution_output(
+                    WireExecutionStatus::Succeeded,
+                    Some("7"),
+                )))
+                .with_history_pages(vec![
+                    Err(fake_error("fake history 1")),
+                    Err(fake_error("fake history 2")),
+                    Err(fake_error("fake history 3")),
+                ])
+                .repeat_history(Ok(callback_started_history())),
+        );
+        let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
+        let approval = run.operation("approval");
+        let err = approval
+            .send_callback(CallbackReply::raw("1"))
+            .await
+            .expect_err("the history read fails");
+        assert_aws(&err, "fake history 3");
+        assert_eq!(api.history_ms(start), unmarked(&[0, 1000, 2450]));
+        assert!(
+            !api.calls()
+                .iter()
+                .any(|call| matches!(call, FakeCall::CallbackSuccess(..))),
+            "no callback call"
+        );
+        approval
+            .send_callback(CallbackReply::raw("2"))
+            .await
+            .expect("the second reply is sent");
+        assert_eq!(api.history_ms(start), unmarked(&[0, 1000, 2450, 2450]));
+        assert_eq!(
+            api.calls().last(),
+            Some(&FakeCall::CallbackSuccess("cb-1".to_owned(), b"2".to_vec()))
+        );
+        let result = run.await.expect("the run succeeds");
+        assert_eq!(result.output(), Some(&7));
+    }
+
+    /// After a run failure past the invoke, a late wait decides from the
+    /// last fold: for each of a status poll that fails on its third
+    /// attempt, a failed final history read and an output that does not
+    /// decode, a wait for a reached status returns the stored operation and
+    /// one for an unreached status returns the run failure. Neither makes a
+    /// Lambda call or spends a poll.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_late_wait_after_post_target_failure_uses_the_last_fold() {
+        for row in 0_u8..3 {
+            let api = Arc::new(match row {
+                0 => failing_polls(),
+                1 => FakeApi::new()
+                    .with_execution(Ok(execution_output(
+                        WireExecutionStatus::Succeeded,
+                        Some("7"),
+                    )))
+                    .with_history_pages(vec![Ok((callback_started_history(), None))])
+                    .repeat_history(Err("fake final")),
+                _ => FakeApi::new()
+                    .with_execution(Ok(execution_output(
+                        WireExecutionStatus::Succeeded,
+                        Some("\"text\""),
+                    )))
+                    .with_history_pages(Vec::new())
+                    .repeat_history(Ok(callback_started_history())),
+            });
+            let mut run = event_runner()
+                .max_poll_attempts(10)
+                .run_with::<_, u32>(Arc::clone(&api), Vec::new());
+            let approval = run.operation("approval");
+            approval
+                .send_callback_heartbeat()
+                .await
+                .expect("the heartbeat stores a fold");
+            let end = (&mut run).await.expect_err("the run fails");
+            match row {
+                0 => assert_aws(&end, "fake execution 3"),
+                1 => assert_aws(&end, "fake final"),
+                _ => assert!(
+                    matches!(end, TestRunnerError::OutputDeserialization(_)),
+                    "{end:?}"
+                ),
+            }
+            let calls = api.calls();
+            let used = run.shared.live.lock().cloud.used;
+            let op = approval
+                .wait_for_data(WaitingStatus::Started)
+                .await
+                .expect("the fold reaches Started");
+            assert_eq!(op.id(), "c");
+            let err = approval
+                .wait_for_data(WaitingStatus::Completed)
+                .await
+                .expect_err("the fold does not reach Completed");
+            assert_same_error(&err, &end);
+            assert_eq!(api.calls(), calls, "row {row}: no Lambda call");
+            assert_eq!(run.shared.live.lock().cloud.used, used, "no poll spent");
+        }
+    }
+
+    /// The fake behind a [`post_failure_callbacks`] row.
+    trait Recorded {
+        fn fake(&self) -> &FakeApi;
+    }
+
+    impl Recorded for FakeApi {
+        fn fake(&self) -> &FakeApi {
+            self
+        }
+    }
+
+    impl Recorded for FailingCallbacks {
+        fn fake(&self) -> &FakeApi {
+            &self.0
+        }
+    }
+
+    /// How much poll budget a [`post_failure_callbacks`] row leaves.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Budget {
+        /// No limit: a callback control reads the history.
+        Remaining,
+        /// Spent, after a wait stored a fold.
+        SpentWithFold,
+        /// Spent by the driver's one poll, with no fold.
+        SpentWithoutFold,
+    }
+
+    /// Runs `api`, whose status poll at 1000 ms fails the run, with
+    /// `budget`, then sends a success reply, a failure reply and a
+    /// heartbeat, and checks each control's calls. With budget remaining,
+    /// it also checks that a read made after the run failure became the
+    /// fold that `snapshot()` returns. Returns the controls' outcomes.
+    async fn post_failure_callbacks<A>(
+        api: Arc<A>,
+        budget: Budget,
+    ) -> Vec<Result<(), TestRunnerError>>
+    where
+        A: CloudApi + Recorded + Send + Sync + 'static,
+    {
+        let runner = match budget {
+            Budget::Remaining => event_runner(),
+            Budget::SpentWithFold => event_runner().max_poll_attempts(2),
+            Budget::SpentWithoutFold => event_runner().max_poll_attempts(1),
+        };
+        let mut run = runner.run_with::<_, u32>(Arc::clone(&api), Vec::new());
+        let approval = run.operation("approval");
+        if budget == Budget::SpentWithFold {
+            approval
+                .wait_for_data(WaitingStatus::Started)
+                .await
+                .expect("the wait stores a fold");
+        }
+        let end = (&mut run).await.expect_err("the run fails");
+        assert_aws(&end, "fake execution 3");
+        if budget == Budget::Remaining {
+            assert!(
+                approval.snapshot().is_none(),
+                "no fold before the callbacks"
+            );
+        }
+        let mut outcomes = Vec::new();
+        for case in 0_u8..3 {
+            let before = api.fake().calls().len();
+            outcomes.push(match case {
+                0 => approval.send_callback(CallbackReply::raw("1")).await,
+                1 => {
+                    approval
+                        .send_callback(CallbackReply::failure(CallbackFailure::default()))
+                        .await
+                }
+                _ => approval.send_callback_heartbeat().await,
+            });
+            let calls = api.fake().calls();
+            let new = calls.get(before..).expect("later calls");
+            let read = budget == Budget::Remaining;
+            let made = match (case, new) {
+                (_, []) => budget == Budget::SpentWithoutFold,
+                (0, [FakeCall::History, FakeCall::CallbackSuccess(id, payload)]) => {
+                    read && id == "cb-1" && payload == b"1"
+                }
+                (0, [FakeCall::CallbackSuccess(id, payload)]) => {
+                    !read && id == "cb-1" && payload == b"1"
+                }
+                (1, [FakeCall::History, FakeCall::CallbackFailure(id, _)])
+                | (2, [FakeCall::History, FakeCall::Heartbeat(id)]) => read && id == "cb-1",
+                (1, [FakeCall::CallbackFailure(id, _)]) | (2, [FakeCall::Heartbeat(id)]) => {
+                    !read && id == "cb-1"
+                }
+                _ => false,
+            };
+            assert!(made, "{budget:?} case {case}: {new:?}");
+        }
+        if budget == Budget::Remaining {
+            // A successful read after the run failure became the fold.
+            assert_eq!(
+                approval.snapshot().map(|op| op.id().to_owned()).as_deref(),
+                Some("c"),
+                "the post-failure read is the fold"
+            );
+        }
+        assert_same_error(&(&mut run).await.expect_err("the run failure stays"), &end);
+        outcomes
+    }
+
+    /// After a run failure past the invoke, a callback control follows its
+    /// normal path: it reads the history while budget remains, else uses
+    /// the last fold, makes its callback call and returns its own outcome.
+    /// With the budget spent and no fold it returns `OperationNotFound`
+    /// without a call. The `RunHandle` keeps the run failure.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_callback_started_after_run_failure_returns_its_own_outcome() {
+        for budget in [Budget::Remaining, Budget::SpentWithFold] {
+            for outcome in post_failure_callbacks(Arc::new(failing_polls()), budget).await {
+                outcome.expect("the callback call succeeds");
+            }
+            let api = Arc::new(FailingCallbacks(failing_polls(), None, AtomicU32::new(0)));
+            let outcomes = post_failure_callbacks(Arc::clone(&api), budget).await;
+            for (outcome, text) in
+                outcomes
+                    .iter()
+                    .zip(["fake success", "fake failure", "fake heartbeat"])
+            {
+                assert_aws(outcome.as_ref().expect_err("the call fails"), text);
+            }
+            assert_eq!(api.2.load(Ordering::SeqCst), 3);
+        }
+        for outcome in
+            post_failure_callbacks(Arc::new(failing_polls()), Budget::SpentWithoutFold).await
+        {
+            let err = outcome.expect_err("no fold");
+            assert!(matches!(err, TestRunnerError::OperationNotFound), "{err:?}");
+        }
+    }
+
+    /// A fake whose status polls and history are those of
+    /// [`failing_polls`], and whose heartbeat fails with `fake heartbeat`.
+    /// With `fail_success`, a callback success call fails with
+    /// `fake success` after the inner fake recorded it. One call is held at
+    /// a gate after it signals `entered`: the history read with the 0-based
     /// index `gate_history`, or, without one, every callback success call.
     struct GatedApi {
         inner: FakeApi,
         gate_history: Option<usize>,
+        fail_success: bool,
         history_reads: std::sync::atomic::AtomicUsize,
         gate: tokio::sync::Semaphore,
         entered: tokio::sync::Notify,
     }
 
     impl GatedApi {
-        fn new(gate_history: Option<usize>) -> Self {
+        fn new(gate_history: Option<usize>, fail_success: bool) -> Self {
             Self {
-                inner: FakeApi::new()
-                    .with_history_pages(Vec::new())
-                    .repeat_history(Ok(callback_started_history())),
+                inner: failing_polls(),
                 gate_history,
+                fail_success,
                 history_reads: std::sync::atomic::AtomicUsize::new(0),
                 gate: tokio::sync::Semaphore::new(0),
                 entered: tokio::sync::Notify::new(),
@@ -20782,7 +21256,11 @@ mod tests {
             if self.gate_history.is_none() {
                 self.hold().await;
             }
-            self.inner.send_callback_success(id, result).await
+            self.inner.send_callback_success(id, result).await?;
+            if self.fail_success {
+                return Err(fake_error("fake success"));
+            }
+            Ok(())
         }
         async fn send_callback_failure(
             &self,
@@ -20797,58 +21275,65 @@ mod tests {
         }
     }
 
-    /// A control whose Lambda call is outstanding when another runner future
-    /// records the run's terminal error returns that error: when the call
-    /// then succeeds, and when it never answers.
+    /// A wait whose history read is outstanding when a status poll fails
+    /// the run returns the run failure and drops the read. A callback whose
+    /// history read or callback call is outstanding then stays pending while
+    /// the call is held, and once it is released returns its own outcome.
     #[tokio::test(start_paused = true)]
-    async fn cloud_outstanding_calls_return_the_terminal_error() {
-        for (gate_history, released) in [
+    async fn cloud_outstanding_controls_follow_the_run_failure_rules() {
+        let api = Arc::new(GatedApi::new(Some(0), false));
+        let mut run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
+        let approval = run.operation("approval");
+        let (end, waited) = tokio::join!(&mut run, approval.wait_for_data(WaitingStatus::Started));
+        let end = end.expect_err("the status poll fails");
+        assert_aws(&end, "fake execution 3");
+        assert_same_error(&waited.expect_err("the waiter gets the run failure"), &end);
+        api.gate.add_permits(1);
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert_eq!(
+            api.inner.history_calls(),
+            Vec::<HistoryCall>::new(),
+            "the held read was dropped"
+        );
+
+        for (gate_history, fail_success) in [
             (Some(0), false),
             (Some(0), true),
             (None, false),
             (None, true),
         ] {
-            let api = Arc::new(GatedApi::new(gate_history));
-            let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
+            let api = Arc::new(GatedApi::new(gate_history, fail_success));
+            let mut run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
             let approval = run.operation("approval");
-            // A history read of `wait_for_data` that would find `approval`
-            // started, or a callback success call that would succeed.
-            let outstanding = async {
-                if gate_history.is_some() {
-                    approval
-                        .wait_for_data(WaitingStatus::Started)
-                        .await
-                        .map(|_| ())
-                } else {
-                    approval.send_callback(CallbackReply::raw("1")).await
-                }
-            };
-            let failing = async {
-                api.entered.notified().await;
-                let err = approval
-                    .send_callback_heartbeat()
+            let send = approval.send_callback(CallbackReply::raw("1"));
+            let mut send = std::pin::pin!(send);
+            tokio::select! {
+                biased;
+                outcome = &mut send => panic!("the call is held: {outcome:?}"),
+                () = api.entered.notified() => {}
+            }
+            let end = (&mut run).await.expect_err("the status poll fails");
+            assert_aws(&end, "fake execution 3");
+            let case = format!("{gate_history:?}/{fail_success}");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(3600), &mut send)
                     .await
-                    .expect_err("the heartbeat fails");
-                if released {
-                    api.gate.add_permits(1);
-                }
-                err
-            };
-            let (outstanding, err) =
-                tokio::time::timeout(std::time::Duration::from_secs(3600), async {
-                    tokio::join!(outstanding, failing)
-                })
-                .await
-                .expect("the outstanding call returns");
-            assert_aws(&err, "fake heartbeat");
-            let outstanding = outstanding.expect_err("the outstanding call gets the error");
-            assert_eq!(
-                outstanding.to_string(),
-                err.to_string(),
-                "case {gate_history:?}/{released}"
+                    .is_err(),
+                "{case}: the callback stays pending while its call is held"
             );
-            let end = run.await.expect_err("the run gets the terminal error");
-            assert_eq!(end.to_string(), err.to_string());
+            api.gate.add_permits(1);
+            let outcome = send.await;
+            if fail_success {
+                assert_aws(&outcome.expect_err("the call fails"), "fake success");
+            } else {
+                outcome.expect("the call succeeds");
+            }
+            assert_eq!(
+                api.inner.calls().last(),
+                Some(&FakeCall::CallbackSuccess("cb-1".to_owned(), b"1".to_vec())),
+                "{case}"
+            );
+            assert_same_error(&(&mut run).await.expect_err("the run failure stays"), &end);
         }
     }
 
@@ -21118,8 +21603,8 @@ mod tests {
     }
 
     /// Arms the commit seam of `run`: the next runner future that commits an
-    /// outcome finds this terminal error recorded just before its commit, as
-    /// another runner future of the run would record it.
+    /// outcome finds this run failure recorded just before its commit, as a
+    /// concurrent failure of the run would record it.
     fn fail_at_next_commit<O>(run: &RunHandle<O>) {
         run.shared.live.lock().fail_at_commit = Some(TestRunnerError::NoExecutionArn);
     }
@@ -21127,7 +21612,7 @@ mod tests {
     /// Asserts that `outcome` is the error [`fail_at_next_commit`] records.
     #[track_caller]
     fn assert_failure_won<T: std::fmt::Debug>(outcome: Result<T, TestRunnerError>) {
-        let err = outcome.expect_err("the terminal error wins");
+        let err = outcome.expect_err("the run failure wins");
         assert!(matches!(err, TestRunnerError::NoExecutionArn), "{err:?}");
     }
 
@@ -21143,10 +21628,12 @@ mod tests {
         (run, c)
     }
 
-    /// A terminal error recorded after a `wait_for_data` became ready, and
-    /// before it returned, is what it returns.
-    #[tokio::test]
-    async fn a_terminal_error_before_commit_beats_a_ready_waiter() {
+    /// A run failure recorded after a `wait_for_data` that started while the
+    /// run was active became ready, and before it returned, is what it
+    /// returns, under `LocalRunner` and under `CloudRunner`. A wait first
+    /// polled after that failure returns the reached data.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_failure_before_wait_commit_beats_ready_data() {
         let (run, c) = paused_callback_run().await;
         let mut waiter = std::pin::pin!(c.wait_for_data(WaitingStatus::Completed));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -21170,14 +21657,33 @@ mod tests {
                 poll,
                 std::task::Poll::Ready(Err(TestRunnerError::NoExecutionArn))
             ),
-            "a ready waiter returns the terminal error: {poll:?}"
+            "a ready waiter returns the run failure: {poll:?}"
         );
+        let op = c
+            .wait_for_data(WaitingStatus::Completed)
+            .await
+            .expect("a later wait returns the reached data");
+        assert_eq!(op.status(), OperationStatus::Succeeded);
+
+        let api = fake_with_history(callback_started_history());
+        let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
+        let approval = run.operation("approval");
+        fail_at_next_commit(&run);
+        assert_failure_won(approval.wait_for_data(WaitingStatus::Started).await);
+        assert_eq!(history_fetches(&api.calls()), 1);
+        let op = approval
+            .wait_for_data(WaitingStatus::Started)
+            .await
+            .expect("a later wait returns the last fold");
+        assert_eq!(op.id(), "c");
+        assert_eq!(history_fetches(&api.calls()), 1, "no further read");
     }
 
-    /// The same holds for every other outcome of a `LocalRunner` control:
-    /// a reached status, a not-reached status, a reply, a refused reply, a
-    /// heartbeat, `pause` and `resume`. A control whose outcome loses
-    /// changes nothing.
+    /// A run failure recorded just before the commit also wins over every
+    /// other outcome of a `LocalRunner` control that started while the run
+    /// was active: a reached status, a not-reached status, a reply, a
+    /// refused reply, a heartbeat, `pause` and `resume`. A control whose
+    /// outcome loses changes nothing.
     #[tokio::test]
     async fn a_terminal_error_before_commit_beats_every_local_control() {
         let (run, c) = paused_callback_run().await;
@@ -21228,8 +21734,8 @@ mod tests {
         assert_failure_won(ghost.wait_for_data(WaitingStatus::Started).await);
     }
 
-    /// A `pause` that waits for its invocation to end returns a terminal
-    /// error recorded after that end and before it returned.
+    /// A `LocalRunner` `pause` that waits for its invocation to end returns
+    /// a run failure recorded after that end and before it returned.
     #[test]
     fn a_terminal_error_before_commit_beats_a_ready_pause() {
         let live = new_live();
@@ -21248,71 +21754,66 @@ mod tests {
                 poll,
                 std::task::Poll::Ready(Err(TestRunnerError::NoExecutionArn))
             ),
-            "a ready pause returns the terminal error: {poll:?}"
+            "a ready pause returns the run failure: {poll:?}"
         );
     }
 
-    /// Every `CloudRunner` control returns a terminal error recorded after
-    /// its history read, its validation or its callback call, and before it
-    /// returned: a reached status, a reply, a refused reply, a heartbeat,
-    /// an `Unsupported` control and `pause`.
+    /// A `CloudRunner` callback control, a `RequestResponse` wait and
+    /// `pause` commit nothing, so a concurrent run failure armed at the next
+    /// commit changes none of their outcomes: a reply, a refused reply, a
+    /// heartbeat and the `Unsupported` errors.
     #[tokio::test(start_paused = true)]
-    async fn a_terminal_error_before_commit_beats_every_cloud_control() {
+    async fn cloud_callbacks_return_their_own_outcome_past_a_run_failure() {
         let api = fake_with_history(callback_started_history());
         let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
         fail_at_next_commit(&run);
-        assert_failure_won(
-            run.operation("approval")
-                .wait_for_data(WaitingStatus::Started)
-                .await,
-        );
-        assert_eq!(history_fetches(&api.calls()), 1);
-
-        let api = fake_with_history(callback_started_history());
-        let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
-        fail_at_next_commit(&run);
-        assert_failure_won(
-            run.operation("approval")
-                .send_callback(CallbackReply::raw("1"))
-                .await,
-        );
+        run.operation("approval")
+            .send_callback(CallbackReply::raw("1"))
+            .await
+            .expect("the reply is sent");
         assert_eq!(
             api.calls().last(),
             Some(&FakeCall::CallbackSuccess("cb-1".to_owned(), b"1".to_vec()))
         );
-
-        let api = fake_with_history(callback_started_history());
-        let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
-        fail_at_next_commit(&run);
-        assert_failure_won(
-            run.operation("ghost")
-                .send_callback(CallbackReply::raw("1"))
-                .await,
-        );
-
-        let api = fake_with_history(callback_started_history());
-        let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
-        fail_at_next_commit(&run);
-        assert_failure_won(run.operation("approval").send_callback_heartbeat().await);
+        let err = run
+            .operation("ghost")
+            .send_callback(CallbackReply::raw("1"))
+            .await
+            .expect_err("no such operation");
+        assert!(matches!(err, TestRunnerError::OperationNotFound), "{err:?}");
+        run.operation("approval")
+            .send_callback_heartbeat()
+            .await
+            .expect("the heartbeat is sent");
         assert_eq!(
             api.calls().last(),
             Some(&FakeCall::Heartbeat("cb-1".to_owned()))
         );
+        assert_unsupported(
+            &run.pause().await.expect_err("pause"),
+            CLOUD_PAUSE_UNSUPPORTED,
+        );
+        assert!(
+            run.shared.live.lock().fail_at_commit.is_some(),
+            "not consumed"
+        );
+        assert!(run.shared.terminal_error().is_none());
 
         let api = fake_with_history(callback_started_history());
         let run = CloudRunner::new("f").run_with::<_, u32>(Arc::clone(&api), Vec::new());
         fail_at_next_commit(&run);
-        assert_failure_won(
-            run.operation("approval")
+        assert_unsupported(
+            &run.operation("approval")
                 .wait_for_data(WaitingStatus::Started)
-                .await,
+                .await
+                .expect_err("RequestResponse"),
+            WAIT_FOR_DATA_REQUEST_RESPONSE_UNSUPPORTED,
         );
         assert_eq!(api.calls(), Vec::<FakeCall>::new());
-
-        let api = fake_with_history(callback_started_history());
-        let run = event_runner().run_with::<_, u32>(Arc::clone(&api), Vec::new());
-        fail_at_next_commit(&run);
-        assert_failure_won(run.pause().await);
+        assert!(
+            run.shared.live.lock().fail_at_commit.is_some(),
+            "not consumed"
+        );
     }
 
     /// A handler that creates the callback `c` with a heartbeat timeout,
@@ -21383,8 +21884,8 @@ mod tests {
     #[test]
     fn an_older_history_read_does_not_replace_a_newer_fold() {
         let (core, cloud) = cloud_core();
-        let older = cloud.begin_request().expect("ticket");
-        let newer = cloud.begin_request().expect("ticket");
+        let older = cloud.begin_request();
+        let newer = cloud.begin_request();
         cloud
             .finish_history(
                 None,
@@ -21407,94 +21908,255 @@ mod tests {
         );
     }
 
-    /// Two Lambda calls that fail in a known order: both controls and the
-    /// run observe the first error, and no later call starts.
+    /// A failed callback call and a failed history read of two controls
+    /// return their own errors and record no run failure. The failed read
+    /// leaves the fold as it is, and later reads and calls still start.
     #[test]
-    fn the_first_cloud_error_wins_for_every_control() {
+    fn failed_cloud_calls_do_not_record_a_run_failure() {
         let (core, cloud) = cloud_core();
         let first = core.live.lock().add_control(ControlKind::Cloud);
         let second = core.live.lock().add_control(ControlKind::Cloud);
-        let one = cloud.begin_request().expect("ticket");
-        let two = cloud.begin_request().expect("ticket");
+        let read = cloud.begin_request();
+        cloud
+            .finish_history(None, read, Ok(vec![step_s_event(EventType::StepStarted)]))
+            .expect("a fold");
+        let one = cloud.begin_request();
+        let two = cloud.begin_request();
         let err = |text: &str| aws_error(Box::new(std::io::Error::other(text.to_owned())));
         let a = cloud
             .finish_call(first, one, Err(err("first")))
             .expect_err("failed");
         let b = cloud
-            .finish_history(Some(second), two, Err(err("second")))
+            .finish_history(
+                Some((second, ControlRole::Callback)),
+                two,
+                Err(err("second")),
+            )
             .expect_err("failed");
-        for e in [a, b, core.terminal_error().expect("recorded")] {
-            assert!(e.to_string().ends_with("first"), "{e}");
+        assert!(a.to_string().ends_with("first"), "{a}");
+        assert!(b.to_string().ends_with("second"), "{b}");
+        assert!(core.terminal_error().is_none(), "no run failure");
+        let fold = core.operations().expect("the fold stays");
+        assert_eq!(
+            fold.first().map(|op| op.status),
+            Some(OperationStatus::Started)
+        );
+        assert_eq!(core.live.lock().cloud.fold_request, read);
+        for role in [ControlRole::Wait, ControlRole::Callback] {
+            assert!(matches!(
+                cloud.begin_history(role),
+                Ok(HistoryStart::Read(ticket)) if ticket > two
+            ));
         }
-        assert!(matches!(
-            cloud.begin_history(false, true),
-            Err(TestRunnerError::Aws(_))
-        ));
-        assert!(matches!(
-            cloud.begin_request(),
-            Err(TestRunnerError::Aws(_))
-        ));
+        assert!(cloud.begin_request() > two);
     }
 
-    /// A control whose Lambda call never answers is woken by a failure
-    /// another control records, and returns it.
+    /// A pending wait whose Lambda call never answers is woken by a run
+    /// failure, and returns it. A callback control is woken too, and keeps
+    /// awaiting its call.
     #[test]
     fn a_failure_wakes_an_in_flight_call() {
+        for role in [ControlRole::Wait, ControlRole::Callback] {
+            let (core, cloud) = cloud_core();
+            let registration = Registration::new(&core, ControlKind::Cloud);
+            let request = cloud.begin_request();
+            let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let waker = std::task::Waker::from(Arc::new(FlagWaker(Arc::clone(&woken))));
+            let mut cx = std::task::Context::from_waker(&waker);
+            let mut call = std::pin::pin!(await_in_flight(
+                &registration,
+                role,
+                request,
+                std::future::pending::<()>()
+            ));
+            assert!(call.as_mut().poll(&mut cx).is_pending());
+            assert!(matches!(
+                core.live
+                    .lock()
+                    .controls
+                    .get(&registration.id)
+                    .map(|control| &control.phase),
+                Some(ControlPhase::InFlight { .. })
+            ));
+            let (_, wakers) = core
+                .live
+                .lock()
+                .record_failure(TestRunnerError::NoExecutionArn);
+            wake(wakers);
+            assert!(woken.load(Ordering::SeqCst), "{role:?}");
+            let poll = call.as_mut().poll(&mut cx);
+            match role {
+                ControlRole::Wait => assert!(matches!(
+                    poll,
+                    std::task::Poll::Ready(Err(TestRunnerError::NoExecutionArn))
+                )),
+                ControlRole::Callback => assert!(poll.is_pending(), "{poll:?}"),
+            }
+        }
+    }
+
+    /// A run failure recorded while the wait polls its Lambda call, which
+    /// then stays pending, ends the wait on that same poll with the run
+    /// failure, and the wait is not left in flight. A callback control
+    /// stays in flight.
+    #[test]
+    fn a_failure_recorded_during_the_call_poll_ends_a_wait() {
+        for role in [ControlRole::Wait, ControlRole::Callback] {
+            let (core, cloud) = cloud_core();
+            let registration = Registration::new(&core, ControlKind::Cloud);
+            let request = cloud.begin_request();
+            let call = {
+                let core = Arc::clone(&core);
+                std::future::poll_fn(move |_| {
+                    let (_, wakers) = core
+                        .live
+                        .lock()
+                        .record_failure(TestRunnerError::NoExecutionArn);
+                    wake(wakers);
+                    std::task::Poll::<()>::Pending
+                })
+            };
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            let mut wait = std::pin::pin!(await_in_flight(&registration, role, request, call));
+            let poll = wait.as_mut().poll(&mut cx);
+            let in_flight = matches!(
+                core.live
+                    .lock()
+                    .controls
+                    .get(&registration.id)
+                    .map(|control| &control.phase),
+                Some(ControlPhase::InFlight { .. })
+            );
+            match role {
+                ControlRole::Wait => {
+                    assert!(
+                        matches!(
+                            poll,
+                            std::task::Poll::Ready(Err(TestRunnerError::NoExecutionArn))
+                        ),
+                        "{poll:?}"
+                    );
+                    assert!(!in_flight, "the wait is not left in flight");
+                }
+                ControlRole::Callback => {
+                    assert!(poll.is_pending(), "{poll:?}");
+                    assert!(in_flight, "the callback stays in flight");
+                }
+            }
+        }
+    }
+
+    /// A pending wait whose Lambda call becomes ready only after a run
+    /// failure was recorded returns the run failure without taking the
+    /// call's output. A wait's read finished after the failure stores no
+    /// fold, while a callback control's read still becomes the fold.
+    #[test]
+    fn a_run_failure_drops_a_wait_call_that_became_ready() {
         let (core, cloud) = cloud_core();
         let registration = Registration::new(&core, ControlKind::Cloud);
-        let request = cloud.begin_request().expect("ticket");
-        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let waker = std::task::Waker::from(Arc::new(FlagWaker(Arc::clone(&woken))));
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut call = std::pin::pin!(await_in_flight(
+        let request = cloud.begin_request();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let call = {
+            let ready = Arc::clone(&ready);
+            let taken = Arc::clone(&taken);
+            std::future::poll_fn(move |_| {
+                if ready.load(Ordering::SeqCst) {
+                    taken.store(true, Ordering::SeqCst);
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+        };
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut wait = std::pin::pin!(await_in_flight(
             &registration,
+            ControlRole::Wait,
             request,
-            std::future::pending::<()>()
+            call
         ));
-        assert!(call.as_mut().poll(&mut cx).is_pending());
-        assert!(matches!(
-            core.live
-                .lock()
-                .controls
-                .get(&registration.id)
-                .map(|control| &control.phase),
-            Some(ControlPhase::InFlight { .. })
-        ));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
         let (_, wakers) = core
             .live
             .lock()
             .record_failure(TestRunnerError::NoExecutionArn);
         wake(wakers);
-        assert!(woken.load(Ordering::SeqCst));
+        ready.store(true, Ordering::SeqCst);
         assert!(matches!(
-            call.as_mut().poll(&mut cx),
+            wait.as_mut().poll(&mut cx),
             std::task::Poll::Ready(Err(TestRunnerError::NoExecutionArn))
         ));
+        assert!(!taken.load(Ordering::SeqCst), "the ready call is dropped");
+
+        let err = cloud
+            .finish_history(
+                Some((registration.id, ControlRole::Wait)),
+                request,
+                Ok(vec![step_s_event(EventType::StepStarted)]),
+            )
+            .expect_err("the run failure wins");
+        assert!(matches!(err, TestRunnerError::NoExecutionArn), "{err:?}");
+        assert!(core.operations().is_none(), "the wait stores no fold");
+        let read = cloud.begin_request();
+        cloud
+            .finish_history(
+                Some((registration.id, ControlRole::Callback)),
+                read,
+                Ok(vec![step_s_event(EventType::StepStarted)]),
+            )
+            .expect("a callback read");
+        assert!(core.operations().is_some(), "the callback read is the fold");
     }
 
-    /// A history read starts only within the budget, and not after the run
-    /// finished when the caller asks; otherwise it returns the fold.
+    /// A history read starts only within the budget. A wait starts none
+    /// after the run finished or failed, and returns the fold or the run
+    /// failure. A callback control starts one after either, within the
+    /// budget.
     #[test]
     fn a_history_read_starts_within_the_budget() {
         let (core, cloud) = cloud_core();
         core.live.lock().cloud.limit = Some(1);
         assert!(matches!(
-            cloud.begin_history(true, true),
+            cloud.begin_history(ControlRole::Wait),
             Ok(HistoryStart::Read(_))
         ));
         assert!(matches!(
-            cloud.begin_history(false, true),
+            cloud.begin_history(ControlRole::Callback),
             Ok(HistoryStart::Done(None))
         ));
         core.live.lock().cloud.limit = None;
         core.live.lock().end = RunEnd::Finished(None);
         assert!(matches!(
-            cloud.begin_history(true, true),
+            cloud.begin_history(ControlRole::Wait),
             Ok(HistoryStart::Done(None))
         ));
         assert!(matches!(
-            cloud.begin_history(false, true),
+            cloud.begin_history(ControlRole::Callback),
             Ok(HistoryStart::Read(_))
+        ));
+
+        let (core, cloud) = cloud_core();
+        core.live.lock().cloud.limit = Some(2);
+        core.live.lock().failure = Some(TestRunnerError::NoExecutionArn);
+        assert!(matches!(
+            cloud.begin_history(ControlRole::Wait),
+            Err(TestRunnerError::NoExecutionArn)
+        ));
+        assert_eq!(core.live.lock().cloud.used, 0, "the wait spent nothing");
+        assert!(matches!(
+            cloud.begin_history(ControlRole::Callback),
+            Ok(HistoryStart::Read(_))
+        ));
+        assert!(matches!(
+            cloud.begin_history(ControlRole::Callback),
+            Ok(HistoryStart::Read(_))
+        ));
+        assert!(matches!(
+            cloud.begin_history(ControlRole::Callback),
+            Ok(HistoryStart::Done(None))
         ));
     }
 
