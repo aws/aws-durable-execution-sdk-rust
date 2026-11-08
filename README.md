@@ -774,6 +774,10 @@ A submitter that fails after its retry strategy stops surfaces as
 external failure with the type `Callback.ExternalFailure` and keeps the
 external message and error data, while `create_callback` keeps the
 external caller's type.
+Both `create_callback` and `wait_for_callback` keep a timed-out callback
+record's message and error data; an absent or empty message becomes
+`Callback timed out`, and `wait_for_callback` records the type
+`Callback.Timeout` or `Callback.Heartbeat`.
 `create_callback` also takes `.sub_type(...)`, which records an
 `OperationSubType` instead of `Callback`, as on a step.
 

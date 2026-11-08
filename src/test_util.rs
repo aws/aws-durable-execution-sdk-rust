@@ -8145,10 +8145,20 @@ mod tests {
         let run =
             run_wfcb_classification(runner, Submitter::Succeeds, "TimedOut", "timed out").await;
         assert!(run.result.is_success(), "{:?}", run.result.error_message());
-        let kinds: Vec<&str> = run.seen.iter().map(|e| e.0.as_str()).collect();
-        assert_eq!(kinds, ["TimedOut", "TimedOut"]);
-        assert_eq!(run.seen[0], run.seen[1]);
+        let entry = (
+            "TimedOut".to_owned(),
+            Some("Callback.Timeout".to_owned()),
+            Some("Callback timed out".to_owned()),
+            None,
+        );
+        assert_eq!(run.seen, [entry.clone(), entry]);
         assert_eq!(approve_error_type(&run.result), Some("Callback.Timeout"));
+        assert_eq!(
+            run.result
+                .operation("approve")
+                .and_then(TestOperation::error_message),
+            Some("Callback timed out")
+        );
     }
 
     #[tokio::test]
@@ -8162,10 +8172,20 @@ mod tests {
         )
         .await;
         assert!(run.result.is_success(), "{:?}", run.result.error_message());
-        let kinds: Vec<&str> = run.seen.iter().map(|e| e.0.as_str()).collect();
-        assert_eq!(kinds, ["HeartbeatTimedOut", "HeartbeatTimedOut"]);
-        assert_eq!(run.seen[0], run.seen[1]);
+        let entry = (
+            "HeartbeatTimedOut".to_owned(),
+            Some("Callback.Heartbeat".to_owned()),
+            Some("Callback timed out on heartbeat".to_owned()),
+            None,
+        );
+        assert_eq!(run.seen, [entry.clone(), entry]);
         assert_eq!(approve_error_type(&run.result), Some("Callback.Heartbeat"));
+        assert_eq!(
+            run.result
+                .operation("approve")
+                .and_then(TestOperation::error_message),
+            Some("Callback timed out on heartbeat")
+        );
     }
 
     #[tokio::test]

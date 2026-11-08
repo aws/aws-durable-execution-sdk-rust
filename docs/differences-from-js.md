@@ -131,7 +131,7 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### `wait_for_callback` failure records
 
 - **JavaScript:** The outer record carries the error class name: `CallbackExternalError`, `CallbackSubmitterError` or `CallbackTimeoutError`.
-- **Rust:** The outer record carries one of `Callback.ExternalFailure`, `Callback.SubmitterFailed`, `Callback.Timeout`, `Callback.Heartbeat` and `Callback.Internal`; an external failure keeps the external message and error data and drops the external type, as in JavaScript. A payload that does not decode returns `CallbackErrorKind::DeserializationFailed` after the outer record succeeded with the raw payload.
+- **Rust:** The outer record carries one of `Callback.ExternalFailure`, `Callback.SubmitterFailed`, `Callback.Timeout`, `Callback.Heartbeat` and `Callback.Internal`; an external failure keeps the external message and error data and drops the external type, as in JavaScript. A timeout keeps the callback record's message and error data, with `Callback timed out` when the message is absent or empty, as in JavaScript. A payload that does not decode returns `CallbackErrorKind::DeserializationFailed` after the outer record succeeded with the raw payload.
 - **Why:** A fixed type set is a closed protocol the SDK owns; each type maps to one error kind, live and on replay.
 - **Decision:** Decision (2026-10-28): record one of a fixed set of `Callback.*` types.
 - **Where:** `src/callback.rs`, `extract_wire_error`.

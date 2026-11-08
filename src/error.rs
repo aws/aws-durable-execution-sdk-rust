@@ -117,6 +117,12 @@ impl WireError {
         }
     }
 
+    /// Sets the human-readable message.
+    pub(crate) fn with_error_message(mut self, error_message: Option<impl Into<String>>) -> Self {
+        self.error_message = error_message.map(Into::into);
+        self
+    }
+
     /// Sets the opaque `error_data` payload.
     pub(crate) fn with_error_data(mut self, error_data: Option<impl Into<String>>) -> Self {
         self.error_data = error_data.map(Into::into);
@@ -1327,7 +1333,7 @@ impl fmt::Display for InvokeErrorKind {
 ///
 /// fn describe(err: &CallbackError) -> String {
 ///     match err.kind() {
-///         CallbackErrorKind::TimedOut { .. } => "callback timed out".to_owned(),
+///         CallbackErrorKind::TimedOut { .. } => "timed out".to_owned(),
 ///         // The failure record travels on `source()`. Its type is the
 ///         // external caller's from `create_callback`, and
 ///         // `Callback.ExternalFailure` from `wait_for_callback`.
@@ -1395,13 +1401,22 @@ impl Error for CallbackError {
 #[non_exhaustive]
 pub enum CallbackErrorKind {
     /// The callback timed out waiting for completion.
+    ///
+    /// The enclosing error's [`OperationError::wire`] record keeps the
+    /// callback record's message and error data. An absent or empty message
+    /// becomes `Callback timed out`. From `wait_for_callback`, the wire
+    /// record has type `Callback.Timeout`.
     #[non_exhaustive]
     TimedOut,
     /// The callback heartbeat timed out (no keep-alive received in time).
     ///
     /// The service records a heartbeat timeout as a `TIMED_OUT` callback
     /// with the error type `Callback.Heartbeat`. Both `create_callback`
-    /// and `wait_for_callback` report it with this kind.
+    /// and `wait_for_callback` report it with this kind. The enclosing
+    /// error's [`OperationError::wire`] record keeps the callback record's
+    /// message and error data. An absent or empty message becomes
+    /// `Callback timed out`. From `wait_for_callback`, the wire record has
+    /// type `Callback.Heartbeat`.
     #[non_exhaustive]
     HeartbeatTimedOut,
     /// The callback was completed with an external failure, or it ended

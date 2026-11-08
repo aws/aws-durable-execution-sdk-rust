@@ -410,13 +410,17 @@ where
 /// The service records a missed heartbeat as a `TIMED_OUT` callback with
 /// the type `Callback.Heartbeat`, which gives `HeartbeatTimedOut`. Every
 /// other type, and a record with no failure, gives `TimedOut`. The error
-/// has no source and carries the recorded wire.
+/// has no source, keeps the recorded type, error data and stack trace,
+/// keeps a nonempty recorded message, and otherwise uses
+/// `Callback timed out`.
 fn timed_out_callback_error(
     wire: Option<crate::error::WireError>,
     wire_id: &str,
     status: &str,
 ) -> OperationError {
     let wire = wire.unwrap_or_default();
+    let message = timeout_message(wire.error_message()).to_owned();
+    let wire = wire.with_error_message(Some(message));
     let kind = if wire.error_type() == Some("Callback.Heartbeat") {
         CallbackErrorKind::HeartbeatTimedOut
     } else {
@@ -1117,6 +1121,19 @@ const CALLBACK_TIMEOUT: &str = "Callback.Timeout";
 /// The `ErrorType` of a missed callback heartbeat.
 const CALLBACK_HEARTBEAT: &str = "Callback.Heartbeat";
 
+/// The message of a callback timeout whose record has no message, or an
+/// empty one, as in JavaScript.
+const CALLBACK_TIMED_OUT_MESSAGE: &str = "Callback timed out";
+
+/// The message a callback timeout reports: `recorded` when it is nonempty,
+/// and [`CALLBACK_TIMED_OUT_MESSAGE`] otherwise.
+fn timeout_message(recorded: Option<&str>) -> &str {
+    match recorded {
+        Some(message) if !message.is_empty() => message,
+        _ => CALLBACK_TIMED_OUT_MESSAGE,
+    }
+}
+
 /// The `ErrorType` the outer record carries for a failed submitter.
 const WFCB_SUBMITTER_FAILED: &str = "Callback.SubmitterFailed";
 
@@ -1238,17 +1255,16 @@ fn wfcb_live_error(
 /// neither the external caller's type nor a `TypedError` name in the chain
 /// sets it. An external failure keeps the external message and error data
 /// from the error's wire record.
+///
+/// A timeout keeps the callback record's message and error data and uses
+/// `Callback timed out` when the message is absent or empty.
 fn extract_wire_error(err: &OperationError) -> crate::error::WireError {
     let OperationErrorKind::Callback(cb_err) = err.kind() else {
         return crate::error::wire_error_with_type(err, WFCB_INTERNAL);
     };
     match cb_err.kind() {
-        CallbackErrorKind::TimedOut => {
-            crate::error::WireError::new(Some(CALLBACK_TIMEOUT), Some("callback timed out"))
-        }
-        CallbackErrorKind::HeartbeatTimedOut => {
-            crate::error::WireError::new(Some(CALLBACK_HEARTBEAT), Some("heartbeat timed out"))
-        }
+        CallbackErrorKind::TimedOut => timeout_wire(err, CALLBACK_TIMEOUT),
+        CallbackErrorKind::HeartbeatTimedOut => timeout_wire(err, CALLBACK_HEARTBEAT),
         CallbackErrorKind::ExternalFailure => {
             let external = err.wire();
             crate::error::WireError::new(
@@ -1265,6 +1281,21 @@ fn extract_wire_error(err: &OperationError) -> crate::error::WireError {
             crate::error::wire_error_with_type(cb_err, WFCB_DESERIALIZATION_FAILED)
         }
     }
+}
+
+/// The outer FAIL record of a `wait_for_callback` whose callback timed out:
+/// `error_type`, with the message and error data of the callback record on
+/// `err`'s wire, and `Callback timed out` when that message is absent or
+/// empty.
+fn timeout_wire(err: &OperationError, error_type: &str) -> crate::error::WireError {
+    let recorded = err.wire();
+    crate::error::WireError::new(
+        Some(error_type),
+        Some(timeout_message(
+            recorded.and_then(crate::error::WireError::error_message),
+        )),
+    )
+    .with_error_data(recorded.and_then(crate::error::WireError::error_data))
 }
 
 /// Creates a callback deserialization error carrying its cause.
@@ -1540,7 +1571,7 @@ mod tests {
             CheckpointStatus::Failed,
             None,
             Some("Callback.Heartbeat"),
-            Some("heartbeat timed out"),
+            Some("Callback timed out on heartbeat"),
             Some("cb-789"),
         )]);
         let op_id = ctx.mint_id();
@@ -2019,7 +2050,7 @@ mod tests {
             CheckpointStatus::Failed,
             None,
             Some("Callback.Timeout"),
-            Some("callback timed out"),
+            Some("Callback timed out"),
             None,
         )]);
         let op_id = ctx.mint_id();
@@ -2050,7 +2081,7 @@ mod tests {
             CheckpointStatus::Failed,
             None,
             Some("Callback.Heartbeat"),
-            Some("heartbeat timed out"),
+            Some("Callback timed out on heartbeat"),
             None,
         )]);
         let op_id = ctx.mint_id();
@@ -3447,20 +3478,53 @@ mod tests {
             Some("deserialization failed: bad payload")
         );
 
-        // The timeouts.
-        let timed_out = OperationError::from_kind(OperationErrorKind::Callback(
-            CallbackError::new(CallbackErrorKind::TimedOut, None),
-        ));
-        assert_eq!(
-            extract_wire_error(&timed_out),
-            crate::error::WireError::new(Some("Callback.Timeout"), Some("callback timed out"))
+        // The timeouts keep the callback record's message and error data
+        // under their fixed type, and use `Callback timed out` for an
+        // absent or empty message.
+        assert_timeout_wire(|| CallbackErrorKind::TimedOut, "Callback.Timeout");
+        assert_timeout_wire(
+            || CallbackErrorKind::HeartbeatTimedOut,
+            "Callback.Heartbeat",
         );
-        let heartbeat = OperationError::from_kind(OperationErrorKind::Callback(
-            CallbackError::new(CallbackErrorKind::HeartbeatTimedOut, None),
-        ));
+    }
+
+    /// Asserts the outer record that `extract_wire_error` derives from a
+    /// timeout of the kind `kind_of` returns: the type `expected_type`, the
+    /// callback record's message and error data, and `Callback timed out`
+    /// when that message is absent or empty, or there is no record.
+    fn assert_timeout_wire(kind_of: impl Fn() -> CallbackErrorKind, expected_type: &str) {
+        let timeout = |wire: crate::error::WireError| {
+            OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(
+                kind_of(),
+                None,
+            )))
+            .with_wire(wire)
+        };
+        let recorded = crate::error::WireError::new(Some("Recorded.Type"), Some("m"))
+            .with_error_data(Some("d"));
         assert_eq!(
-            extract_wire_error(&heartbeat),
-            crate::error::WireError::new(Some("Callback.Heartbeat"), Some("heartbeat timed out"))
+            extract_wire_error(&timeout(recorded)),
+            crate::error::WireError::new(Some(expected_type), Some("m")).with_error_data(Some("d")),
+            "{expected_type}"
+        );
+        for message in [None, Some("")] {
+            let recorded = crate::error::WireError::new(Some("Recorded.Type"), message)
+                .with_error_data(Some("d"));
+            assert_eq!(
+                extract_wire_error(&timeout(recorded)),
+                crate::error::WireError::new(Some(expected_type), Some("Callback timed out"))
+                    .with_error_data(Some("d")),
+                "{expected_type} {message:?}"
+            );
+        }
+        let bare = OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(
+            kind_of(),
+            None,
+        )));
+        assert_eq!(
+            extract_wire_error(&bare),
+            crate::error::WireError::new(Some(expected_type), Some("Callback timed out")),
+            "{expected_type} bare"
         );
     }
 
@@ -3708,46 +3772,109 @@ mod tests {
     /// A `TIMED_OUT` callback record with type `Callback.Heartbeat` gives
     /// `HeartbeatTimedOut`, from `create_callback` and inside
     /// `wait_for_callback`; any other `TIMED_OUT` record gives `TimedOut`.
+    /// The error keeps the record's fields, with `Callback timed out` for
+    /// an absent or empty message.
     #[tokio::test]
     async fn replay_timed_out_reads_heartbeat_type() {
-        // C19 to C21.
-        let cases: [(Option<&str>, &str); 3] = [
-            (Some("Callback.Heartbeat"), "HeartbeatTimedOut"),
-            (Some("Callback.Timeout"), "TimedOut"),
-            (None, "TimedOut"),
+        fresh_timed_out_callbacks_keep_their_record().await;
+        heartbeat_timeout_in_wfcb_keeps_the_callback_message().await;
+    }
+
+    /// Reads `record` through `result()` and through `spawn_result()` of
+    /// fresh callbacks, and returns both errors.
+    async fn both_timeout_errors(record: (String, CheckpointRecord)) -> [OperationError; 2] {
+        let cb = create_from(record.clone())
+            .await
+            .expect("a TIMED_OUT callback settles");
+        let from_result = cb.result().await.expect_err("the callback timed out");
+        let cb = create_from(record)
+            .await
+            .expect("a TIMED_OUT callback settles");
+        let from_spawn = cb.spawn_result().await.expect_err("the callback timed out");
+        [from_result, from_spawn]
+    }
+
+    /// The `create_callback` half of `replay_timed_out_reads_heartbeat_type`:
+    /// a full record keeps all four wire fields, and C19 to C21 report
+    /// `Callback timed out` with their recorded type and kind.
+    async fn fresh_timed_out_callbacks_keep_their_record() {
+        // A record with every field keeps all four.
+        let wire = crate::engine::compute_wire_id_public("1");
+        let mut record = callback_record(
+            &wire,
+            CheckpointStatus::TimedOut,
+            None,
+            Some("Callback.Timeout"),
+            Some("the service's message"),
+            Some("cb-1"),
+        );
+        record.1.error_data = Some("d".to_owned());
+        record.1.stack_trace = Some(vec!["frame-1".to_owned(), "frame-2".to_owned()]);
+        for err in both_timeout_errors(record).await {
+            let wire = err.wire().expect("the record travels on the error");
+            assert_eq!(wire.error_type(), Some("Callback.Timeout"));
+            assert_eq!(wire.error_message(), Some("the service's message"));
+            assert_eq!(wire.error_data(), Some("d"));
+            assert_eq!(wire.stack_trace(), ["frame-1", "frame-2"]);
+            assert!(matches!(
+                callback_kind(&err),
+                Some(CallbackErrorKind::TimedOut)
+            ));
+        }
+
+        // C19 to C21: no message, an empty message, no recorded error.
+        let cases: [(Option<&str>, Option<&str>, &str); 3] = [
+            (Some("Callback.Heartbeat"), None, "HeartbeatTimedOut"),
+            (Some("Callback.Timeout"), Some(""), "TimedOut"),
+            (None, None, "TimedOut"),
         ];
-        for (error_type, expected) in cases {
+        for (error_type, message, expected) in cases {
             let wire = crate::engine::compute_wire_id_public("1");
-            let mut record = callback_record(
+            let record = callback_record(
                 &wire,
                 CheckpointStatus::TimedOut,
                 None,
                 error_type,
-                None,
+                message,
                 Some("cb-1"),
             );
-            if error_type.is_none() {
-                // C21: no recorded failure at all.
-                record.1.error_message = None;
+            for err in both_timeout_errors(record).await {
+                let kind = callback_kind(&err).map(|k| format!("{k:?}"));
+                assert_eq!(kind.as_deref(), Some(expected), "{error_type:?}");
+                assert!(
+                    std::error::Error::source(&err)
+                        .and_then(std::error::Error::source)
+                        .is_none()
+                );
+                let wire = err.wire().expect("the error carries a wire record");
+                assert_eq!(wire.error_type(), error_type, "{error_type:?}");
+                assert_eq!(
+                    wire.error_message(),
+                    Some("Callback timed out"),
+                    "{error_type:?}"
+                );
             }
-            let cb = create_from(record)
-                .await
-                .expect("a TIMED_OUT callback settles");
-            let err = cb.result().await.expect_err("the callback timed out");
-            let kind = callback_kind(&err).map(|k| format!("{k:?}"));
-            assert_eq!(kind.as_deref(), Some(expected), "{error_type:?}");
-            assert!(
-                std::error::Error::source(&err)
-                    .and_then(std::error::Error::source)
-                    .is_none()
-            );
         }
+    }
 
-        // C4: the outer record is STARTED and its callback TIMED_OUT with
-        // the heartbeat type, as the service writes it.
+    /// C4 of `replay_timed_out_reads_heartbeat_type`: the outer record is
+    /// `STARTED` and its callback `TIMED_OUT` with the heartbeat type, the
+    /// message `Callback timed out on heartbeat` and the error data `d`,
+    /// as the service writes it. The live error, the outer FAIL and the
+    /// replay of that FAIL carry the same record.
+    async fn heartbeat_timeout_in_wfcb_keeps_the_callback_message() {
         let wfcb_wire = crate::engine::compute_wire_id_public("1");
         let cb_wire = crate::engine::compute_wire_id_public("1-1");
         let step_wire = crate::engine::compute_wire_id_public("1-2");
+        let mut timed_out = callback_record(
+            &cb_wire,
+            CheckpointStatus::TimedOut,
+            None,
+            Some("Callback.Heartbeat"),
+            Some("Callback timed out on heartbeat"),
+            Some("cb-1"),
+        );
+        timed_out.1.error_data = Some("d".to_owned());
         let log = CheckpointLog::from_records(vec![
             callback_record(
                 &wfcb_wire,
@@ -3757,14 +3884,7 @@ mod tests {
                 None,
                 None,
             ),
-            callback_record(
-                &cb_wire,
-                CheckpointStatus::TimedOut,
-                None,
-                Some("Callback.Heartbeat"),
-                Some("heartbeat timed out"),
-                Some("cb-1"),
-            ),
+            timed_out,
             callback_record(
                 &step_wire,
                 CheckpointStatus::Succeeded,
@@ -3802,16 +3922,37 @@ mod tests {
             ),
             "{err:?}"
         );
+        let expected = crate::error::WireError::new(
+            Some("Callback.Heartbeat"),
+            Some("Callback timed out on heartbeat"),
+        )
+        .with_error_data(Some("d"));
+        assert_eq!(err.wire(), Some(&expected));
         let fail = client
             .recorded_updates()
             .into_iter()
             .find(|u| u.id() == wfcb_wire && *u.action() == OperationAction::Fail)
             .expect("the outer FAIL was written");
+        let error = fail.error().expect("the FAIL carries an error");
+        assert_eq!(error.error_type(), Some("Callback.Heartbeat"));
         assert_eq!(
-            fail.error()
-                .and_then(aws_sdk_lambda::types::ErrorObject::error_type),
-            Some("Callback.Heartbeat")
+            error.error_message(),
+            Some("Callback timed out on heartbeat")
         );
+        assert_eq!(error.error_data(), Some("d"));
+
+        // The replay of that outer record returns the same wire.
+        let replayed = replay_wfcb_outer(
+            error.error_type(),
+            error.error_message(),
+            error.error_data(),
+        )
+        .await;
+        assert_eq!(replayed.wire(), err.wire());
+        assert!(matches!(
+            callback_kind(&replayed),
+            Some(CallbackErrorKind::HeartbeatTimedOut)
+        ));
     }
 
     /// The submitter's replay mismatch records the fatal nondeterminism
@@ -4478,6 +4619,98 @@ mod coordinator_tests {
             .expect("the handler finished")
             .expect_err("the payload does not decode");
         assert_same_error(&spawned, &live);
+    }
+
+    /// The `TIMED_OUT` record of the callback `start` with the type
+    /// `error_type` and the message `message`.
+    fn timed_out_with(
+        start: &OperationUpdate,
+        error_type: &str,
+        message: Option<&str>,
+    ) -> Operation {
+        let mut error = ErrorObject::builder().error_type(error_type);
+        if let Some(message) = message {
+            error = error.error_message(message);
+        }
+        operation_like(start, OperationStatus::TimedOut)
+            .callback_details(
+                CallbackDetails::builder()
+                    .callback_id("cb-1")
+                    .error(error.build())
+                    .build(),
+            )
+            .build()
+            .expect("all required fields set")
+    }
+
+    /// A callback that becomes `TIMED_OUT` while `result()` or
+    /// `spawn_result()` waits reports `Callback timed out` when its record
+    /// has no message or an empty one, and keeps the recorded type.
+    #[tokio::test(start_paused = true)]
+    async fn pending_timeout_message_fallback_for_result_and_spawn_result() {
+        // `result()` over a `Callback.Timeout` record without a message.
+        let client = Arc::new(client_completing(|start| {
+            timed_out_with(start, "Callback.Timeout", None)
+        }));
+        let (outcome, result) = join_callback_with_step(&client).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let err = result
+            .expect("the handler finished")
+            .expect_err("the callback timed out");
+        assert!(
+            matches!(
+                err.kind(),
+                crate::error::OperationErrorKind::Callback(e)
+                    if matches!(e.kind(), crate::error::CallbackErrorKind::TimedOut)
+            ),
+            "{err:?}"
+        );
+        let wire = err.wire().expect("the record travels on the error");
+        assert_eq!(wire.error_type(), Some("Callback.Timeout"));
+        assert_eq!(wire.error_message(), Some("Callback timed out"));
+
+        // `spawn_result()` over a `Callback.Heartbeat` record with an empty
+        // message.
+        let client = Arc::new(client_completing(|start| {
+            timed_out_with(start, "Callback.Heartbeat", Some(""))
+        }));
+        let ctx = scripted_ctx(&client);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let (result, step) = tokio::join!(
+                cb.spawn_result(),
+                ctx.step(|_| async { Ok(2_u32) }).name("s").future()
+            );
+            step.map_err(wire_err)?;
+            *handler_seen.lock().expect("lock") = Some(result);
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let err = seen
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("the handler finished")
+            .expect_err("the heartbeat timed out");
+        assert!(
+            matches!(
+                err.kind(),
+                crate::error::OperationErrorKind::Callback(e)
+                    if matches!(e.kind(), crate::error::CallbackErrorKind::HeartbeatTimedOut)
+            ),
+            "{err:?}"
+        );
+        let wire = err.wire().expect("the record travels on the error");
+        assert_eq!(wire.error_type(), Some("Callback.Heartbeat"));
+        assert_eq!(wire.error_message(), Some("Callback timed out"));
     }
 
     /// The handler of `caught_callback_decode_failure_replays_the_same_path`.
