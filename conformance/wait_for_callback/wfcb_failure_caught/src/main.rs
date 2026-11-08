@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-6: wait_for_callback failure caught.
+//! Conformance handler for requirement 7-6: `wait_for_callback` failure caught.
 //! Handler catches failure and returns "recovered".
 
 use aws_durable_execution_sdk as durable;

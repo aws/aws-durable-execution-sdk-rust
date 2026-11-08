@@ -2,12 +2,7 @@
 //! Create A, wait for A, create B, wait for B, return both.
 
 use aws_durable_execution_sdk as durable;
-use serde::Serialize;
 use std::collections::HashMap;
-
-/// Output: map with keys "a" and "b".
-#[derive(Serialize)]
-struct Output(HashMap<String, String>);
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {

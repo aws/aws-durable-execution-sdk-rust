@@ -4,7 +4,7 @@ use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: step that fails on first attempt and succeeds on second,
-/// tracking attempts via DynamoDB.
+/// tracking attempts via `DynamoDB`.
 async fn handler(
     _event: serde_json::Value,
     ctx: durable::DurableContext,

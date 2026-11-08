@@ -2,8 +2,8 @@
 //! serializer round-trips each iteration result.
 
 use aws_durable_execution_sdk as durable;
-use durable::{DurableContext, Serdes};
 use durable::serdes::SerdesContext;
+use durable::{DurableContext, Serdes};
 
 /// Custom serdes that wraps with "wrapped:" prefix.
 ///
@@ -15,20 +15,23 @@ use durable::serdes::SerdesContext;
 struct WrapSerdes;
 
 impl Serdes<String> for WrapSerdes {
-    async fn serialize(
+    fn serialize(
         &self,
         value: String,
         _context: SerdesContext,
-    ) -> Result<String, durable::BoxError> {
-        Ok(format!("wrapped:{value}"))
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(Ok(format!("wrapped:{value}")))
     }
 
-    async fn deserialize(
+    fn deserialize(
         &self,
         wire: String,
         _context: SerdesContext,
-    ) -> Result<String, durable::BoxError> {
-        Ok(wire.strip_prefix("wrapped:").unwrap_or(&wire).to_owned())
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(Ok(wire
+            .strip_prefix("wrapped:")
+            .unwrap_or(&wire)
+            .to_owned()))
     }
 }
 

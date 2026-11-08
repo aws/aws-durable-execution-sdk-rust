@@ -20,7 +20,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     |_ctx, mut state: PollState| async move {
                         state.attempts += 1;
                         if state.attempts >= 2 {
-                            state.status = "DONE".to_owned();
+                            "DONE".clone_into(&mut state.status);
                         }
                         Ok(state)
                     },

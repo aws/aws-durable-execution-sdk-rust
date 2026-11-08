@@ -1,5 +1,5 @@
 //! Conformance handler for requirement 6-13: multiple sequential.
-//! Two sequential wait_for_condition ops, first result seeds the second.
+//! Two sequential `wait_for_condition` ops, first result seeds the second.
 
 use aws_durable_execution_sdk as durable;
 use durable::builders::wait_for_condition::WaitDecision;

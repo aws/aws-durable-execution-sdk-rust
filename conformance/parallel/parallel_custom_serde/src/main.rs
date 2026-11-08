@@ -1,35 +1,40 @@
 //! Conformance requirement 8-15: Parallel with a custom per-branch serde.
 
 use aws_durable_execution_sdk as durable;
-use durable::{Branch, DurableContext, Serdes};
 use durable::serdes::SerdesContext;
+use durable::{Branch, DurableContext, Serdes};
 
 /// Custom serdes that wraps strings as `{"wrapped": "value"}`.
 #[derive(Debug)]
 struct WrappedSerdes;
 
 impl Serdes<String> for WrappedSerdes {
-    async fn serialize(
+    fn serialize(
         &self,
         value: String,
         _context: SerdesContext,
-    ) -> Result<String, durable::BoxError> {
-        Ok(serde_json::to_string(
-            &serde_json::json!({"wrapped": value}),
-        )?)
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(
+            serde_json::to_string(&serde_json::json!({"wrapped": value})).map_err(Into::into),
+        )
     }
 
-    async fn deserialize(
+    fn deserialize(
         &self,
         wire: String,
         _context: SerdesContext,
-    ) -> Result<String, durable::BoxError> {
-        let v: serde_json::Value = serde_json::from_str(&wire)?;
-        Ok(v.get("wrapped")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("WrappedSerdes: missing 'wrapped' field")?
-            .to_owned())
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(unwrap_value(&wire))
     }
+}
+
+/// Decodes `wire` and returns its "wrapped" field.
+fn unwrap_value(wire: &str) -> Result<String, durable::BoxError> {
+    let v: serde_json::Value = serde_json::from_str(wire)?;
+    Ok(v.get("wrapped")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("WrappedSerdes: missing 'wrapped' field")?
+        .to_owned())
 }
 
 /// Handler: parallel with custom serdes wrapping branch results.

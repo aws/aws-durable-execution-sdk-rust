@@ -18,10 +18,10 @@ async fn handler(
         .await;
 
     // Catch the ChildContextError and continue.
-    if let Err(ref e) = child_result {
-        if !matches!(e.kind(), durable::OperationErrorKind::ChildContext(_)) {
-            return Err(e.to_string().into());
-        }
+    if let Err(ref e) = child_result
+        && !matches!(e.kind(), durable::OperationErrorKind::ChildContext(_))
+    {
+        return Err(e.to_string().into());
     }
 
     let ev = event.clone();

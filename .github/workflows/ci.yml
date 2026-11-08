@@ -172,9 +172,11 @@ jobs:
 
   # The conformance handlers and examples are separate cargo workspaces with
   # heavier dependency graphs, deliberately outside the SDK's `make check`.
-  # CI still compiles both so a public API change cannot silently break them.
+  # CI checks the formatting of each, builds Cargo's default members and
+  # lints every workspace member, so a public API change cannot silently
+  # break them.
   workspaces:
-    name: build (${{ matrix.workspace }})
+    name: check (${{ matrix.workspace }})
     # Same routing and timeout as the check job, on the default instance.
     runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     timeout-minutes: 50
@@ -198,11 +200,11 @@ jobs:
       - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
 
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
         with:
           workspaces: ${{ matrix.workspace }}
 
-      - name: Build and clippy
+      - name: Format, build and clippy
         run: make workspaces WORKSPACES=${{ matrix.workspace }}

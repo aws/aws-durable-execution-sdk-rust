@@ -7,8 +7,8 @@
 //! so the error is caught and returned as a successful Lambda response.
 
 use aws_durable_execution_sdk as durable;
-use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
+use durable::{Branch, DurableContext};
 
 /// Handler: parallel fail-fast, returns metadata projection.
 async fn handler(

@@ -1,5 +1,5 @@
-//! Conformance handler for requirement 7-10: wait + step + wait_for_callback.
-//! Handler first waits 1s, then runs a step, then wait_for_callback.
+//! Conformance handler for requirement 7-10: wait + step + `wait_for_callback`.
+//! Handler first waits 1s, then runs a step, then `wait_for_callback`.
 
 use aws_durable_execution_sdk as durable;
 use std::time::Duration;

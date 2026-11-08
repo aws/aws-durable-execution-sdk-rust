@@ -123,8 +123,9 @@ runs on a push to `main`, and it needs no AWS:
   `Cargo.toml` does not name;
 - `feature-powerset`, which compiles every feature combination with
   cargo-hack;
-- `workspaces`, which builds and lints the `conformance` and `examples`
-  workspaces, so a public API change that breaks them fails;
+- `workspaces`, which checks the formatting of the `conformance` and
+  `examples` workspaces, builds Cargo's default members and lints every
+  workspace member, so a public API change that breaks them fails;
 - `pins`, which fails when `scripts/tools.sh` and a workflow name different
   versions of a pinned tool.
 
@@ -317,9 +318,11 @@ Branch from `main`, keep the change focused on one thing, and open the pull
 request against `main`. Discuss anything substantial in an issue first so you do
 not spend a weekend on a design we cannot take.
 
-Run `make check` before you push, and run the two extra workspace builds when
-you have changed the public API. A pull request that fails `make check` wastes a CI
-run and a reviewer's first pass.
+Run `make check` before you push, and run `make workspaces` when you have
+changed the public API. It checks the formatting of the `conformance` and
+`examples` workspaces, builds Cargo's default members and lints every
+workspace member. A pull request that fails `make check` wastes a CI run and a
+reviewer's first pass.
 
 CI runs four workflows on a pull request. `ci.yml` splits `make check` into a
 `check` job and a `dependencies` job, verifies the declared minimum Rust
@@ -327,8 +330,9 @@ version with an `msrv` job, guards the public API surface with an
 `external-types` job (no foreign type may reach the public API unless the
 allowlist under `[package.metadata.cargo_check_external_types]` in
 `Cargo.toml` names it deliberately), proves every feature combination compiles
-with a `feature-powerset` job (cargo-hack), then builds and lints the
-`conformance` and `examples` workspaces.
+with a `feature-powerset` job (cargo-hack), then checks the formatting of the
+`conformance` and `examples` workspaces, builds Cargo's default members and
+lints every workspace member.
 `codeql.yml` runs static analysis over the Rust sources.
 `conformance-tests.yml` runs the ten conformance suites when the SDK or the
 handlers change. `cloud-tests.yml` deploys the example stacks and runs the cloud

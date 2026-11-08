@@ -1,5 +1,5 @@
 //! Target function with tenancy: waits briefly then echoes its input.
-//! Identical to target_echo; the tenancy configuration is in the SAM template.
+//! Identical to `target_echo`; the tenancy configuration is in the SAM template.
 
 use aws_durable_execution_sdk as durable;
 use std::time::Duration;

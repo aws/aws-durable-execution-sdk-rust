@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-9: two sequential wait_for_callback operations.
+//! Conformance handler for requirement 7-9: two sequential `wait_for_callback` operations.
 //! First named "first", second named "second"; returns the second result.
 
 use aws_durable_execution_sdk as durable;

@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-5: wait_for_callback with 3s timeout.
+//! Conformance handler for requirement 7-5: `wait_for_callback` with 3s timeout.
 //! No external completion, so it times out.
 
 use aws_durable_execution_sdk as durable;

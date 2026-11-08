@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-14: wait_for_callback timeout caught.
+//! Conformance handler for requirement 7-14: `wait_for_callback` timeout caught.
 //! Handler catches timeout and returns "timed-out-handled".
 
 use aws_durable_execution_sdk as durable;

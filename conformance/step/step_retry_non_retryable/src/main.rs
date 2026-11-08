@@ -3,7 +3,7 @@
 use aws_durable_execution_sdk as durable;
 use std::fmt;
 
-/// Custom error type (TransientError) that the retry strategy does NOT retry.
+/// Custom error type (`TransientError`) that the retry strategy does NOT retry.
 #[derive(Debug)]
 struct TransientError {
     message: String,
@@ -17,7 +17,7 @@ impl fmt::Display for TransientError {
 
 impl std::error::Error for TransientError {}
 
-/// Handler: step throws TransientError; strategy does not retry it → fails.
+/// Handler: step throws `TransientError`; strategy does not retry it → fails.
 async fn handler(
     _event: serde_json::Value,
     ctx: durable::DurableContext,
@@ -26,14 +26,11 @@ async fn handler(
     // wire type name travels on the TypedError wrapper reachable through
     // source().
     let retry = |err: &durable::StepError, _attempt: u32| {
-        let retries = std::iter::successors(
-            std::error::Error::source(err),
-            |e| e.source(),
-        )
-        .any(|e| {
-            e.downcast_ref::<durable::TypedError>()
-                .is_some_and(|t| t.error_type() == "ValidationError")
-        });
+        let retries =
+            std::iter::successors(std::error::Error::source(err), |e| e.source()).any(|e| {
+                e.downcast_ref::<durable::TypedError>()
+                    .is_some_and(|t| t.error_type() == "ValidationError")
+            });
         if retries {
             durable::RetryDecision::retry(std::time::Duration::from_secs(1))
         } else {

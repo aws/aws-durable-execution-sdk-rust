@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-15: wait_for_callback with null/empty payload.
+//! Conformance handler for requirement 7-15: `wait_for_callback` with null/empty payload.
 //! External system completes with success but no payload.
 
 use aws_durable_execution_sdk as durable;

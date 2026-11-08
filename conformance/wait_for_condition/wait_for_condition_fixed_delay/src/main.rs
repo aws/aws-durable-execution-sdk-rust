@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 6-5: wait_for_condition fixed delay.
+//! Conformance handler for requirement 6-5: `wait_for_condition` fixed delay.
 //! Fixed 2-second delay between polls.
 
 use aws_durable_execution_sdk as durable;

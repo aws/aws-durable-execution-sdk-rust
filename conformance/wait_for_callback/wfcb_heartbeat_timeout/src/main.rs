@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-12: wait_for_callback with 5s heartbeat timeout.
+//! Conformance handler for requirement 7-12: `wait_for_callback` with 5s heartbeat timeout.
 //! No heartbeat sent, so it times out.
 
 use aws_durable_execution_sdk as durable;

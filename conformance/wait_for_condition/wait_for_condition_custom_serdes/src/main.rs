@@ -2,9 +2,9 @@
 //! Custom serializer adds "ENC:" prefix; custom deserializer strips it.
 
 use aws_durable_execution_sdk as durable;
-use durable::{BoxError, Serdes};
 use durable::builders::wait_for_condition::WaitDecision;
 use durable::serdes::SerdesContext;
+use durable::{BoxError, Serdes};
 use std::time::Duration;
 
 /// Custom serdes that adds/strips an "ENC:" prefix for string state.
@@ -12,24 +12,29 @@ use std::time::Duration;
 struct PrefixSerdes;
 
 impl Serdes<String> for PrefixSerdes {
-    async fn serialize(
+    fn serialize(
         &self,
         value: String,
         _context: SerdesContext,
-    ) -> Result<String, BoxError> {
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
         // The state arrives typed, so it needs no JSON decode first.
-        Ok(serde_json::to_string(&format!("ENC:{value}"))?)
+        std::future::ready(serde_json::to_string(&format!("ENC:{value}")).map_err(Into::into))
     }
 
-    async fn deserialize(
+    fn deserialize(
         &self,
         wire: String,
         _context: SerdesContext,
-    ) -> Result<String, BoxError> {
-        // `wire` is a JSON-quoted string like "\"ENC:hello\"".
-        let raw: String = serde_json::from_str(&wire)?;
-        Ok(raw.strip_prefix("ENC:").unwrap_or(&raw).to_owned())
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
+        std::future::ready(strip_enc_prefix(&wire))
     }
+}
+
+/// Decodes `wire`, a JSON-quoted string like "\"ENC:hello\"", and strips
+/// its "ENC:" prefix.
+fn strip_enc_prefix(wire: &str) -> Result<String, BoxError> {
+    let raw: String = serde_json::from_str(wire)?;
+    Ok(raw.strip_prefix("ENC:").unwrap_or(&raw).to_owned())
 }
 
 #[tokio::main]

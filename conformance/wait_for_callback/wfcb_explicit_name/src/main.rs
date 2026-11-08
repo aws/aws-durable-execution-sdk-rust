@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-2: wait_for_callback with explicit name "approval".
+//! Conformance handler for requirement 7-2: `wait_for_callback` with explicit name "approval".
 
 use aws_durable_execution_sdk as durable;
 

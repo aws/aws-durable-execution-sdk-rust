@@ -1,12 +1,12 @@
-//! Conformance requirement 1-17: step with AtMostOncePerRetry (no retry, crashes).
+//! Conformance requirement 1-17: step with `AtMostOncePerRetry` (no retry, crashes).
 
 use aws_durable_execution_sdk as durable;
 use durable::StepSemantics;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// Handler: step with AtMostOncePerRetry semantics and no retry. Prints to
-/// stdout then crashes (process::exit).
+/// Handler: step with `AtMostOncePerRetry` semantics and no retry. Prints to
+/// stdout then crashes (`process::exit`).
 async fn handler(
     event: serde_json::Value,
     ctx: durable::DurableContext,

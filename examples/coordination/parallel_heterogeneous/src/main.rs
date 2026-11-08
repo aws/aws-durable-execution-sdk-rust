@@ -31,7 +31,11 @@ async fn handler(
     });
 
     ctx.parallel_mixed(branches).name("fan-out").await?;
-    Ok(format!("{}: {}", count.into_result()?, status.into_result()?))
+    Ok(format!(
+        "{}: {}",
+        count.into_result()?,
+        status.into_result()?
+    ))
 }
 
 #[tokio::main]
@@ -64,7 +68,10 @@ mod tests {
         let mut map = serde_json::Map::new();
         map.insert("z".to_owned(), 0.into());
         map.insert("a".to_owned(), 0.into());
-        assert_eq!(serde_json::Value::Object(map).to_string(), r#"{"a":0,"z":0}"#);
+        assert_eq!(
+            serde_json::Value::Object(map).to_string(),
+            r#"{"a":0,"z":0}"#
+        );
     }
 
     /// An oversized one-branch `parallel_mixed` with a caller summary

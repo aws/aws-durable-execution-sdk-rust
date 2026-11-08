@@ -157,8 +157,10 @@ in that repository.
   Run `make check` before you push. It is the single quality gate, and
   CONTRIBUTING.md lists what it runs.
 - `make check` covers only the root workspace. `make ci` runs every
-  `ci.yml` job, including the `conformance/` and `examples/` builds, with
-  CI's flags; run it after a public API change. `make conformance` and
+  `ci.yml` job with CI's flags, including the `conformance/` and
+  `examples/` checks, which check the formatting, build Cargo's default
+  members and lint every workspace member; run it after a public API
+  change. `make conformance` and
   `make cloud-tests` run the AWS suites. CONTRIBUTING.md gives their inputs.
 - Run every `make` target under `timeout`, for example
   `timeout 3600 make ci`. A change to suspension or concurrency code can

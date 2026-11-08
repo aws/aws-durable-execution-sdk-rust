@@ -2,8 +2,8 @@
 //! percentage exceeds the tolerated-failure-percentage.
 
 use aws_durable_execution_sdk as durable;
-use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
+use durable::{Branch, DurableContext};
 
 /// Handler: parallel with tolerated-failure-percentage=25, two of four fail.
 async fn handler(

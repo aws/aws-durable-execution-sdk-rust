@@ -12,8 +12,10 @@
 # The ci.yml jobs that run on a push to main, plus the tool pin check.
 CI_TARGETS = pins check-sdk msrv dependencies external-types feature-powerset workspaces
 
-# The cargo workspaces the workspaces job builds. CI's matrix passes one,
-# for example `make workspaces WORKSPACES=conformance`.
+# The cargo workspaces the workspaces job checks. For each one it checks
+# the formatting, builds Cargo's default members and lints every workspace
+# member. CI's matrix passes one, for example
+# `make workspaces WORKSPACES=conformance`.
 WORKSPACES ?= conformance examples
 WORKSPACE_TARGETS = $(addprefix workspace-,$(WORKSPACES))
 
@@ -74,9 +76,10 @@ workspaces: $(WORKSPACE_TARGETS)
 
 # A static pattern rule, because make skips pattern rules for phony targets.
 $(WORKSPACE_TARGETS): workspace-%:
-	. scripts/tools.sh && require cargo clippy
+	. scripts/tools.sh && require cargo rustfmt clippy
+	cd $* && cargo fmt --check
 	cd $* && cargo build --all-targets
-	cd $* && cargo clippy --all-targets -- -D warnings
+	cd $* && cargo clippy --workspace --all-targets -- -D warnings
 
 # The examples workspace builds serde_json without `preserve_order`, as a
 # consumer's build can, so its parallel_heterogeneous tests check that the

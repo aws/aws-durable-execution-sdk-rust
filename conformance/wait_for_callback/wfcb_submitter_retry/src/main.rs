@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-7: wait_for_callback submitter retry exhaustion.
+//! Conformance handler for requirement 7-7: `wait_for_callback` submitter retry exhaustion.
 //! Submitter always throws; retry policy allows 2 attempts (one retry) with 1s delay.
 
 use std::time::Duration;

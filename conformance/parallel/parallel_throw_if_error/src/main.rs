@@ -5,8 +5,8 @@
 //! simply lets the error bubble up (equivalent to Go's `ThrowIfError()`).
 
 use aws_durable_execution_sdk as durable;
-use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
+use durable::{Branch, DurableContext};
 
 /// Handler: parallel that propagates the first branch failure.
 async fn handler(

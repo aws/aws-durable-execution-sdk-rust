@@ -15,20 +15,20 @@ use aws_durable_execution_sdk as durable;
 struct UppercaseResultSerdes;
 
 impl durable::Serdes<String> for UppercaseResultSerdes {
-    async fn serialize(
+    fn serialize(
         &self,
         value: String,
         _context: durable::serdes::SerdesContext,
-    ) -> Result<String, durable::BoxError> {
-        Ok(serde_json::to_string(&value)?)
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(serde_json::to_string(&value).map_err(Into::into))
     }
 
-    async fn deserialize(
+    fn deserialize(
         &self,
         wire: String,
         _context: durable::serdes::SerdesContext,
-    ) -> Result<String, durable::BoxError> {
-        Ok(wire.to_uppercase())
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(Ok(wire.to_uppercase()))
     }
 }
 

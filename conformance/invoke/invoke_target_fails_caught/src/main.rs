@@ -2,7 +2,7 @@
 
 use aws_durable_execution_sdk as durable;
 
-/// Handler: invoke target that errors, catch InvokeError, return fallback.
+/// Handler: invoke target that errors, catch `InvokeError`, return fallback.
 async fn handler(
     event: serde_json::Value,
     ctx: durable::DurableContext,

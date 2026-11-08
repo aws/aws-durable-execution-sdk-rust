@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-8: wait_for_callback inside a child context.
+//! Conformance handler for requirement 7-8: `wait_for_callback` inside a child context.
 //! Nested inside a child context named "wrapper".
 
 use aws_durable_execution_sdk as durable;

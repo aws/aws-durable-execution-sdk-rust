@@ -18,8 +18,8 @@ impl fmt::Display for TransientError {
 
 impl std::error::Error for TransientError {}
 
-/// Handler: step throws TransientError on first attempt; retry strategy
-/// retries only TransientError. Tracks via DDB.
+/// Handler: step throws `TransientError` on first attempt; retry strategy
+/// retries only `TransientError`. Tracks via DDB.
 async fn handler(
     _event: serde_json::Value,
     ctx: durable::DurableContext,
@@ -33,15 +33,12 @@ async fn handler(
         if attempt >= 3 {
             return durable::RetryDecision::Stop;
         }
-        let is_transient = std::iter::successors(
-            std::error::Error::source(err),
-            |e| e.source(),
-        )
-        .any(|e| {
-            e.downcast_ref::<TransientError>().is_some()
-                || e.downcast_ref::<durable::TypedError>()
-                    .is_some_and(|t| t.error_type() == "TransientError")
-        });
+        let is_transient = std::iter::successors(std::error::Error::source(err), |e| e.source())
+            .any(|e| {
+                e.downcast_ref::<TransientError>().is_some()
+                    || e.downcast_ref::<durable::TypedError>()
+                        .is_some_and(|t| t.error_type() == "TransientError")
+            });
         if is_transient {
             durable::RetryDecision::retry(Duration::from_secs(1))
         } else {

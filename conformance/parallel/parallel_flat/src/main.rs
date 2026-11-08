@@ -4,8 +4,8 @@
 //! Uses `NestingMode::Flat` to suppress per-branch context checkpoint events.
 
 use aws_durable_execution_sdk as durable;
-use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::NestingMode;
+use durable::{Branch, DurableContext};
 
 /// Handler: parallel flat nesting: branches run steps in virtual contexts.
 async fn handler(

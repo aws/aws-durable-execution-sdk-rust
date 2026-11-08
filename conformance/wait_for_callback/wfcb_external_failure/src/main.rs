@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-4: wait_for_callback external failure (uncaught).
+//! Conformance handler for requirement 7-4: `wait_for_callback` external failure (uncaught).
 
 use aws_durable_execution_sdk as durable;
 

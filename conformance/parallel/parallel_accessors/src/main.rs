@@ -2,8 +2,8 @@
 //! (success/failure counts, errors, has-failure).
 
 use aws_durable_execution_sdk as durable;
-use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
+use durable::{Branch, DurableContext};
 
 /// Handler: returns accessor-derived projection from the batch result.
 async fn handler(

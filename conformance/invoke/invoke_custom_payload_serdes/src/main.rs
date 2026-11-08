@@ -10,16 +10,20 @@ use aws_durable_execution_sdk as durable;
 struct UppercasePayloadSerdes;
 
 impl durable::PayloadSerializer for UppercasePayloadSerdes {
-    async fn serialize_payload<T>(
+    fn serialize_payload<T>(
         &self,
         value: T,
         _context: durable::serdes::SerdesContext,
-    ) -> Result<String, durable::BoxError>
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send
     where
         T: serde::Serialize + Send + 'static,
     {
         // Uppercase the JSON rendering of the payload value.
-        Ok(serde_json::to_string(&value)?.to_uppercase())
+        std::future::ready(
+            serde_json::to_string(&value)
+                .map(|json| json.to_uppercase())
+                .map_err(Into::into),
+        )
     }
 }
 

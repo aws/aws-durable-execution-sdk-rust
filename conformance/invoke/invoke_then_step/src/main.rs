@@ -13,7 +13,7 @@ async fn handler(
         .invoke::<serde_json::Value>(&target, event.clone())
         .await?;
     let step_result = ctx
-        .step(move |_| async move { Ok(format!("processed: {}", invoke_result)) })
+        .step(move |_| async move { Ok(format!("processed: {invoke_result}")) })
         .await?;
     Ok(step_result)
 }

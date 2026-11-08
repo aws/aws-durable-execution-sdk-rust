@@ -9,20 +9,24 @@ use durable::serdes::SerdesContext;
 struct UppercaseSerdes;
 
 impl Serdes<String> for UppercaseSerdes {
-    async fn serialize(
+    fn serialize(
         &self,
         value: String,
         _context: SerdesContext,
-    ) -> Result<String, durable::BoxError> {
-        Ok(serde_json::to_string(&value)?.to_uppercase())
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(
+            serde_json::to_string(&value)
+                .map(|json| json.to_uppercase())
+                .map_err(Into::into),
+        )
     }
 
-    async fn deserialize(
+    fn deserialize(
         &self,
         wire: String,
         _context: SerdesContext,
-    ) -> Result<String, durable::BoxError> {
-        Ok(serde_json::from_str(&wire)?)
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(serde_json::from_str(&wire).map_err(Into::into))
     }
 }
 

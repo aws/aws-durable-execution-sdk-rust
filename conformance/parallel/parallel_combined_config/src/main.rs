@@ -2,8 +2,8 @@
 //! (min-successful + tolerated-failure-count).
 
 use aws_durable_execution_sdk as durable;
-use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
+use durable::{Branch, DurableContext};
 
 /// Handler: combined config: tolerated-failure-count=1, min-successful=3.
 async fn handler(

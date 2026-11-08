@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 6-2: wait_for_condition immediate.
+//! Conformance handler for requirement 6-2: `wait_for_condition` immediate.
 //! Condition is already met on first check (state >= 5).
 
 use aws_durable_execution_sdk as durable;

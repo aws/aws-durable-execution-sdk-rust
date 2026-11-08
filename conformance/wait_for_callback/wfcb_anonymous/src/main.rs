@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-3: wait_for_callback with no operation name.
+//! Conformance handler for requirement 7-3: `wait_for_callback` with no operation name.
 
 use aws_durable_execution_sdk as durable;
 

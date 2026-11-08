@@ -1,4 +1,4 @@
-//! Conformance requirement 1-18: step with AtMostOncePerRetry (with retry, succeeds on second).
+//! Conformance requirement 1-18: step with `AtMostOncePerRetry` (with retry, succeeds on second).
 
 use aws_durable_execution_sdk as durable;
 use durable::StepSemantics;

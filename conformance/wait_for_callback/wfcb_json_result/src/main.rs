@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 7-11: wait_for_callback with JSON result.
+//! Conformance handler for requirement 7-11: `wait_for_callback` with JSON result.
 //! Callback payload is JSON object `{"status":"approved"}`, handler returns the status field.
 
 use aws_durable_execution_sdk as durable;

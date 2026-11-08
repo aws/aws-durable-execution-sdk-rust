@@ -6,8 +6,8 @@
 //! construct it from the number of results returned.
 
 use aws_durable_execution_sdk as durable;
-use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
+use durable::{Branch, DurableContext};
 
 /// Handler: parallel with min-successful=2 out of 4 branches.
 async fn handler(

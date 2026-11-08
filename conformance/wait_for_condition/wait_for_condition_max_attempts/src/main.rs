@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 6-6: wait_for_condition max attempts.
+//! Conformance handler for requirement 6-6: `wait_for_condition` max attempts.
 //! Condition never met, strategy exhausts after 3 attempts.
 
 use aws_durable_execution_sdk as durable;

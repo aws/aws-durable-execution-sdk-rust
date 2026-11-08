@@ -37,29 +37,35 @@ struct ReceivedData {
 struct TimestampSerdes;
 
 impl Serdes<ReceivedData> for TimestampSerdes {
-    async fn serialize(
+    fn serialize(
         &self,
         value: ReceivedData,
         _context: durable::serdes::SerdesContext,
-    ) -> Result<String, BoxError> {
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
         // The callback payload is produced externally; the SDK never
         // serializes a value on the way out. Plain JSON keeps the impl total.
-        Ok(serde_json::to_string(&value)?)
+        std::future::ready(serde_json::to_string(&value).map_err(Into::into))
     }
 
-    async fn deserialize(
+    fn deserialize(
         &self,
         wire: String,
         _context: durable::serdes::SerdesContext,
-    ) -> Result<ReceivedData, BoxError> {
-        let raw: CallbackPayload = serde_json::from_str(&wire)?;
-        let timestamp = parse_iso_timestamp(&raw.timestamp)?;
-        Ok(ReceivedData {
-            id: raw.id,
-            message: raw.message,
-            timestamp,
-        })
+    ) -> impl Future<Output = Result<ReceivedData, BoxError>> + Send {
+        std::future::ready(decode_payload(&wire))
     }
+}
+
+/// Decodes the raw callback payload and converts its timestamp to epoch
+/// seconds.
+fn decode_payload(wire: &str) -> Result<ReceivedData, BoxError> {
+    let raw: CallbackPayload = serde_json::from_str(wire)?;
+    let timestamp = parse_iso_timestamp(&raw.timestamp)?;
+    Ok(ReceivedData {
+        id: raw.id,
+        message: raw.message,
+        timestamp,
+    })
 }
 
 /// Parse an ISO-8601 timestamp into Unix epoch seconds (simple implementation
@@ -73,7 +79,7 @@ fn parse_iso_timestamp(s: &str) -> Result<i64, Box<dyn std::error::Error + Send 
         .first()
         .ok_or("missing date")?
         .split('-')
-        .map(|p| p.parse::<i64>())
+        .map(str::parse::<i64>)
         .collect::<Result<Vec<_>, _>>()?;
     let time_parts: Vec<&str> = parts.get(1).ok_or("missing time")?.split(':').collect();
 
@@ -104,6 +110,11 @@ fn parse_iso_timestamp(s: &str) -> Result<i64, Box<dyn std::error::Error + Send 
         30,
         31,
     ];
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the conformance timestamp contains a valid calendar month"
+    )]
     for m in 0..(month - 1) as usize {
         days += month_days.get(m).copied().unwrap_or(30);
     }
