@@ -104,13 +104,13 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Decision (2026-10-28): capture no frames, and keep the frames a record already carries.
 - **Where:** `src/error.rs`, `wire_error_with_type`; `src/invoke.rs`, `invoke_error_from_record`.
 
-### Child failure type
+### Child and execution failure type
 
-- **JavaScript:** A child whose body propagates a failed step records `StepError`.
-- **Rust:** Records the body error's type. For an operation error the body propagates, that is the type the inner operation recorded, else the type of a `TypedError` in its source chain, else that error kind's name, such as `StepError`. For a replayed failure the body propagates, it is the type that failure's record carries, else `Error`. For any other error, it is the type of a `TypedError` in the source chain, else `Error`. The message follows JavaScript: a child that propagates a recorded step failure records the step's recorded message (see "Untyped handler error").
-- **Why:** The inner type tells a history reader more, and the Rust error kind `ChildContext(ChildFailed)` still says that the child failed.
-- **Decision:** Decision (2026-10-28): record the body's error type.
-- **Where:** `src/error.rs`, `ChildFnError::failure_wire` and `wire_error_for`; `src/child.rs`, `checkpoint_live_failure`.
+- **JavaScript:** A child whose body propagates a failed step records `StepError`. A handler that throws an operation's error records that error's class as the execution's error type, such as `StepError` for a failed step that recorded `PaymentError`, or `ChildContextError` for a failed child.
+- **Rust:** A child records the body error's type, and the execution records the type of the error the handler returns, by the same rules. For an operation error the body or the handler propagates, that is the type the inner operation recorded, else the type of a `TypedError` in its source chain, else that error kind's name, such as `StepError`. For a replayed failure the body or the handler propagates, it is the type that failure's record carries, else `Error`. For any other error, it is the type of a `TypedError` in the source chain, else `Error`. The message follows JavaScript: a child or a handler that propagates a recorded step failure records the step's recorded message (see "Untyped handler error").
+- **Why:** The inner type tells a history reader more. The Rust error kind `ChildContext(ChildFailed)` still says that the child failed, and the history still holds the record of the operation that failed.
+- **Decision:** Decision (2026-10-28): record the body's error type; extended to the execution's record (2026-11-07).
+- **Where:** `src/error.rs`, `ChildFnError::failure_wire` and `wire_error_for`; `src/child.rs`, `checkpoint_live_failure`; `src/lib.rs`, `wire_error_from_box_error` and `wire_error_from_operation_error`.
 
 ### Panic in user code
 
@@ -645,10 +645,82 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### `LocalRunner` scope
 
 - **JavaScript:** A local runner with `skipTime`, setup, teardown and reset, a live waiter, and local timers that time out a callback (`Callback timed out`) and a missed heartbeat.
-- **Rust:** Always skips time on a virtual clock, needs no setup, teardown or reset, adds fault injection and `max_invocations`, and lets a test react to a run in progress through `RunHandle` and `OperationHandle` (`wait_for_data`, `send_callback`, `send_callback_heartbeat`, `pause`, `resume`). It runs no callback, heartbeat or execution timeout timers: `CallbackReply::timeout()` and `CallbackReply::heartbeat_timeout()` deliver those records, and `send_callback_heartbeat` validates and starts nothing.
+- **Rust:** Always skips time on a virtual clock, needs no setup, teardown or reset, adds fault injection, `max_invocations` and replies queued before the run (`LocalRunner::callback` and `callback_for`), and lets a test react to a run in progress through `RunHandle` and `OperationHandle` (`wait_for_data`, `send_callback`, `send_callback_heartbeat`, `pause`, `resume`). It runs no callback, heartbeat or execution timeout timers: `CallbackReply::timeout()` and `CallbackReply::heartbeat_timeout()` deliver those records, and `send_callback_heartbeat` validates and starts nothing.
 - **Why:** It is a test framework, not a service emulator; JavaScript's local callback timers emulate the service on the checkpoint server's real clock even with `skipTime`. A scripted reply tests the same handler branch at once.
 - **Decision:** Decision (2026-10-31): run no service timers, and deliver timeout records through scripted replies.
 - **Where:** `src/test_util.rs`, `LocalRunner`; `src/test_util/live.rs`, `RunHandle` and `OperationHandle`.
+
+### Run progress
+
+- **JavaScript:** `run()` starts the execution at once, and the execution runs in the background until it ends, whatever the test awaits meanwhile.
+- **Rust:** `run` returns a `RunHandle` and starts nothing until the test polls one of the run's futures. Under `LocalRunner` the run moves on only while the test awaits the `RunHandle`, a `wait_for_data` or a `pause`: a checkpoint that the handler sends while none of them waits is held until one waits, and meanwhile no invocation starts and the virtual clock does not move. The checkpoints of a registered durable invoke target are not held. Under `CloudRunner` the runner invokes the function and polls it only while the test awaits the `RunHandle`, a `wait_for_data`, a `send_callback` or a `send_callback_heartbeat`. Dropping the `RunHandle` and every `OperationHandle` stops the run; under `CloudRunner` the execution runs on without the runner.
+- **Why:** The run's driver is a future that the run's own futures poll in the test's task, and the runner starts no task of its own; under `LocalRunner` the driver awaits the service function inline, as `lambda_runtime` does in production. So after `wait_for_data` returns, a `LocalRunner` test reads the operation and replies before the run moves on, where a JavaScript test races the running execution.
+- **Decision:** Decision (2026-11-04): a lazy run that moves only while one of its futures is awaited.
+- **Where:** `src/test_util/live.rs`, `RunCore::drive`, `RunCore::poll_driver`, `RunState::hold_open` and `RunState::admit_invocation`; `src/test_util.rs`, `Backend::checkpoint_held`, `Backend::between_step` and `between_decision`.
+
+### Runner errors in live controls
+
+- **JavaScript:** The run's promise and each control settle on their own. A failed `Invoke`, or an invoke response without an execution ARN, rejects `run()` and leaves every pending waiter unsettled. A history read that fails on its third attempt ends the cloud run, and a local runner failure ends the local run; either run's end rejects every pending waiter with `Operation was not found after execution completion`. A waiter started after the run failed returns at once when the operation's recorded status matches, and otherwise never settles. After a local run failed, a callback control still sends its completion or heartbeat to the checkpoint server; a completion changes the stored callback even though no execution remains to consume it. `pauseExecution` and `resumeExecution` instead reject because no execution is in progress.
+- **Rust:** The run's terminal runner error is the first failure of the run itself: an event that fails to serialize, a `LocalRunner` run error, an output that does not decode, or, under `CloudRunner`, a failed `Invoke`, `NoExecutionArn`, or a status poll or final history read that fails on its third attempt. The `RunHandle` returns it, and so does every `wait_for_data` pending when the run fails. Under either runner, a `wait_for_data` started after the failure returns the last snapshot when it already reached the requested status, and returns the terminal error otherwise. Under `LocalRunner`, a callback control, `pause` or `resume` started after the failure returns the terminal error. Under `CloudRunner`, once the invoke has returned the execution's ARN, a callback control started after the failure, or in flight when it happens, makes its own calls and returns their outcome; before that, it returns the terminal error. A callback call's own failure fails only that control, and the run continues.
+- **Why:** A waiter that the run's failure leaves unanswered gets the failure's cause, instead of a generic not-found error or a wait until the test framework's timeout. A `LocalRunner` execution ends with its run, while a cloud execution can remain active in AWS.
+- **Decision:** Decision (2026-11-08): JavaScript defect. Rust returns the error that ended the run in the differing waiter and `LocalRunner` control cases.
+- **Where:** `src/test_util/live.rs`, `RunCore::failed`, `RunCore::poll_driver`, `RunState::record_failure`, `RunState::commit` and `CloudShared::wait_for_data_outcome`.
+
+### `wait_for_data` result
+
+- **JavaScript:** `waitForData` resolves with the operation object itself, whose data the runner keeps updating, so a later read of it shows the operation's latest state.
+- **Rust:** `wait_for_data` returns an owned `TestOperation`: the operation at the moment it reached the status, which does not change later. `OperationHandle::snapshot()` returns the operation now: the backend's record under `LocalRunner`, and under `CloudRunner` the operation in the newest history read, which a control or the run's final history read makes.
+- **Why:** An owned value is the Rust form of a result: it holds the state that satisfied the wait, and `snapshot()` reads a newer state when the test asks for one.
+- **Decision:** Decision (2026-11-04): return the operation that reached the status, and read later states with `snapshot()`.
+- **Where:** `src/test_util/live.rs`, `OperationHandle::wait_for_data`, `OperationHandle::snapshot`, `RunCore::operations` and `RunState::recheck`.
+
+### `wait_for_callback` `Completed`
+
+- **JavaScript:** A `waitForCallback` context reaches `COMPLETED` when its callback child ends, while the context itself can still be `STARTED`. A wait made after the context ended returns at once from the context's own status.
+- **Rust:** A `wait_for_callback` context reaches `Completed` once its callback child and the context itself have a terminal status, so `wait_for_data` returns the finished context with its result.
+- **Why:** The context records its own `SUCCEED` or `FAIL` only after its callback ended, and the operation that `wait_for_data` returns does not change later. Under the JavaScript rule the wait can end while the context is still `STARTED`, and the returned operation would keep that state, without the context's result.
+- **Decision:** Decision (2026-11-07): `Completed` waits for the terminal context.
+- **Where:** `src/test_util/live.rs`, `status_reached`.
+
+### Waiting after the run ended
+
+- **JavaScript:** A `waitForData` made after `run()` resolved returns at once when the operation's recorded status matches. Otherwise its promise never settles, because the run cleared its waiters when it ended, so the test waits until the test framework's timeout.
+- **Rust:** A `wait_for_data` made after the run finished with a `TestResult` returns the operation's final state when it reached the status, and `OperationNotReached(status)` otherwise. "Runner errors in live controls" covers a run that failed.
+- **Why:** A wait that can no longer be satisfied fails at once, naming the status it waited for, instead of holding the test until the test framework's timeout.
+- **Decision:** JavaScript defect and Decision (2026-11-04): answer a late wait from the run's final state.
+- **Where:** `src/test_util/live.rs`, `OperationHandle::wait_for_data` and `CloudShared::wait_for_data_outcome`.
+
+### `CloudRunner` poll budget
+
+- **JavaScript:** `CloudDurableTestRunner` takes `pollInterval` and `invocationType` and has no poll limit: its history poller reads until the execution ends.
+- **Rust:** `CloudRunner::max_poll_attempts(n)` gives the run one budget of `n` polls. Each `GetDurableExecution` poll of the run's driver and each history read of `wait_for_data`, `send_callback` and `send_callback_heartbeat` spends one, however many attempts and pages it takes, and the history read that builds the final `TestResult` spends none. Once the budget is spent, the run returns a `TestResult` with `ExecutionStatus::Running` and the error message `execution <arn> still running after <n> polls`, `wait_for_data` decides on the newest history read and returns `OperationNotReached` when it does not match, and a callback control acts on that read. Without `max_poll_attempts`, the runner polls until the execution ends, as in JavaScript.
+- **Why:** A test bounds a run against a deployed function without relying on the test framework's timeout, and one budget bounds the run's waiters together with the run.
+- **Decision:** Decision (2026-11-04): one poll budget for the driver's status polls and the controls' history reads.
+- **Where:** `src/test_util.rs`, `CloudRunner::max_poll_attempts` and `CloudRunner::drive`; `src/test_util/live.rs`, `RunState::take_poll` and `CloudShared::begin_history`.
+
+### `CloudRunner` execution status read
+
+- **JavaScript:** `CloudDurableTestRunner` polls `GetDurableExecutionHistory` only. The last terminal history event supplies the run's status, result or error.
+- **Rust:** `CloudRunner` polls `GetDurableExecution` until its status is terminal, then reads `GetDurableExecutionHistory`. The credentials for a cloud test therefore need `lambda:GetDurableExecution` in addition to `lambda:GetDurableExecutionHistory`. The terminal history event, when present, supplies the result or error. When the history has no terminal execution event, the `GetDurableExecution` response supplies the terminal status and result or error. Rust does not use its execution start or end timestamp; operation timing comes from history event timestamps.
+- **Why:** The Python SDK's cloud runner polls the status the same way ([Python runner.py:1366-1404, `_wait_for_completion` polls `GetDurableExecution`](https://github.com/aws/aws-durable-execution-sdk-python/blob/c0a173b55d926189869b0167df0f2299ce5789dd/packages/aws-durable-execution-sdk-python-testing/src/aws_durable_execution_sdk_python_testing/runner.py?plain=1#L1366-L1404)). The status read also lets the runner complete from the execution record when the final history has no terminal execution event.
+- **Decision:** Decision (2026-11-08): keep the status read, as the Python SDK does, and document its permission.
+- **Where:** `src/test_util.rs`, `CloudApi::send_get_durable_execution`, `CloudRunner::drive`, `terminal_execution_event`, `fold_history` and `TestResult`.
+
+### Callback reply target
+
+- **JavaScript:** `sendCallbackSuccess`, `sendCallbackFailure` and `sendCallbackHeartbeat` take the callback ID from the operation data the runner already holds, and throw `Could not find callback details` when it holds none. They check no status: the local checkpoint server records a new outcome over a callback that already ended, and the cloud runner leaves the check to the service.
+- **Rust:** `send_callback` and `send_callback_heartbeat` read the operation's current state first: the backend's records under `LocalRunner`, and a new history read under `CloudRunner`, or the newest read once the poll budget is spent. So a reply needs no earlier `wait_for_data`. `send_callback` refuses a callback that is not waiting for a reply with `CallbackNotPending` before any callback call, and so does `send_callback_heartbeat` under `LocalRunner`. The `LocalRunner` terminal-error rule in "Runner errors in live controls" takes precedence after a failed run.
+- **Why:** The reply goes to the callback that the selector names at the moment of the call, also when the test never waited for the operation, and a reply to a callback that already ended fails before it reaches the backend or the service.
+- **Decision:** Decision (2026-11-04): read the operation's current state before every reply.
+- **Where:** `src/test_util/live.rs`, `callback_target`, `CloudShared::control_operations`, `CloudShared::send_callback_outcome` and `CloudShared::send_heartbeat_outcome`; `src/test_util.rs`, `reply_live` and `check_heartbeat`.
+
+### Live controls under `RequestResponse`
+
+- **JavaScript:** Only `waitForData` requires `InvocationType.Event`. Under `RequestResponse`, `run()` awaits the invoke before it reads any history, so until the invoke returns a callback call finds no data and throws `Could not find callback details`.
+- **Rust:** Under `CloudRunner` with `InvocationType::RequestResponse`, the default, `wait_for_data`, `send_callback` and `send_callback_heartbeat` return `Unsupported` at once, without polling the run or calling AWS, with a text that names the control, such as `send_callback with InvocationType::RequestResponse (use InvocationType::Event)`.
+- **Why:** A control needs the execution's history while the execution runs, and only an `Event` invoke returns the execution's ARN before the execution ends.
+- **Decision:** Decision (2026-11-04): reject every live control under `RequestResponse` before any call.
+- **Where:** `src/test_util/live.rs`, `WAIT_FOR_DATA_REQUEST_RESPONSE_UNSUPPORTED`, `SEND_CALLBACK_REQUEST_RESPONSE_UNSUPPORTED` and `SEND_CALLBACK_HEARTBEAT_REQUEST_RESPONSE_UNSUPPORTED`, and the `CloudShared` methods `wait_for_data_outcome`, `send_callback_outcome` and `send_heartbeat_outcome`.
 
 ### Backend validation
 
