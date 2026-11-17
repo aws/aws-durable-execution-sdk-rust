@@ -1,0 +1,89 @@
+name: Telemetry Conformance Tests
+
+# Builds the Durable Execution Telemetry conformance handlers in
+# conformance/telemetry/. The shared telemetry-suite workflow of
+# aws-durable-execution-conformance-tests deploys them, runs them, and
+# validates the records in CloudWatch Logs.
+
+on:
+  pull_request:
+    # feat/telemetry-exporter is the branch of the telemetry exporter PR,
+    # which this PR is stacked on. Remove it when this PR targets main.
+    branches: [main, feat/telemetry-exporter]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "telemetry-exporter/**"
+      - "conformance/telemetry/**"
+      - "conformance/Cargo.toml"
+      - "conformance/Cargo.lock"
+      - "conformance/build_examples.sh"
+      - "scripts/telemetry-conformance-setup.sh"
+      - ".github/workflows/telemetry-conformance-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "telemetry-exporter/**"
+      - "conformance/telemetry/**"
+      - "conformance/Cargo.toml"
+      - "conformance/Cargo.lock"
+      - "conformance/build_examples.sh"
+      - "scripts/telemetry-conformance-setup.sh"
+      - ".github/workflows/telemetry-conformance-tests.yml"
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: AWS region
+        required: true
+        default: us-west-2
+        type: string
+      conformance_test_ref:
+        description: Optional conformance test commit SHA or branch name. Empty uses the shared workflow commit.
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  telemetry:
+    # Fork and Dependabot pull requests cannot read the test account's
+    # secrets. So the job runs for every other event, and for pull requests
+    # from branches of this repository by other actors.
+    if: github.event_name != 'pull_request' || (github.actor != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      contents: read
+      id-token: write
+    # The pinned SHA also selects the runner and telemetry extension that the
+    # shared workflow installs. At that commit the suite has the requirements
+    # telemetry-1 to telemetry-4, which match the handlers in
+    # conformance/telemetry/. Advance the pin when this repository adds
+    # handlers for later requirements.
+    uses: aws/aws-durable-execution-conformance-tests/.github/workflows/telemetry-suite.yml@30915949a9f08023f6227357338d3a7cf1495313
+    with:
+      language: rust
+      resource_prefix: rust
+      sdk_repository: aws/aws-durable-execution-sdk-rust
+      sdk_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The path is relative to the conformance checkout. The shared workflow
+      # checks this repository out at .build/durable-sdk.
+      examples_dir: .build/durable-sdk/conformance/telemetry
+      conformance_test_ref: ${{ inputs.conformance_test_ref }}
+      aws_region: ${{ inputs.aws_region || 'us-west-2' }}
+      runs_on: codebuild-github-actions-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      timeout_minutes: 50
+      setup_command: |
+        . "$SDK_CHECKOUT/scripts/telemetry-conformance-setup.sh"
+      # SAM builds each provided.al2023 function with BuildMethod: makefile.
+      # The generated Makefile only copies publish/<handler>/bootstrap. So
+      # the binaries must exist before the runner calls sam build.
+      prepare_command: |
+        sh "$SDK_CHECKOUT/conformance/build_examples.sh" telemetry
+    secrets:
+      CONFORMANCE_TEST_ROLE_ARN: ${{ secrets.TEST_ROLE_ARN }}
+      CONFORMANCE_TEST_ACCOUNT_ID: ${{ secrets.TEST_ACCOUNT_ID }}
+      CONFORMANCE_TEST_LAMBDA_EXECUTION_ROLE_ARN: ${{ secrets.TEST_LAMBDA_EXECUTION_ROLE_ARN }}

@@ -22,6 +22,7 @@ members = [
     "combinator/*",
     "static_typing/*",
     "plugin/*",
+    "telemetry/*",
 ]
 resolver = "2"
 
