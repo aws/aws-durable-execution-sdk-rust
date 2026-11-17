@@ -109,11 +109,11 @@ telemetry exporter are four independent cargo workspaces, each with its own
 lint table. The telemetry exporter's table copies the root table. The tables share a
 common core (the panic restriction lints, `missing_docs`, `unsafe_code =
 "forbid"`) but already differ in the groups they enable and the extra lints they
-carry. The root workspace adds `unreachable_pub`, `missing_debug_implementations`,
-`unused_qualifications`, and the `cargo` clippy group; the conformance and examples
-workspaces omit those. A lint policy change that you intend to apply across the
-project must update all applicable `Cargo.toml` files, and the pull request should
-say why.
+carry. The root and telemetry exporter workspaces add `unreachable_pub`,
+`missing_debug_implementations`, `unused_qualifications`, and the `cargo` clippy
+group; the conformance and examples workspaces omit those. A lint policy change
+that you intend to apply across the project must update all applicable
+`Cargo.toml` files, and the pull request should say why.
 
 `make check` covers the SDK workspace only, and it keeps your environment, so
 your incremental build cache survives it. `make ci` runs everything `ci.yml`
@@ -125,9 +125,10 @@ runs on a push to `main`, and it needs no AWS:
   `Cargo.toml` does not name;
 - `feature-powerset`, which compiles every feature combination with
   cargo-hack;
-- `workspaces`, which checks the formatting of the `conformance` and
-  `examples` workspaces, builds Cargo's default members and lints every
-  workspace member, so a public API change that breaks them fails;
+- `workspaces`, which checks the formatting of the `conformance`, `examples`
+  and `telemetry-exporter` workspaces, builds Cargo's default members and
+  lints every workspace member, so a public API change that breaks them
+  fails. It also runs the `telemetry-exporter` tests and doc build;
 - `pins`, which fails when `scripts/tools.sh` and a workflow name different
   versions of a pinned tool.
 
