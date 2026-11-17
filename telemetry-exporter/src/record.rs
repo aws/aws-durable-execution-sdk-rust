@@ -87,14 +87,12 @@ impl ErrorRecord {
 
 /// Caps `text` at [`MAX_TEXT_LENGTH`] code points, then appends `…`.
 pub(crate) fn cap_text(text: &str) -> String {
-    match text.char_indices().nth(MAX_TEXT_LENGTH) {
-        Some((cut, _)) => {
-            let mut capped = text.get(..cut).unwrap_or(text).to_owned();
-            capped.push('…');
-            capped
-        }
-        None => text.to_owned(),
+    let mut chars = text.chars();
+    let mut capped: String = chars.by_ref().take(MAX_TEXT_LENGTH).collect();
+    if chars.next().is_some() {
+        capped.push('…');
     }
+    capped
 }
 
 /// One operation of the execution.
