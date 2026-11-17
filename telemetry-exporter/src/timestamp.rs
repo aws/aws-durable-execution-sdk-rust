@@ -45,12 +45,12 @@ pub(crate) fn system_time(ms: i64) -> SystemTime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Civil {
     pub(crate) year: i64,
-    pub(crate) month: u32,
-    pub(crate) day: u32,
-    pub(crate) hour: u32,
-    pub(crate) minute: u32,
-    pub(crate) second: u32,
-    pub(crate) millisecond: u32,
+    pub(crate) month: i64,
+    pub(crate) day: i64,
+    pub(crate) hour: i64,
+    pub(crate) minute: i64,
+    pub(crate) second: i64,
+    pub(crate) millisecond: i64,
 }
 
 const MS_PER_DAY: i64 = 86_400_000;
@@ -74,18 +74,14 @@ impl Civil {
         let month = if mp < 10 { mp + 3 } else { mp - 9 };
         let year = yoe + era * 400 + i64::from(month <= 2);
 
-        // Every field below is bounded by the arithmetic above (a day of
-        // month at most 31, a millisecond of day below 86_400_000), so each
-        // conversion succeeds; the fallback is unreachable.
-        let small = |value: i64| u32::try_from(value).unwrap_or(0);
         Self {
             year,
-            month: small(month),
-            day: small(day),
-            hour: small(of_day / 3_600_000),
-            minute: small(of_day / 60_000 % 60),
-            second: small(of_day / 1000 % 60),
-            millisecond: small(of_day % 1000),
+            month,
+            day,
+            hour: of_day / 3_600_000,
+            minute: of_day / 60_000 % 60,
+            second: of_day / 1000 % 60,
+            millisecond: of_day % 1000,
         }
     }
 }
