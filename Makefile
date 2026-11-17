@@ -57,9 +57,15 @@ msrv:
 	. scripts/tools.sh && require cargo msrv-toolchain
 	sh scripts/check-msrv.sh
 
+# The telemetry exporter is its own workspace with its own Cargo.lock, so
+# the root cargo deny run does not read its graph. The second deny line
+# checks that graph against the same deny.toml. check-direct-deps.sh stays
+# root-only: the exporter is a separate workspace because its direct
+# dependencies are outside the SDK allowlist.
 dependencies:
 	. scripts/tools.sh && require cargo cargo-deny
 	cargo deny --all-features check
+	cargo deny --manifest-path telemetry-exporter/Cargo.toml --config deny.toml --all-features check
 	sh scripts/check-direct-deps.sh
 
 # CI's workflow-wide RUSTFLAGS='-D warnings' belongs to the stable lint

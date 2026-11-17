@@ -94,6 +94,7 @@ targets after a failure:
 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | a broken intra-doc link or malformed rustdoc markup anywhere in the documented surface, including feature-gated items |
 | `sh scripts/check-msrv-consistency.sh` | a `rust-version` declaration (in any manifest, the `msrv` CI job, or the README) that disagrees with the root `Cargo.toml`'s |
 | `cargo deny --all-features check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source, in the graph with every feature enabled |
+| `cargo deny --manifest-path telemetry-exporter/Cargo.toml --config deny.toml --all-features check` | the same license, advisory and source violations in the telemetry exporter's separate graph, which the root run does not read |
 | `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in either the default-feature or the all-features graph |
 | `sh scripts/check-msrv.sh` | code that does not compile warning-free on the declared minimum supported Rust version |
 
