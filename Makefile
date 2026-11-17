@@ -16,10 +16,11 @@ CI_TARGETS = pins check-sdk msrv dependencies external-types feature-powerset wo
 # the formatting, builds Cargo's default members and lints every workspace
 # member. CI's matrix passes one, for example
 # `make workspaces WORKSPACES=conformance`.
-WORKSPACES ?= conformance examples
+WORKSPACES ?= conformance examples telemetry-exporter
 WORKSPACE_TARGETS = $(addprefix workspace-,$(WORKSPACES))
 
 .PHONY: check ci $(CI_TARGETS) $(WORKSPACE_TARGETS) summary-order-consumer-test \
+	telemetry-exporter-test \
 	test-role conformance conformance-build conformance-run cloud-tests
 
 # The quality gate for every change: the check-sdk, dependencies and msrv
@@ -87,6 +88,15 @@ $(WORKSPACE_TARGETS): workspace-%:
 workspace-examples: summary-order-consumer-test
 summary-order-consumer-test:
 	cd examples && cargo test --locked -p parallel_heterogeneous
+
+# The telemetry exporter is a separate workspace because exporters that
+# need an AWS service client depend on crates that the SDK's dependency
+# allowlist does not include. So its tests and doc build run here, not in
+# check-sdk.
+workspace-telemetry-exporter: telemetry-exporter-test
+telemetry-exporter-test:
+	cd telemetry-exporter && cargo test --locked
+	cd telemetry-exporter && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --locked
 
 # Targets that deploy to AWS. They need TEST_ACCOUNT_ID.
 test-role:

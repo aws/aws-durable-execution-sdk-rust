@@ -1555,6 +1555,10 @@ the hooks it needs. The `plugin` module's rustdoc gives each hook's full
 contract, and [Differences from the JavaScript SDK](docs/differences-from-js.md#plugins)
 lists where plugins behave differently from the JavaScript SDK.
 
+The [`telemetry-exporter`](telemetry-exporter/README.md) crate is a
+ready-made plugin. It writes one Durable Execution Telemetry record per
+execution, in the schema of the other SDKs' telemetry exporters.
+
 Example 1 counts the `on_operation_end` calls of each invocation and adds
 them to a total that the factory keeps across invocations.
 

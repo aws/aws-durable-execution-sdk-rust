@@ -47,7 +47,8 @@ version is an intentional, documented change: an MSRV bump ships as a minor
 release (1.x → 1.x+1), never as a patch, and the
 change must update every declaration in the same pull request: the root
 `Cargo.toml` is the source of truth, and every `Cargo.toml` under
-`conformance/` and `examples/` that declares `rust-version` (200+ manifests),
+`conformance/`, `examples/` and `telemetry-exporter/` that declares
+`rust-version` (200+ manifests),
 the `msrv` CI job, and the README must agree with it.
 `scripts/check-msrv-consistency.sh`, wired into `make check`, enforces this
 mechanically, so a bump that misses a declaration fails `make check`
@@ -103,8 +104,9 @@ warns by default; `RUSTDOCFLAGS="-D warnings"` makes a broken link a build
 failure.
 
 The lint configuration lives in `[workspace.lints]` in each workspace's
-`Cargo.toml`. The SDK, the conformance handlers, and the examples are three
-independent cargo workspaces, each with its own lint table. The tables share a
+`Cargo.toml`. The SDK, the conformance handlers, the examples, and the
+telemetry exporter are four independent cargo workspaces, each with its own
+lint table. The telemetry exporter's table copies the root table. The tables share a
 common core (the panic restriction lints, `missing_docs`, `unsafe_code =
 "forbid"`) but already differ in the groups they enable and the extra lints they
 carry. The root workspace adds `unreachable_pub`, `missing_debug_implementations`,
@@ -331,8 +333,9 @@ version with an `msrv` job, guards the public API surface with an
 allowlist under `[package.metadata.cargo_check_external_types]` in
 `Cargo.toml` names it deliberately), proves every feature combination compiles
 with a `feature-powerset` job (cargo-hack), then checks the formatting of the
-`conformance` and `examples` workspaces, builds Cargo's default members and
-lints every workspace member.
+`conformance`, `examples` and `telemetry-exporter` workspaces, builds Cargo's
+default members and lints every workspace member. It also runs the
+`telemetry-exporter` tests and doc build.
 `codeql.yml` runs static analysis over the Rust sources.
 `conformance-tests.yml` runs the ten conformance suites when the SDK or the
 handlers change. `cloud-tests.yml` deploys the example stacks and runs the cloud
