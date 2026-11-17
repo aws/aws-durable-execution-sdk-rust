@@ -1,7 +1,6 @@
 //! The plugin factory and the per-invocation plugin.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aws_durable_execution_sdk::BoxError;
@@ -230,9 +229,6 @@ struct TelemetryInvocation {
     arn: ParsedArn,
     start_ms: i64,
     input: Option<Value>,
-    /// Set when the invocation ended the execution. A later change must
-    /// not publish a `RUNNING` record after the terminal one.
-    closed: AtomicBool,
     /// The `emittedAt` of the last record, in epoch milliseconds.
     last_emitted_ms: Mutex<Option<i64>>,
 }
@@ -246,7 +242,6 @@ impl TelemetryInvocation {
             arn: ParsedArn::parse(info.execution_arn()),
             start_ms: execution_start_ms(info),
             input: Some(parse_payload(info.execution_input())),
-            closed: AtomicBool::new(false),
             last_emitted_ms: Mutex::new(None),
         }
     }
@@ -320,7 +315,7 @@ impl Plugin for TelemetryInvocation {
     /// In on-change mode, schedules a `RUNNING` record and returns the work
     /// that exports it.
     fn on_operation_change(&self, info: &OperationChangeInfo) -> HookWork {
-        if self.env.emit_mode != EmitMode::OnChange || self.closed.load(Ordering::SeqCst) {
+        if self.env.emit_mode != EmitMode::OnChange {
             return Ok(None);
         }
         self.slot.schedule(self.running_record(info.operations()));
@@ -346,9 +341,6 @@ impl Plugin for TelemetryInvocation {
             EmitMode::OnFailure => status == ExecutionStatus::Failed,
             EmitMode::OnComplete => status.is_terminal(),
         };
-        if status.is_terminal() {
-            self.closed.store(true, Ordering::SeqCst);
-        }
         if emit {
             let record = self.build_record(
                 status,
