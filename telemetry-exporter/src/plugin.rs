@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use aws_durable_execution_sdk::BoxError;
 use aws_durable_execution_sdk::plugin::{
@@ -197,16 +198,30 @@ impl PluginFactory for DurableExecutionTelemetry {
 /// agrees on. The current time is the last resort, and it makes the
 /// duration cover only this invocation.
 fn execution_start_ms(info: &InvocationInfo) -> i64 {
-    info.execution_start_timestamp()
+    first_known_start_ms(
+        info.execution_start_timestamp(),
+        info.operations()
+            .values()
+            .filter_map(OperationInfo::start_timestamp),
+        now_ms,
+    )
+}
+
+/// The fallback order of [`execution_start_ms`]: `reported`, then the
+/// oldest of `operation_starts`, then `now`.
+///
+/// The SDK builds an `InvocationInfo` only inside its own crate, and its
+/// local runner always reports the execution start. So this crate's tests
+/// reach the two fallbacks only through this function.
+fn first_known_start_ms(
+    reported: Option<SystemTime>,
+    operation_starts: impl IntoIterator<Item = SystemTime>,
+    now: impl FnOnce() -> i64,
+) -> i64 {
+    reported
         .map(epoch_ms)
-        .or_else(|| {
-            info.operations()
-                .values()
-                .filter_map(OperationInfo::start_timestamp)
-                .map(epoch_ms)
-                .min()
-        })
-        .unwrap_or_else(now_ms)
+        .or_else(|| operation_starts.into_iter().map(epoch_ms).min())
+        .unwrap_or_else(now)
 }
 
 /// Returns `now`, or 1 ms after `last` when `now` is not later, and stores
@@ -361,6 +376,29 @@ impl Plugin for TelemetryInvocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timestamp::system_time;
+
+    fn never_called() -> i64 {
+        unreachable!("the current time is the last resort")
+    }
+
+    #[test]
+    fn the_reported_start_wins_over_an_older_operation_start() {
+        let start =
+            first_known_start_ms(Some(system_time(5_000)), [system_time(1_000)], never_called);
+        assert_eq!(start, 5_000);
+    }
+
+    #[test]
+    fn without_a_reported_start_the_oldest_operation_start_is_used() {
+        let starts = [system_time(3_000), system_time(1_000), system_time(2_000)];
+        assert_eq!(first_known_start_ms(None, starts, never_called), 1_000);
+    }
+
+    #[test]
+    fn without_any_start_the_current_time_is_used() {
+        assert_eq!(first_known_start_ms(None, [], || 7), 7);
+    }
 
     #[test]
     fn emitted_at_strictly_increases() {
