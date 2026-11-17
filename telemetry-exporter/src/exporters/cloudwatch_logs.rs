@@ -5,7 +5,9 @@ use std::sync::Mutex;
 
 use aws_durable_execution_sdk::BoxError;
 use aws_sdk_cloudwatchlogs::Client;
+use aws_sdk_cloudwatchlogs::error::SdkError;
 use aws_sdk_cloudwatchlogs::operation::create_log_stream::CreateLogStreamError;
+use aws_sdk_cloudwatchlogs::operation::put_log_events::PutLogEventsError;
 use aws_sdk_cloudwatchlogs::types::InputLogEvent;
 
 use super::DEFAULT_MAX_RECORD_SIZE_BYTES;
@@ -28,6 +30,8 @@ const DEFAULT_LOG_STREAM_PREFIX: &str = "durable-execution-telemetry/";
 /// The function's role needs `logs:CreateLogStream` and
 /// `logs:PutLogEvents` on the log group. The exporter creates each day's
 /// stream on its first record and treats an existing stream as created.
+/// If a write fails because the stream no longer exists, the exporter
+/// creates the stream again and resends the record once.
 #[derive(Debug)]
 pub struct CloudWatchLogsExporter {
     log_group_name: String,
@@ -117,15 +121,50 @@ impl CloudWatchLogsExporter {
             .timestamp(now)
             .message(message)
             .build()?;
+        match self.put_event(client, &stream, event.clone()).await {
+            Ok(()) => Ok(()),
+            Err(error) if is_stream_missing(&error) => {
+                // `created_streams` records that a stream existed at its first
+                // write. The stream can be deleted later. Without this removal,
+                // `ensure_stream` would skip CreateLogStream, and every later
+                // write to the stream would fail. So the name is removed, the
+                // stream is created again, and the event is resent once.
+                lock(&self.created_streams).remove(&stream);
+                self.ensure_stream(client, &stream).await?;
+                self.put_event(client, &stream, event).await?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Sends `event` to `stream` with one `PutLogEvents` request.
+    ///
+    /// The error is boxed because `SdkError<PutLogEventsError>` is several
+    /// hundred bytes, which clippy's `result_large_err` rejects.
+    async fn put_event(
+        &self,
+        client: &Client,
+        stream: &str,
+        event: InputLogEvent,
+    ) -> Result<(), Box<SdkError<PutLogEventsError>>> {
         client
             .put_log_events()
             .log_group_name(&self.log_group_name)
             .log_stream_name(stream)
             .log_events(event)
             .send()
-            .await?;
+            .await
+            .map_err(Box::new)?;
         Ok(())
     }
+}
+
+/// Whether `PutLogEvents` failed because the log stream does not exist.
+fn is_stream_missing(error: &SdkError<PutLogEventsError>) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(PutLogEventsError::is_resource_not_found_exception)
 }
 
 impl CloudWatchLogsExporterBuilder {
@@ -192,9 +231,11 @@ mod tests {
     use aws_sdk_cloudwatchlogs::operation::create_log_stream::{
         CreateLogStreamError, CreateLogStreamOutput,
     };
-    use aws_sdk_cloudwatchlogs::operation::put_log_events::PutLogEventsOutput;
+    use aws_sdk_cloudwatchlogs::operation::put_log_events::{
+        PutLogEventsError, PutLogEventsOutput,
+    };
     use aws_sdk_cloudwatchlogs::types::error::{
-        InvalidParameterException, ResourceAlreadyExistsException,
+        InvalidParameterException, ResourceAlreadyExistsException, ResourceNotFoundException,
     };
     use aws_smithy_mocks::{RuleMode, mock, mock_client};
 
@@ -304,6 +345,96 @@ mod tests {
         assert!(exporter.export(&r).await.is_err());
         assert_eq!(create.num_calls(), 2);
         assert_eq!(put.num_calls(), 0);
+    }
+
+    fn stream_not_found() -> PutLogEventsError {
+        PutLogEventsError::ResourceNotFoundException(ResourceNotFoundException::builder().build())
+    }
+
+    #[tokio::test]
+    async fn a_deleted_stream_is_created_again_and_the_record_is_resent() {
+        let create = mock!(Client::create_log_stream)
+            .then_output(|| CreateLogStreamOutput::builder().build());
+        let put = mock!(Client::put_log_events)
+            .sequence()
+            .error(stream_not_found)
+            .output(|| PutLogEventsOutput::builder().build())
+            .times(2)
+            .build();
+        let client = mock_client!(aws_sdk_cloudwatchlogs, RuleMode::MatchAny, [&create, &put]);
+        let exporter = CloudWatchLogsExporter::builder("group")
+            .client(client)
+            .build();
+
+        let r = record(Vec::new());
+        assert!(exporter.export(&r).await.is_ok());
+        // The stream is cached again, so the next record makes no create call.
+        assert!(exporter.export(&r).await.is_ok());
+        assert_eq!(create.num_calls(), 2);
+        assert_eq!(put.num_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_log_group_fails_the_export_and_is_retried_next_time() {
+        let create = mock!(Client::create_log_stream)
+            .sequence()
+            .output(|| CreateLogStreamOutput::builder().build())
+            .error(|| {
+                CreateLogStreamError::ResourceNotFoundException(
+                    ResourceNotFoundException::builder().build(),
+                )
+            })
+            .output(|| CreateLogStreamOutput::builder().build())
+            .build();
+        let put = mock!(Client::put_log_events)
+            .sequence()
+            .error(stream_not_found)
+            .output(|| PutLogEventsOutput::builder().build())
+            .build();
+        let client = mock_client!(aws_sdk_cloudwatchlogs, RuleMode::MatchAny, [&create, &put]);
+        let exporter = CloudWatchLogsExporter::builder("group")
+            .client(client)
+            .build();
+
+        let r = record(Vec::new());
+        assert!(exporter.export(&r).await.is_err());
+        assert!(exporter.export(&r).await.is_ok());
+        assert_eq!(create.num_calls(), 3);
+        assert_eq!(put.num_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_stays_missing_is_resent_only_once() {
+        let create = mock!(Client::create_log_stream)
+            .then_output(|| CreateLogStreamOutput::builder().build());
+        let put = mock!(Client::put_log_events).then_error(stream_not_found);
+        let client = mock_client!(aws_sdk_cloudwatchlogs, RuleMode::MatchAny, [&create, &put]);
+        let exporter = CloudWatchLogsExporter::builder("group")
+            .client(client)
+            .build();
+
+        assert!(exporter.export(&record(Vec::new())).await.is_err());
+        assert_eq!(create.num_calls(), 2);
+        assert_eq!(put.num_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn another_put_error_fails_the_export_without_a_resend() {
+        let create = mock!(Client::create_log_stream)
+            .then_output(|| CreateLogStreamOutput::builder().build());
+        let put = mock!(Client::put_log_events).then_error(|| {
+            PutLogEventsError::InvalidParameterException(
+                InvalidParameterException::builder().build(),
+            )
+        });
+        let client = mock_client!(aws_sdk_cloudwatchlogs, RuleMode::MatchAny, [&create, &put]);
+        let exporter = CloudWatchLogsExporter::builder("group")
+            .client(client)
+            .build();
+
+        assert!(exporter.export(&record(Vec::new())).await.is_err());
+        assert_eq!(create.num_calls(), 1);
+        assert_eq!(put.num_calls(), 1);
     }
 
     #[tokio::test]
