@@ -7,8 +7,8 @@
 # only: any workspace member adding a [dependencies] entry not in the
 # allowlists causes a non-zero exit and a clear error message.
 #
-# Two graphs are checked, because an optional dependency hides from the
-# default-feature graph:
+# Two graphs of the root workspace are checked, because an optional
+# dependency hides from the default-feature graph:
 #
 #   1. Default features: only the ALWAYS_ON allowlist may appear. This is
 #      the graph every consumer gets, so an optional crate leaking into it
@@ -16,6 +16,10 @@
 #   2. --all-features: ALWAYS_ON plus OPTIONAL_ALLOWLIST may appear. This
 #      closes the loophole where an unapproved crate rides in behind a
 #      feature flag and never shows up in pass 1.
+#
+# The telemetry exporter (telemetry-exporter/) is a separate workspace, so
+# passes 1 and 2 do not read it. Pass 3 checks its graph against
+# EXPORTER_ALLOWLIST.
 #
 # Wired into `make check`. See also deny.toml for the rationale comment.
 #
@@ -38,6 +42,12 @@ ALWAYS_ON="aws-config aws-sdk-lambda lambda_runtime serde serde_json sha2 tokio 
 # policy approval as ALWAYS_ON (see CONTRIBUTING.md, "Dependency policy") and
 # a note here naming the feature that gates it. There are none today.
 OPTIONAL_ALLOWLIST=""
+
+# The direct production dependencies of the telemetry exporter. The exporter
+# is a separate workspace with its own closed list (see CONTRIBUTING.md,
+# "Dependency policy"). The path dependency on the SDK is not listed: the
+# parser skips path dependencies.
+EXPORTER_ALLOWLIST="aws-config aws-sdk-cloudwatchlogs serde serde_json tokio tracing"
 
 # check_graph <allowlist> <label> [extra cargo-tree args...]
 # Parses `cargo tree --workspace --depth 1 -e normal` for the given feature
@@ -86,6 +96,12 @@ check_graph() {
             case "$line" in
                 *"(*)"*) continue ;;
                 *"(/"*")"*)
+                    # A path dependency of a member also has a local path.
+                    # A blank line ends each member section. So a local
+                    # path inside an open section is a path dependency.
+                    # Starting a new section there would report the
+                    # member's later dependencies under the wrong crate.
+                    [ -n "$current_member" ] && continue
                     # This is a workspace member line: extract name (first field).
                     current_member=$(echo "$line" | awk '{print $1}')
                     # Skip the conformance and test-tracing crates: they are
@@ -102,11 +118,6 @@ check_graph() {
 
             # Extract the dependency crate name (first field).
             dep=$(echo "$line" | awk '{print $1}')
-
-            # Skip workspace-internal path dependencies (they also have local paths).
-            case "$line" in
-                *"(/"*")"*) continue ;;
-            esac
 
             # Check against allowlist.
             allowed=0
@@ -130,8 +141,7 @@ check_graph() {
             echo "  ERROR: crate '$dep' is a direct dependency of workspace member '$member' but is NOT in the allowlist for this graph."
         done < "$VIOLATIONS_FILE"
         echo ""
-        echo "Always-on allowlist: $ALWAYS_ON"
-        echo "Optional (feature-gated) allowlist: ${OPTIONAL_ALLOWLIST:-none}"
+        echo "Allowlist for this graph: $allowlist"
         echo "To add a new production dependency, update the allowlists in scripts/check-direct-deps.sh"
         echo "and obtain design-spec approval. See CONTRIBUTING.md and deny.toml for policy."
         return 1
@@ -147,5 +157,12 @@ check_graph "$ALWAYS_ON" "default features" || exit 1
 # crates may appear.
 check_graph "$ALWAYS_ON $OPTIONAL_ALLOWLIST" "--all-features" --all-features || exit 1
 
+# Pass 3: the telemetry exporter's graph may contain only its own list. The
+# exporter declares no features today. --all-features keeps a feature that
+# is added later inside this check.
+check_graph "$EXPORTER_ALLOWLIST" "telemetry-exporter" \
+    --manifest-path telemetry-exporter/Cargo.toml --all-features || exit 1
+
 echo "direct-dep-allowlist OK: default-feature graph limited to the always-on allowlist;"
-echo "all-features graph adds only approved optional crates (${OPTIONAL_ALLOWLIST:-none})."
+echo "all-features graph adds only approved optional crates (${OPTIONAL_ALLOWLIST:-none});"
+echo "telemetry-exporter graph limited to its own allowlist."

@@ -95,7 +95,7 @@ targets after a failure:
 | `sh scripts/check-msrv-consistency.sh` | a `rust-version` declaration (in any manifest, the `msrv` CI job, or the README) that disagrees with the root `Cargo.toml`'s |
 | `cargo deny --all-features check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source, in the graph with every feature enabled |
 | `cargo deny --manifest-path telemetry-exporter/Cargo.toml --config deny.toml --all-features check` | the same license, advisory and source violations in the telemetry exporter's separate graph, which the root run does not read |
-| `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in either the default-feature or the all-features graph |
+| `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in the default-feature graph or the all-features graph of the root workspace, or in the telemetry exporter's graph |
 | `sh scripts/check-msrv.sh` | code that does not compile warning-free on the declared minimum supported Rust version |
 
 Two of those are stricter than their defaults. Clippy normally reports warnings
@@ -184,6 +184,14 @@ the script on its own, explain what the crate buys that the current set
 cannot, and expect the discussion to be about whether we take on the
 dependency at all. Development dependencies carry none of
 this weight: `deny.toml` sets `exclude-dev = true` and you may add one freely.
+
+The telemetry exporter (`telemetry-exporter/`) is a separate workspace, so
+the eight-crate list does not cover it. It has its own closed list in the
+same script, `EXPORTER_ALLOWLIST`: `aws-config`, `aws-sdk-cloudwatchlogs`,
+`serde`, `serde_json`, `tokio`, and `tracing`. A third `cargo tree` read
+checks the exporter's graph, and the script fails if that graph contains any
+other direct production dependency. The exporter list was set when the
+exporter was added. Changing it needs its own pull request.
 
 [`ReplayFilterLayer`]: https://github.com/aws/aws-durable-execution-sdk-rust/blob/main/src/tracing_layer.rs
 
