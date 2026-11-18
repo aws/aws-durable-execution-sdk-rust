@@ -230,12 +230,16 @@ where
                 }
             }
             // The record is PENDING until its retry timer fires. Wait until
-            // a checkpoint response carries the next status, then handle
-            // the record as a new invocation would: READY runs the next
-            // check cycle, a terminal status returns its outcome.
+            // a checkpoint response carries READY or a terminal status, as
+            // the step loop does, then handle the record as a new invocation
+            // would: READY runs the next check cycle, a terminal status
+            // returns its outcome. A STARTED record (a response that did not
+            // carry the RETRY's result) keeps waiting rather than starting
+            // the next check at once. When no other SDK work runs, the
+            // invocation suspends here instead.
             core.ctx
                 .wait_for_record(core.op_id.wire(), |status| {
-                    *status != CheckpointStatus::Pending
+                    *status == CheckpointStatus::Ready || status.is_terminal()
                 })
                 .await;
             resumed = true;

@@ -1054,3 +1054,244 @@ async fn refresh_failure_stops_later_writes() {
         "no request follows the refresh: {requests:?}"
     );
 }
+
+/// After a `wait_for_condition` check writes `RETRY`, the operation waits
+/// for `READY` or a terminal status, whatever status the `RETRY` response
+/// carries.
+mod wait_for_condition_retry {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision;
+    use aws_durable_execution_sdk::lambda_types::{
+        DateTime, Operation, OperationAction, OperationStatus, OperationType, OperationUpdate,
+        StepDetails, StepOptions,
+    };
+    use aws_durable_execution_sdk::{
+        BoxError, CheckpointOutput, DurableContext, ExecutionClient, ExecutionClientError,
+        GetStateOutput, Options, lambda_runtime,
+    };
+
+    use super::{execution_operation, payload, status};
+
+    /// How the transport answers a `RETRY`.
+    #[derive(Clone, Copy)]
+    enum RetryAnswer {
+        /// `PENDING` with the next attempt time, as the service answers.
+        Pending,
+        /// `STARTED`, with the `RETRY`'s payload as the result.
+        Started,
+    }
+
+    /// A step record the transport keeps: its attempt and its result.
+    #[derive(Default)]
+    struct Record {
+        attempt: i32,
+        result: Option<String>,
+    }
+
+    /// A transport that keeps one record per step, answers each checkpoint
+    /// with the records the request touched, and records the action of
+    /// every step update.
+    struct RetryTransport {
+        answer: RetryAnswer,
+        tokens: Mutex<u32>,
+        records: Mutex<Vec<(String, Record)>>,
+        actions: Mutex<Vec<OperationAction>>,
+    }
+
+    impl RetryTransport {
+        fn new(answer: RetryAnswer) -> Arc<Self> {
+            Arc::new(Self {
+                answer,
+                tokens: Mutex::new(0),
+                records: Mutex::new(Vec::new()),
+                actions: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn actions(&self) -> Vec<OperationAction> {
+            self.actions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        /// Applies a step update and returns the record the response carries.
+        fn apply(&self, update: &OperationUpdate) -> Option<Operation> {
+            if update.r#type() != &OperationType::Step {
+                return None;
+            }
+            self.actions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(update.action().clone());
+            let mut records = self
+                .records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !records.iter().any(|(id, _)| id == update.id()) {
+                records.push((update.id().to_owned(), Record::default()));
+            }
+            let (_, record) = records
+                .iter_mut()
+                .find(|(id, _)| id == update.id())
+                .expect("the record was just added");
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the clock is after the epoch")
+                .as_secs();
+            let now = i64::try_from(now).expect("the clock fits in an i64");
+            let mut next_attempt = None;
+            let status = match update.action() {
+                OperationAction::Start => OperationStatus::Started,
+                OperationAction::Retry => {
+                    record.attempt += 1;
+                    record.result = update.payload().map(str::to_owned);
+                    match self.answer {
+                        RetryAnswer::Pending => {
+                            let delay = update
+                                .step_options()
+                                .and_then(StepOptions::next_attempt_delay_seconds)
+                                .unwrap_or(1);
+                            next_attempt = Some(DateTime::from_secs(now + i64::from(delay)));
+                            OperationStatus::Pending
+                        }
+                        RetryAnswer::Started => OperationStatus::Started,
+                    }
+                }
+                OperationAction::Succeed => {
+                    record.result = update.payload().map(str::to_owned);
+                    OperationStatus::Succeeded
+                }
+                _ => OperationStatus::Failed,
+            };
+            let mut details = StepDetails::builder().attempt(record.attempt);
+            if let Some(result) = &record.result {
+                details = details.result(result);
+            }
+            if let Some(at) = next_attempt {
+                details = details.next_attempt_timestamp(at);
+            }
+            let mut builder = Operation::builder()
+                .id(update.id())
+                .r#type(OperationType::Step)
+                .status(status)
+                .start_timestamp(DateTime::from_secs(now))
+                .step_details(details.build());
+            if let Some(sub_type) = update.sub_type() {
+                builder = builder.sub_type(sub_type);
+            }
+            if let Some(name) = update.name() {
+                builder = builder.name(name);
+            }
+            Some(
+                builder
+                    .build()
+                    .expect("every required Operation field is set"),
+            )
+        }
+    }
+
+    impl ExecutionClient for RetryTransport {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            let operations = updates.iter().filter_map(|u| self.apply(u)).collect();
+            let mut tokens = self
+                .tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *tokens += 1;
+            let output = CheckpointOutput::new(Some(format!("t-{tokens}")), operations, None);
+            Box::pin(async move { Ok(output) })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            let output = GetStateOutput::new(vec![execution_operation()], None);
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
+    /// Runs one invocation of a handler whose `wait_for_condition` adds 1
+    /// to its state in each check and continues after 5 s until the state
+    /// is 3. Returns the response and the number of checks that ran.
+    async fn invoke_polling(transport: Arc<RetryTransport>) -> (serde_json::Value, u32) {
+        let checks = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&checks);
+        let service = aws_durable_execution_sdk::wrap(
+            move |_event: serde_json::Value, ctx: DurableContext| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    let state = ctx
+                        .wait_for_condition(
+                            move |_step, state: u32| {
+                                counted.fetch_add(1, Ordering::SeqCst);
+                                async move { Ok(state + 1) }
+                            },
+                            0_u32,
+                        )
+                        .wait_strategy_fn(|state: u32, _attempt| {
+                            if state >= 3 {
+                                WaitDecision::complete()
+                            } else {
+                                WaitDecision::continue_with(Duration::from_secs(5))
+                            }
+                        })
+                        .name("poll")
+                        .await?;
+                    Ok::<u32, BoxError>(state)
+                }
+            },
+            Options::builder()
+                .execution_client(transport)
+                .build()
+                .expect("execution_client alone is valid"),
+        );
+        let event =
+            lambda_runtime::LambdaEvent::new(payload(false), lambda_runtime::Context::default());
+        let response = tokio::time::timeout(Duration::from_secs(10), service(event))
+            .await
+            .expect("the invocation ends within 10 s")
+            .expect("the invocation returns an envelope");
+        let response = serde_json::to_value(&response).expect("the response serializes");
+        (response, checks.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn wait_for_condition_retry_answered_started_waits_for_ready() {
+        let transport = RetryTransport::new(RetryAnswer::Started);
+        let (response, checks) = invoke_polling(Arc::clone(&transport)).await;
+        assert_eq!(checks, 1, "{response} {:?}", transport.actions());
+        assert_eq!(
+            transport.actions(),
+            [OperationAction::Start, OperationAction::Retry]
+        );
+        assert_eq!(status(&response), Some("PENDING"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_condition_retry_answered_pending_suspends_after_one_check() {
+        let transport = RetryTransport::new(RetryAnswer::Pending);
+        let (response, checks) = invoke_polling(Arc::clone(&transport)).await;
+        assert_eq!(checks, 1, "{response} {:?}", transport.actions());
+        assert_eq!(
+            transport.actions(),
+            [OperationAction::Start, OperationAction::Retry]
+        );
+        assert_eq!(status(&response), Some("PENDING"), "{response}");
+    }
+}
