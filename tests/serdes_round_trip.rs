@@ -117,3 +117,95 @@ async fn child_returns_round_tripped_value_live_and_on_replay() {
     let seen = seen.lock().expect("lock").clone();
     assert_round_tripped(&result, &seen, "c");
 }
+
+/// How a map ended: `"Ok"`, or the child-context error kind and whether
+/// the error carries a recorded wire record.
+fn outcome_class<T>(outcome: &Result<T, durable::OperationError>) -> String {
+    match outcome {
+        Ok(_) => "Ok".to_owned(),
+        Err(err) => match err.kind() {
+            durable::OperationErrorKind::ChildContext(child) => {
+                format!("{:?}, wire {}", child.kind(), err.wire().is_some())
+            }
+            other => format!("{other:?}"),
+        },
+    }
+}
+
+/// Runs a map over one item whose value is `len` NaNs, which `JsonSerdes`
+/// writes as `null` and cannot read back, with `max_concurrency`, then
+/// waits 1 s. Returns the outcome class of the map in each invocation,
+/// awaited with `.await_batch()` when `batch` is true and with `.await`
+/// otherwise. A `max_concurrency` of 1 rebuilds the item at the sequential
+/// dispatch cursor, and 2 rebuilds it in the concurrent replay pass.
+async fn map_of_nan_then_wait(
+    runner: LocalRunner,
+    len: usize,
+    max_concurrency: usize,
+    batch: bool,
+) -> Vec<String> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let handler_seen = Arc::clone(&seen);
+    let result = runner
+        .run(
+            move |(), ctx: DurableContext| {
+                let seen = Arc::clone(&handler_seen);
+                async move {
+                    let map = ctx
+                        .map(vec![0_u32], move |_child, _item, _idx| async move {
+                            Ok(vec![f64::NAN; len])
+                        })
+                        .name("m")
+                        .max_concurrency(max_concurrency);
+                    let class = if batch {
+                        outcome_class(&map.await_batch().await)
+                    } else {
+                        outcome_class(&map.await)
+                    };
+                    seen.lock().expect("lock").push(class);
+                    ctx.wait(Duration::from_secs(1)).name("after").await?;
+                    Ok::<_, BoxError>(())
+                }
+            },
+            (),
+        )
+        .await
+        .expect("the run finishes");
+    assert_eq!(result.invocation_count(), 2, "{result}");
+    seen.lock().expect("lock").clone()
+}
+
+/// What both invocations must see: the live decode error.
+fn live_error_twice() -> [String; 2] {
+    let internal = "Internal, wire false".to_owned();
+    [internal.clone(), internal]
+}
+
+#[tokio::test]
+async fn map_item_decode_failure_after_oversized_succeed_fails_the_resumed_map() {
+    // 60 000 `null,` are 300 000 bytes, so the item records `ReplayChildren`.
+    let seen = map_of_nan_then_wait(LocalRunner::new(), 60_000, 1, true).await;
+    assert_eq!(seen, live_error_twice());
+}
+
+#[tokio::test]
+async fn map_item_decode_failure_with_preserved_children_fails_the_resumed_map() {
+    let options = durable::Options::builder()
+        .plugin_child_operations_depth(2)
+        .build()
+        .expect("valid options");
+    let seen = map_of_nan_then_wait(LocalRunner::new().options(options), 1, 1, true).await;
+    assert_eq!(seen, live_error_twice());
+}
+
+#[tokio::test]
+async fn map_item_decode_failure_after_oversized_succeed_returns_the_live_error_on_resume() {
+    let seen = map_of_nan_then_wait(LocalRunner::new(), 60_000, 1, false).await;
+    assert_eq!(seen, live_error_twice());
+}
+
+#[tokio::test]
+async fn concurrent_map_item_decode_failure_after_oversized_succeed_fails_the_resumed_map() {
+    let seen = map_of_nan_then_wait(LocalRunner::new(), 60_000, 2, true).await;
+    assert_eq!(seen, live_error_twice());
+}

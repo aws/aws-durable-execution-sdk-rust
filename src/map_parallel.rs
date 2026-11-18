@@ -1472,7 +1472,8 @@ where
     // item re-runs only to rebuild a `ReplayChildren` result (see
     // `item_before`). Its record is already closed, and a checkpoint backend
     // rejects a second close of a CONTEXT. So it takes the same path and
-    // writes nothing.
+    // writes nothing, and it returns a failed round trip as the error the
+    // live run returned after it wrote that record.
     if req.nesting == NestingMode::Flat || req.is_terminal {
         let settled = match outcome {
             Ok(value) => {
@@ -1507,6 +1508,7 @@ where
                         },
                         Some(serialized),
                     )),
+                    Err(op_err) if req.is_terminal => Err(op_err),
                     Err(op_err) => {
                         let wire = crate::error::serialization_failure_wire(&op_err);
                         Ok((
