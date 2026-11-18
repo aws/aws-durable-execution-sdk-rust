@@ -2263,3 +2263,125 @@ async fn captured_span_panic_during_aborted_task_drop_is_recorded() {
         assert!(!seen.contains(&"after panicking=true"), "{at:?}: {seen:?}");
     }
 }
+
+/// What the runs of a combinator winner's body saw: the names of the spans
+/// in scope of each run's `probe` event, and the frames each run read.
+type BodyContext = (Vec<Vec<&'static str>>, Vec<Vec<String>>);
+
+/// Runs `race`, or `select_ok` when `select_ok` is true, over two inputs
+/// and then waits 1 s, so invocation 2 replays the recorded winner. The
+/// body of the virtual child `a` makes the winner `in` with `.future()`
+/// inside span `created`: a child context that returns 300 KiB, so its
+/// record and the combinator's carry `ReplayChildren`, and replay runs its
+/// body again. The loser is a step that never finishes. The handler awaits
+/// the combinator inside span `joined`. Returns what each run of `in`'s
+/// body saw, its frames counted from the last invocation wrap.
+async fn oversized_winner_body_context(select_ok: bool) -> BodyContext {
+    use tracing::Instrument as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let names = ScopeNames::default();
+    let _guard =
+        test_tracing::install_test_subscriber(tracing_subscriber::registry().with(names.clone()));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let body_seen = std::sync::Arc::clone(&seen);
+    let result = run_with(Wraps::default(), move |_event: (), ctx: DurableContext| {
+        let body_seen = std::sync::Arc::clone(&body_seen);
+        async move {
+            let slot: std::sync::Arc<std::sync::Mutex<Option<durable::DurableFuture<String>>>> =
+                std::sync::Arc::default();
+            let fill = std::sync::Arc::clone(&slot);
+            ctx.run_in_child_context(move |a| async move {
+                let winner = {
+                    let _created = tracing::info_span!("created").entered();
+                    a.run_in_child_context(move |_in| async move {
+                        let stack = frames();
+                        let at = stack.iter().rposition(|frame| frame == "I");
+                        let innermost = at.and_then(|at| stack.get(at..)).unwrap_or(&stack);
+                        body_seen
+                            .lock()
+                            .expect("not poisoned")
+                            .push(innermost.to_vec());
+                        tracing::info!(target: "probe", "winner body");
+                        Ok("w".repeat(300 * 1024))
+                    })
+                    .name("in")
+                    .future()
+                };
+                *fill.lock().expect("not poisoned") = Some(winner);
+                Ok(0_u32)
+            })
+            .name("a")
+            .virtual_context()
+            .await?;
+            let winner = slot
+                .lock()
+                .expect("not poisoned")
+                .take()
+                .ok_or("`a` made no input")?;
+            let loser = ctx
+                .step(|_| async {
+                    std::future::pending::<()>().await;
+                    Ok(String::new())
+                })
+                .name("loser")
+                .future();
+            let joined = tracing::info_span!("joined");
+            let value = if select_ok {
+                ctx.select_ok([winner, loser])
+                    .name("first")
+                    .into_future()
+                    .instrument(joined)
+                    .await?
+            } else {
+                ctx.race([winner, loser])
+                    .name("first")
+                    .into_future()
+                    .instrument(joined)
+                    .await?
+            };
+            ctx.wait(std::time::Duration::from_secs(1))
+                .name("pause")
+                .await?;
+            Ok::<_, BoxError>(value.len())
+        }
+    })
+    .await;
+    assert_eq!(result.output(), Some(&307_200));
+    assert_eq!(result.invocation_count(), 2);
+    let scopes = names.0.lock().expect("not poisoned").clone();
+    let frames = seen.lock().expect("not poisoned").clone();
+    (scopes, frames)
+}
+
+/// Asserts that the winner's body ran live and on replay, and that both
+/// runs ran inside span `created`, not span `joined`, and inside the wraps
+/// of `a`: the live run inside its own frame `in` too, and the replay,
+/// which rebuilds the value, inside no frame of its own.
+fn assert_ran_in_creation_context((scopes, frames): &BodyContext) {
+    assert_eq!(
+        scopes.len(),
+        2,
+        "the body ran live and on replay: {scopes:?}"
+    );
+    for scope in scopes {
+        assert!(scope.contains(&"created"), "{scope:?}");
+        assert!(!scope.contains(&"joined"), "{scope:?}");
+    }
+    assert_eq!(frames, &[path(&["a", "in"]), path(&["a"])]);
+}
+
+/// The replay of a `race` whose winner was over 256 KiB runs the winner's
+/// body in the span and wraps current where the winner became a future, as
+/// the first run does.
+#[tokio::test]
+async fn a_replayed_oversized_race_winner_runs_in_its_creation_context() {
+    assert_ran_in_creation_context(&oversized_winner_body_context(false).await);
+}
+
+/// As [`a_replayed_oversized_race_winner_runs_in_its_creation_context`],
+/// for `select_ok`.
+#[tokio::test]
+async fn a_replayed_oversized_select_ok_winner_runs_in_its_creation_context() {
+    assert_ran_in_creation_context(&oversized_winner_body_context(true).await);
+}

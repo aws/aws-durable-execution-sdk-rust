@@ -1376,8 +1376,9 @@ async fn checkpoint_winner_succeed(
 ///    that does not decode, is an internal error.
 /// 3. An index past the inputs is an internal error.
 /// 4. Every other input is dropped without being polled: a lazy input never
-///    runs, and a spawned one is aborted. The winner is awaited directly, so
-///    its error, or its wait for the service, is the combinator's.
+///    runs, and a spawned one is aborted. The winner runs on its own task in
+///    the context that created it, as on the live run, and its error, or its
+///    wait for the service, is the combinator's.
 /// 5. The value is serialized and decoded, as the live path does, so both
 ///    paths return the same value.
 ///
@@ -1403,7 +1404,20 @@ async fn replay_recorded_winner<O: Serialize + DeserializeOwned + Send + 'static
             "replay: recorded winner index {winner} is out of range for {count} inputs"
         )));
     };
-    let value = input.await?;
+    // The winner runs on its own task in the context that created it, as on
+    // the live run (see `spawn_constituent`).
+    let mut join_set = constituent_set(ctx);
+    spawn_constituent(ctx, &mut join_set, winner, input)?;
+    #[expect(clippy::expect_used)]
+    // reason: the set holds the one input just spawned, and a refused
+    // start never yields, so the join never reports an empty set.
+    let (_, joined) = join_set
+        .join_next_with_id()
+        .await
+        .expect("the recorded winner joins");
+    // A panicked winner resumes its panic here.
+    let (_, settled) = joined.into_value();
+    let value = settled?;
     let serialized = serialize_result(&value)?;
     drop(value);
     replay_single_success::<O>(Some(&serialized))
@@ -3820,6 +3834,68 @@ mod tests {
         assert_eq!(
             err.wire().and_then(crate::error::WireError::error_type),
             Some("InputFailure")
+        );
+        assert_eq!(client.recorded_updates().len(), 0, "no update");
+    }
+
+    /// The replay of a recorded winner runs the winner on a task of its own,
+    /// so without a Tokio runtime the combinator returns the no-runtime
+    /// error instead of driving the winner.
+    #[test]
+    fn race_replay_children_without_runtime_returns_error() {
+        let polled = crate::task::test_support::poll_once_without_runtime(|| {
+            let (ctx, _client) = replay_children_ctx(Some("{\"winner\":0}"));
+            let op_id = ctx.mint_id();
+            RaceExecution::<i32> {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![must_not_run(), must_not_run()],
+            }
+            .execute()
+        });
+        let std::task::Poll::Ready(Err(err)) = polled else {
+            panic!("expected an immediate error, got {polled:?}");
+        };
+        assert!(
+            format!("{err:#}").contains(crate::task::NO_RUNTIME_MESSAGE),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// A recorded winner that panics on replay resumes its panic, with its
+    /// original payload, in the invocation driver.
+    #[tokio::test]
+    async fn race_replay_children_winner_panic_propagates_payload() {
+        let (ctx, client) = replay_children_ctx(Some("{\"winner\":1}"));
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
+        let op_id = ctx.mint_id();
+        let winner: DurableFuture<i32> = DurableFuture::from_async(async { panic!("boom-winner") });
+        let exec = RaceExecution {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![must_not_run(), winner],
+        };
+        let outcome = crate::driver::drive_outcome(
+            async move {
+                let _ = exec.execute().await;
+                Ok::<_, crate::error::WireError>("done".to_owned())
+            },
+            ownership,
+            signal,
+            root,
+            None,
+        )
+        .await;
+        let Err(payload) = outcome else {
+            panic!("the winner panic must reach the invocation driver, got {outcome:?}");
+        };
+        assert_eq!(
+            crate::task::test_support::str_payload(payload.as_ref()),
+            Some("boom-winner")
         );
         assert_eq!(client.recorded_updates().len(), 0, "no update");
     }
