@@ -45,7 +45,8 @@ where
     PS: PayloadSerializer,
     RS: Serdes<O>,
 {
-    /// Executes the invoke operation: replay path or live path.
+    /// Executes the invoke operation: a rebuilt-body hold, the replay path
+    /// or the live path.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -57,13 +58,21 @@ where
         // 2. Check checkpoint log for replay. The validated view covers the
         // non-terminal branches without cloning; the terminal branches fetch
         // only the invoke fields they consume.
-        if let Some(view) = self.ctx.checkpoint_view_validated(
+        let view = self.ctx.checkpoint_view_validated(
             &positional_id,
             &wire_id,
             "ChainedInvoke",
             Some(CHAINED_INVOKE_SUB_TYPE),
             self.name.as_deref(),
-        )? {
+        )?;
+        if crate::start::rebuild_holds(
+            &self.ctx,
+            "ChainedInvoke",
+            view.as_ref().map(|view| &view.status),
+        ) {
+            return std::future::pending().await;
+        }
+        if let Some(view) = view {
             return recorded_outcome(
                 &self.ctx,
                 self.name.as_deref(),

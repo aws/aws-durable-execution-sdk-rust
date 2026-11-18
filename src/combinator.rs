@@ -960,8 +960,11 @@ struct Running<O> {
     start: Option<SubmittedWrite>,
 }
 
-/// Begins the combinator's inputs, then runs its own start step, then
-/// spawns the inputs' remainders, in that order:
+/// In a rebuilding context (see [`crate::start::rebuild_holds`]),
+/// `Run::Live` and `Run::Resumed` never resolve: no input begins and
+/// nothing is written. Otherwise this begins the combinator's inputs, then
+/// runs its own start step, then spawns the inputs' remainders, in that
+/// order:
 ///
 /// 1. A still-unclaimed combinator input is detected first (see
 ///    [`unclaimed_input_message`]). Reconstruction records and returns the
@@ -988,6 +991,12 @@ async fn start_inputs<O: Send + 'static>(
     run: Run,
     futures: Vec<DurableFuture<O>>,
 ) -> Result<Running<O>, OperationError> {
+    // A rebuilt body runs no combinator without a `SUCCEEDED` or `FAILED`
+    // record (see `crate::start::rebuild_holds`): it begins no input and
+    // writes nothing.
+    if ctx.is_rebuilding() && run != Run::Reconstruct {
+        return std::future::pending().await;
+    }
     if let Some(message) = unclaimed_input_message(positional_id, &futures) {
         drop(futures);
         if let Some(start) = combinator_start(ctx, wire_id, name, run)

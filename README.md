@@ -814,6 +814,8 @@ let greeting = ctx
 When a child context's body returns, an operation it started and did not
 await writes no further checkpoint, and awaiting it never resolves.
 
+When a later invocation runs the body again to rebuild a result over 256 KiB, or a context that `plugin_child_operations_depth` preserves, an operation in the body returns its record only when replay needs nothing more: a `SUCCEEDED` or `FAILED` record, an invoke's `TIMED_OUT`, `STOPPED` or `CANCELLED` record, and a callback's record of any status but `READY`. A `STARTED` or `PENDING` callback returns its callback. Every other operation never resolves there, and so does an operation without a record: it runs nothing, writes no checkpoint and fires no plugin hook. The same holds in a `with_retry` block and in a map or parallel item that runs again to rebuild its result.
+
 The body should run at least one durable operation. Its result is saved,
 so a replay returns it without running the body, with three exceptions: a
 body that returns an error is not retried as a step is, a result over
@@ -1863,6 +1865,8 @@ value in parentheses is the info's `is_replay`.
 | `create_callback` | start (`false`) | start (`true`) | end (`false`), when `result()` reads `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED` after waiting in the invocation | `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED`: end, `is_replay` = not listed in `updated_operations` |
 | `run_in_child_context`, `with_retry` with its own record, each `attempt-N` of a `with_retry` in either mode, `map`, `parallel`, `parallel_mixed`, each map item, parallel branch and `parallel_mixed` branch, `wait_for_callback`, the combinators | start (`false`) before the body | start (`true`) before the body | end (`false`) after the terminal write | nothing, including a `ReplayChildren` reconstruction |
 | `run_in_child_context` with `virtual_context()`, and a virtual `with_retry` block | start (`is_replay` = the invocation's replay state) before the body, in every invocation | never, because a record at its ID fails replay | end (`is_replay` = the invocation's replay state) after the body returns, with no checkpoint write | never |
+
+In a body that runs again to rebuild a `ReplayChildren` result, an operation that never resolves there, as the "child contexts" section describes, fires no hook.
 
 A step retry or a `wait_for_condition` check that continues in the same
 invocation after its delay fires the `READY` cell of its row: start

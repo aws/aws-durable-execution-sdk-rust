@@ -1431,8 +1431,14 @@ where
     // checkpointed by the coordinator at dispatch (the coordinator is the
     // sole writer of child starts; see `execute_batch`), or exists from a
     // prior invocation.
+    // A terminal item that reaches this point recorded `ReplayChildren`, so
+    // its body runs again only to rebuild its result.
     Ok(ItemPrelude::Run {
-        child_ctx: req.ctx.new_child(&child_positional, Some(&req.item_name)),
+        child_ctx: req.ctx.new_child_rebuilding(
+            &child_positional,
+            Some(&req.item_name),
+            req.is_terminal,
+        ),
     })
 }
 
@@ -2233,6 +2239,9 @@ where
     };
     // A fresh `START` is a live start; a record resumes the batch.
     let resumed = recorded.is_some();
+    let rebuilding = recorded
+        .as_ref()
+        .is_some_and(|view| view.status.is_terminal());
 
     // The caller computed both name lists once per input item, before the
     // items moved. `user_names` holds the name the caller gave, which only
@@ -2260,7 +2269,10 @@ where
     // because they name the caller's parent. Item replay, item serdes
     // faults and the item contexts use `batch_ctx`, and item IDs come from
     // `item_ids`, so the batch never claims an ID from the caller.
-    let batch_ctx = ctx.new_child(&parent_positional, parent_name.as_deref());
+    // A terminal record means the batch runs its items again only to
+    // rebuild its result, so the batch context is rebuilding.
+    let batch_ctx =
+        ctx.new_child_rebuilding(&parent_positional, parent_name.as_deref(), rebuilding);
 
     // 2. Check if the parent batch is already terminal in the checkpoint log.
     // Identity validation and the status read happen in one read-guard pass;

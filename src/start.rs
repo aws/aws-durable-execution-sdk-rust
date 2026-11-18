@@ -11,11 +11,13 @@
 //!    the operation, and queues nothing;
 //! 2. runs the task-ownership check;
 //! 3. runs the replay identity check and reads the operation's record;
-//! 4. when the cycle needs a `START` (no record, or a record that begins a
+//! 4. returns [`StartStep::Refused`] when [`rebuild_holds`] holds the
+//!    operation in a rebuilt body, and queues nothing;
+//! 5. when the cycle needs a `START` (no record, or a record that begins a
 //!    new attempt), builds it and fixes its position in the write order;
-//! 5. for an operation whose JS order is "queue `START`, then hook", fires
+//! 6. for an operation whose JS order is "queue `START`, then hook", fires
 //!    `on_operation_start` and then releases the `START`;
-//! 6. for a record that resumes work without a new `START`, fires its
+//! 7. for a record that resumes work without a new `START`, fires its
 //!    replay start hook.
 //!
 //! The order of the `START` write and `on_operation_start` follows JS for
@@ -41,7 +43,7 @@
 use aws_sdk_lambda::types::OperationUpdate;
 
 use crate::context::{DurableContext, SubmittedWrite};
-use crate::engine::{CheckpointStatusView, OperationId};
+use crate::engine::{CheckpointStatus, CheckpointStatusView, OperationId};
 use crate::error::OperationError;
 use crate::plugin::InvocationPlugins;
 
@@ -85,8 +87,9 @@ pub(crate) struct StartSpec<'a> {
 
 /// The outcome of [`start_step`].
 pub(crate) enum StartStep {
-    /// Admission refused the operation. Nothing was queued, and the
-    /// operation's future never resolves.
+    /// Admission refused the operation, or [`rebuild_holds`] held it in a
+    /// rebuilt body. Nothing was queued, and the operation's future never
+    /// resolves.
     Refused,
     /// The operation has a record, and this cycle queues no `START`.
     Recorded(CheckpointStatusView),
@@ -96,11 +99,45 @@ pub(crate) enum StartStep {
     Queued(SubmittedWrite),
 }
 
+/// Whether an operation in a rebuilding context (see
+/// [`DurableContext::new_child_rebuilding`]) never resolves. It does when
+/// it has no record, and when replay cannot return its record without
+/// running it again: a callback's `READY` record, an invoke's `STARTED`,
+/// `PENDING` or `READY` record, and any other operation's record that is
+/// neither `SUCCEEDED` nor `FAILED`. A callback with any other record
+/// still returns its callback, so a rebuilt body that returns the
+/// callback ID returns. An unrecognized status never gets here:
+/// `checkpoint_view_validated` fails the execution first.
+pub(crate) fn rebuild_holds(
+    ctx: &DurableContext,
+    operation_type: &str,
+    status: Option<&CheckpointStatus>,
+) -> bool {
+    if !ctx.is_rebuilding() {
+        return false;
+    }
+    let Some(status) = status else {
+        return true;
+    };
+    match operation_type {
+        "Callback" => *status == CheckpointStatus::Ready,
+        "ChainedInvoke" => matches!(
+            status,
+            CheckpointStatus::Started | CheckpointStatus::Pending | CheckpointStatus::Ready
+        ),
+        _ => !matches!(
+            status,
+            CheckpointStatus::Succeeded | CheckpointStatus::Failed
+        ),
+    }
+}
+
 /// Runs the start step of the operation `spec` on `ctx` (see the module
 /// documentation).
 ///
 /// `classify` decides what a record means for this cycle; without a
-/// record the cycle starts a first attempt. `start_update` builds the
+/// record the cycle starts a first attempt. Neither applies when
+/// [`rebuild_holds`] holds the operation. `start_update` builds the
 /// `START`. `start_hook` fires `on_operation_start` with the given replay
 /// flag. The start step calls it for a [`StartOrder::QueueThenHook`]
 /// `START` and for a [`Cycle::Resume`] record, and only when plugins are
@@ -128,6 +165,13 @@ pub(crate) fn start_step(
         Some(spec.sub_type),
         spec.name,
     )?;
+    if rebuild_holds(
+        ctx,
+        spec.operation_type,
+        view.as_ref().map(|view| &view.status),
+    ) {
+        return Ok(StartStep::Refused);
+    }
     let is_replay = match view {
         None => false,
         Some(view) => match classify(&view) {
@@ -233,6 +277,54 @@ mod tests {
 
     fn in_memory() -> Arc<InMemoryExecutionClient> {
         Arc::new(InMemoryExecutionClient::new(Vec::new()))
+    }
+
+    /// In a rebuilding context, `rebuild_holds` holds every operation
+    /// without a record, and every record except those that replay returns
+    /// without running anything: `SUCCEEDED` and `FAILED` for every
+    /// operation, also `TIMED_OUT`, `STOPPED` and `CANCELLED` for a chained
+    /// invoke, and every status but `READY` for a callback. Outside a
+    /// rebuilding context it holds nothing.
+    #[test]
+    fn rebuild_holds_matches_rebuilt_body_status_matrix() {
+        use CheckpointStatus::{
+            Cancelled, Failed, Pending, Ready, Started, Stopped, Succeeded, TimedOut,
+        };
+        let root = DurableContext::test_context();
+        let rebuilding = root.new_child_rebuilding("1", None, true);
+        let statuses = [
+            Started, Pending, Ready, Succeeded, Failed, Cancelled, TimedOut, Stopped,
+        ];
+        let rows: [(&str, Vec<CheckpointStatus>); 5] = [
+            ("Step", vec![Succeeded, Failed]),
+            ("Wait", vec![Succeeded, Failed]),
+            ("Context", vec![Succeeded, Failed]),
+            (
+                "ChainedInvoke",
+                vec![Succeeded, Failed, Cancelled, TimedOut, Stopped],
+            ),
+            (
+                "Callback",
+                vec![
+                    Started, Pending, Succeeded, Failed, Cancelled, TimedOut, Stopped,
+                ],
+            ),
+        ];
+        for (operation_type, returns) in &rows {
+            assert!(
+                super::rebuild_holds(&rebuilding, operation_type, None),
+                "{operation_type} without a record"
+            );
+            assert!(!super::rebuild_holds(&root, operation_type, None));
+            for status in &statuses {
+                assert_eq!(
+                    super::rebuild_holds(&rebuilding, operation_type, Some(status)),
+                    !returns.contains(status),
+                    "{operation_type} {status:?}"
+                );
+                assert!(!super::rebuild_holds(&root, operation_type, Some(status)));
+            }
+        }
     }
 
     fn start_update(op_id: &OperationId, r#type: OperationType, sub_type: &str) -> OperationUpdate {

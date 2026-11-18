@@ -293,8 +293,9 @@ where
     S: Clone + Send + Sync + 'static,
     SD: Serdes<S>,
 {
-    /// Runs everything that precedes the check closure: replay path, or
-    /// the live-path preamble (carried-state derivation + START checkpoint).
+    /// Runs everything that precedes the check closure: a rebuilt-body
+    /// hold, the replay path, or the live-path preamble (carried-state
+    /// derivation + START checkpoint).
     #[expect(clippy::too_many_lines)] // reason: replay-status protocol is a single logical unit; splitting would obscure it
     ///
     /// `resumed` is true when the record changed during this invocation: a
@@ -311,13 +312,17 @@ where
         // 2. Check checkpoint log for replay / resume status. The validated
         // view covers the non-terminal branches without cloning.
         let mut already_started = false;
-        if let Some(view) = self.ctx.checkpoint_view_validated(
+        let view = self.ctx.checkpoint_view_validated(
             &positional_id,
             &wire_id,
             "Step",
             Some(WFC_SUB_TYPE),
             self.name.as_deref(),
-        )? {
+        )?;
+        if crate::start::rebuild_holds(&self.ctx, "Step", view.as_ref().map(|view| &view.status)) {
+            return std::future::pending().await;
+        }
+        if let Some(view) = view {
             match view.status {
                 CheckpointStatus::Succeeded => {
                     // Terminal success: deserialize the final state.

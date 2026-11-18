@@ -485,6 +485,9 @@ struct Inner {
     /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth),
     /// copied into every derived context.
     preserve_child_depth: u32,
+    /// True inside a body that runs again to rebuild the result of a
+    /// recorded success (`ReplayChildren`). Copied into every derived context.
+    rebuilding: bool,
 }
 
 impl std::fmt::Debug for Inner {
@@ -598,6 +601,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                rebuilding: false,
             }),
             awaited: None,
         }
@@ -639,6 +643,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                rebuilding: false,
             }),
             awaited: None,
         }
@@ -680,6 +685,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                rebuilding: false,
             }),
             awaited: None,
         }
@@ -731,6 +737,7 @@ impl DurableContext {
                 plugins,
                 nesting_level: 0,
                 preserve_child_depth,
+                rebuilding: false,
             }),
             awaited: None,
         }
@@ -808,6 +815,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                rebuilding: false,
             }),
             awaited: None,
         }
@@ -817,6 +825,20 @@ impl DurableContext {
     /// span carries it as `operationName`, with the operation's wire ID as
     /// `operationId`.
     pub(crate) fn new_child(&self, parent_positional_id: &str, name: Option<&str>) -> Self {
+        self.new_child_rebuilding(parent_positional_id, name, false)
+    }
+
+    /// [`Self::new_child`] for a body that may run again to rebuild the
+    /// result of a recorded success (`ReplayChildren`). With `rebuilding`
+    /// true, or when this context is rebuilding, the child and every
+    /// context derived from it are rebuilding: an operation there returns
+    /// only its recorded outcome (see [`crate::start::rebuild_holds`]).
+    pub(crate) fn new_child_rebuilding(
+        &self,
+        parent_positional_id: &str,
+        name: Option<&str>,
+        rebuilding: bool,
+    ) -> Self {
         let wire_id = crate::engine::compute_wire_id_public(parent_positional_id);
         let engine = Arc::new(EngineState::new_child(
             parent_positional_id,
@@ -859,6 +881,7 @@ impl DurableContext {
                 plugins: self.inner.plugins.clone(),
                 nesting_level: self.inner.nesting_level.saturating_add(1),
                 preserve_child_depth: self.inner.preserve_child_depth,
+                rebuilding: self.inner.rebuilding || rebuilding,
             }),
             awaited: None,
         }
@@ -910,6 +933,7 @@ impl DurableContext {
                 plugins: self.inner.plugins.clone(),
                 nesting_level: self.inner.nesting_level,
                 preserve_child_depth: self.inner.preserve_child_depth,
+                rebuilding: self.inner.rebuilding,
             }),
             awaited: None,
         }
@@ -963,6 +987,12 @@ impl DurableContext {
     pub(crate) fn preserves_children(&self, levels_below: u32) -> bool {
         let level = self.inner.nesting_level.saturating_add(levels_below);
         level <= self.inner.preserve_child_depth
+    }
+
+    /// Whether this context runs inside a rebuilt body (see
+    /// [`Self::new_child_rebuilding`]).
+    pub(crate) fn is_rebuilding(&self) -> bool {
+        self.inner.rebuilding
     }
 
     /// Mints the next operation ID (internal engine concern).
@@ -1148,6 +1178,7 @@ impl DurableContext {
                 plugins: self.inner.plugins.clone(),
                 nesting_level: self.inner.nesting_level,
                 preserve_child_depth: self.inner.preserve_child_depth,
+                rebuilding: self.inner.rebuilding,
             }),
             awaited: None,
         }
@@ -4165,6 +4196,44 @@ mod tests {
         assert_eq!(under_root.owners(), [] as [String; 0]);
         assert_eq!(under_child.parent_wire_id(), child.parent_wire_id());
         assert_eq!(under_child.owners(), child.owners());
+    }
+
+    /// A context that `new_child_rebuilding` creates with `rebuilding` true
+    /// is rebuilding, and so is every context derived from it by
+    /// `new_child`, `new_child_rebuilding`, `new_virtual_child` and
+    /// `new_flat_child`. A root, a child created with `rebuilding` false,
+    /// and the contexts derived from it are not.
+    #[test]
+    fn rebuilding_state_propagates_to_every_derived_context() {
+        let root = DurableContext::test_context();
+        let plain = root.new_child_rebuilding("1", None, false);
+        let not_rebuilding = [
+            root.clone(),
+            root.new_child("2", None),
+            root.new_virtual_child("3", None),
+            root.new_flat_child("4", "parent", None),
+            plain.new_child("1-1", None),
+            plain.new_virtual_child("1-2", None),
+            plain.new_flat_child("1-3", "parent", None),
+            plain.clone(),
+        ];
+        for ctx in &not_rebuilding {
+            assert!(!ctx.is_rebuilding());
+        }
+
+        let rebuilt = root.new_child_rebuilding("5", None, true);
+        let virtual_child = rebuilt.new_virtual_child("5-1", None);
+        let rebuilding = [
+            rebuilt.new_child("5-2", None),
+            rebuilt.new_child_rebuilding("5-3", None, false),
+            rebuilt.new_flat_child("5-4", "parent", None),
+            virtual_child.new_child("5-5", None),
+            virtual_child.clone(),
+            rebuilt,
+        ];
+        for ctx in &rebuilding {
+            assert!(ctx.is_rebuilding());
+        }
     }
 
     /// Each row of the issue's table: the context that creates the record,

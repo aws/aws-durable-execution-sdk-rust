@@ -404,6 +404,14 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Decision (2026-10-26 and 2026-11-03, [Rust SDK #151: Keep dropped spawned operations running, and stop work when its scope closes](https://github.com/aws/aws-durable-execution-sdk-rust/issues/151)): stop combinator `.future()` losers and the work of a closed scope.
 - **Where:** `src/combinator.rs`, `RaceExecution::execute`, `SelectOkExecution::execute` and `TryJoinAllExecution::execute`; `src/child.rs`, `ChildExecution::run`; `src/checkpoint_coalescer.rs`, `ScopeClose`; `src/map_parallel.rs`, `produce_batch`.
 
+### Operations in a rebuilt body
+
+- **JavaScript:** When a later invocation runs the body of a succeeded context again to rebuild a result that `ReplayChildren` left out of its record, an operation whose record is neither `SUCCEEDED` nor `FAILED` never resolves, a `createCallback` and an invoke included. An operation without a record runs: a step runs its function under the default semantics and a child context runs its body, and every checkpoint they write is dropped.
+- **Rust:** An operation without a record never resolves, runs nothing and writes nothing. A `create_callback` returns its callback for every record but `READY`, and an invoke returns its recorded `TIMED_OUT`, `STOPPED` or `CANCELLED` failure. Every other operation never resolves unless its record is `SUCCEEDED` or `FAILED`, as in JavaScript.
+- **Why:** In JavaScript, a step without a record runs its function again in every rebuild, and nothing records that it ran. A rebuilt body that created a callback and returned its ID, or that caught an invoke's timeout, never returns, so the execution never completes. In Rust, an invoke, a `wait_for_condition` or a combinator that the body started with `.spawn()` has no record when the scope closed before its task first ran.
+- **Decision:** JavaScript defect.
+- **Where:** `src/start.rs`, `rebuild_holds`; `src/context.rs`, `DurableContext::new_child_rebuilding`; `src/combinator.rs`, `start_inputs`.
+
 ### Oversized `race` or `select_ok` result
 
 - **JavaScript:** Replay runs the combinator again and can return a different winner.

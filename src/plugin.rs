@@ -389,6 +389,13 @@ pub trait Plugin: Send + Sync {
     /// it fire no `on_operation_end`. An item that was never dispatched
     /// fires no hook.
     ///
+    /// When the SDK runs a body again to rebuild a result that
+    /// `ReplayChildren` kept out of the record, an operation in that body
+    /// that never resolves there fires no hook: one without a record, a
+    /// callback with a `READY` record, an invoke with a `STARTED`,
+    /// `PENDING` or `READY` record, and any other operation whose record is
+    /// neither `SUCCEEDED` nor `FAILED`.
+    ///
     /// A map item or parallel branch with `NestingMode::Flat` writes no
     /// record. It fires `on_operation_start` and `on_operation_end` with
     /// kind `Context`, sub-type `MapIteration` or `ParallelBranch`, its
@@ -545,6 +552,13 @@ pub trait Plugin: Send + Sync {
     /// still running is abandoned: it and the unfinished operations inside
     /// it fire no `on_operation_end`. An item that was never dispatched
     /// fires no hook.
+    ///
+    /// When the SDK runs a body again to rebuild a result that
+    /// `ReplayChildren` kept out of the record, an operation in that body
+    /// that never resolves there fires no hook: one without a record, a
+    /// callback with a `READY` record, an invoke with a `STARTED`,
+    /// `PENDING` or `READY` record, and any other operation whose record is
+    /// neither `SUCCEEDED` nor `FAILED`.
     ///
     /// A map item or parallel branch with `NestingMode::Flat` writes no
     /// record. It fires `on_operation_start` and `on_operation_end` with

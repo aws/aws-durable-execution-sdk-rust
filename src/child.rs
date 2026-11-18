@@ -320,6 +320,9 @@ enum ChildRunMode {
     /// Live path: checkpoint the outcome afterwards.
     Live,
     /// `ReplayChildren` path: round-trip the result, checkpoint nothing.
+    /// The body runs in a rebuilding context, where an operation never
+    /// resolves unless replay can return its record without running it
+    /// (see [`crate::start::rebuild_holds`]).
     Reconstruct,
 }
 
@@ -495,7 +498,11 @@ where
             summary,
             ..
         } = self;
-        let child_ctx = ctx.new_child(&positional_id, name.as_deref());
+        let child_ctx = ctx.new_child_rebuilding(
+            &positional_id,
+            name.as_deref(),
+            mode == ChildRunMode::Reconstruct,
+        );
 
         // A reconstruction fires no start hook; its info is never read,
         // because only a live body reaches the runner.
