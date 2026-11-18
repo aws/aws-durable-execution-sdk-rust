@@ -43,8 +43,8 @@ true minimum above the declared one. `make check` runs the same check
 locally through `scripts/check-msrv.sh`, which reads the version from the
 root `Cargo.toml` and asks you to `rustup toolchain install` the minimum if
 it is missing, so the local gate sees what CI's `msrv` job sees. Bumping the minimum supported Rust
-version is an intentional, documented change: while the crate is pre-1.0, an
-MSRV bump ships as a minor release (0.x → 0.x+1), never as a patch, and the
+version is an intentional, documented change: an MSRV bump ships as a minor
+release (1.x → 1.x+1), never as a patch, and the
 change must update every declaration in the same pull request: the root
 `Cargo.toml` is the source of truth, and every `Cargo.toml` under
 `conformance/` and `examples/` that declares `rust-version` (200+ manifests),
