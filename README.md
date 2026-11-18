@@ -1896,9 +1896,17 @@ replayed from a record the service did not change since the previous
 invocation. `is_virtual` is `true` for a `NestingMode::Flat` map item or
 parallel branch and for a virtual child context, which record no operation
 of their own, and `false` for every other operation and every entry of
-`operations()`. The start hook of a virtual child reports `is_replay`
-`true` when an earlier invocation already ran its body, and its end hook
-reports `true` when an earlier invocation already got past the child. `operations()`
+`operations()`. A virtual child writes no record, so each of its hooks
+reports what `DurableContext::is_replaying()` reports when the hook fires:
+the start hook reports `true` when the first operation of the child's body
+already has a record, and the end hook reports `true` when the caller's
+next operation already has a record. So the start hook of a
+`run_in_child_context` body that creates no operation reports `false` in
+every invocation, and the end hook reports `false` when no operation after
+the child has a record yet, even when an earlier invocation completed the
+child. The first operation of a virtual `with_retry` block is its
+`attempt-1` context, so the block's start hook reports `true` in every
+invocation after the first one that reached the block. `operations()`
 holds every operation the service reports for this execution, including
 the `EXECUTION` operation, keyed by wire ID.
 

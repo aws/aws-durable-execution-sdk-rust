@@ -1775,10 +1775,13 @@ impl OperationInfo {
     /// operations map.
     ///
     /// A virtual child context fires its hooks in every invocation, because
-    /// its body runs in every invocation. Its start hook reports
-    /// [`is_replay`](Self::is_replay) `true` when an earlier invocation
-    /// already ran its body, and its end hook reports `true` when an
-    /// earlier invocation already got past the child.
+    /// its body runs in every invocation. It writes no record, so each hook
+    /// reports [`is_replay`](Self::is_replay) as
+    /// [`DurableContext::is_replaying`](crate::DurableContext::is_replaying)
+    /// reports it when the hook fires: the start hook `true` when the first
+    /// operation of the child's body already has a record, which for a
+    /// virtual `with_retry` block is its `attempt-1` context, and the end
+    /// hook `true` when the caller's next operation already has a record.
     pub fn is_virtual(&self) -> bool {
         self.is_virtual
     }

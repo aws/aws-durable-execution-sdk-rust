@@ -6535,6 +6535,155 @@ async fn virtual_child_hooks_report_replay_state() {
     assert_virtual_flags(&tree, &["w"]);
 }
 
+/// A virtual child writes no record, so each of its hooks reports
+/// `is_replaying()` of a namespace when it fires. The end hook reports the
+/// caller's, which is `true` only when the caller's next operation has a
+/// record, and the start hook the child's, which is `true` only when the
+/// body's first operation has a record.
+#[tokio::test]
+async fn virtual_child_hooks_follow_the_next_claim() {
+    // Handler 1: the wait `before` is claimed before the virtual child `v`
+    // and awaited after it, so no operation follows `v`. Invocation 2
+    // reports `false` on `v`'s end hook, as `ctx.is_replaying()` does on
+    // the handler's next line.
+    let tree = Tree::default();
+    let after_v: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let seen = Arc::clone(&after_v);
+    let result = tree
+        .runner()
+        .run(
+            move |_e: (), ctx: DurableContext| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let before = ctx.wait(Duration::from_secs(1)).name("before");
+                    let value = ctx
+                        .run_in_child_context(|v| async move {
+                            Ok(v.step(|_| async { Ok("a".to_owned()) }).name("s").await?)
+                        })
+                        .name("v")
+                        .virtual_context()
+                        .await?;
+                    seen.lock().unwrap().push(ctx.is_replaying());
+                    before.await?;
+                    Ok::<_, BoxError>(value)
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(
+        tree.shapes_of("v"),
+        [
+            (1, "start", "v".to_owned(), false, None),
+            (1, "end", "v".to_owned(), false, SUCCEEDED),
+            (2, "start", "v".to_owned(), true, None),
+            (2, "end", "v".to_owned(), false, SUCCEEDED),
+        ]
+    );
+    assert_eq!(*after_v.lock().unwrap(), [false, false]);
+
+    // Handler 2: the body of the virtual child `e` creates no operation, so
+    // `e`'s start hook reports `false` in every invocation.
+    let tree = Tree::default();
+    let result = tree
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let value = ctx
+                    .run_in_child_context(|_e| async { Ok(1_u32) })
+                    .name("e")
+                    .virtual_context()
+                    .await?;
+                ctx.wait(Duration::from_secs(1)).name("after").await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(
+        tree.shapes_of("e"),
+        [
+            (1, "start", "e".to_owned(), false, None),
+            (1, "end", "e".to_owned(), false, SUCCEEDED),
+            (2, "start", "e".to_owned(), false, None),
+            (2, "end", "e".to_owned(), true, SUCCEEDED),
+        ]
+    );
+}
+
+/// The first operation of a virtual `with_retry` block is its `attempt-1`
+/// context, so the block's start hook reports `true` in every invocation
+/// after the one that first reached the block, also when its closure
+/// creates no operation, and `false` in the invocation that first reaches
+/// it, also when that invocation replays operations before it.
+#[tokio::test]
+async fn virtual_with_retry_start_hook_follows_its_first_attempt() {
+    // Handler 1: invocation 1 runs the block, invocation 2 replays it.
+    let tree = Tree::default();
+    let result = tree
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let value = ctx
+                    .with_retry(|_c, _n| async { Ok(1_u32) })
+                    .name("r")
+                    .virtual_context()
+                    .await?;
+                ctx.wait(Duration::from_secs(1)).name("after").await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(
+        tree.shapes_of("r"),
+        [
+            (1, "start", "r".to_owned(), false, None),
+            (1, "end", "r".to_owned(), false, SUCCEEDED),
+            (2, "start", "r".to_owned(), true, None),
+            (2, "end", "r".to_owned(), true, SUCCEEDED),
+        ]
+    );
+
+    // Handler 2: invocation 1 suspends on `before`, so invocation 2, which
+    // replays `before`, is the first to reach the block.
+    let tree = Tree::default();
+    let result = tree
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                ctx.wait(Duration::from_secs(1)).name("before").await?;
+                let value = ctx
+                    .with_retry(|_c, _n| async { Ok(1_u32) })
+                    .name("r")
+                    .virtual_context()
+                    .await?;
+                ctx.wait(Duration::from_secs(1)).name("after").await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.invocations().len(), 3);
+    assert_eq!(
+        tree.shapes_of("r"),
+        [
+            (2, "start", "r".to_owned(), false, None),
+            (2, "end", "r".to_owned(), false, SUCCEEDED),
+            (3, "start", "r".to_owned(), true, None),
+            (3, "end", "r".to_owned(), true, SUCCEEDED),
+        ]
+    );
+}
+
 /// The body of a virtual child is a user function in every invocation:
 /// its start hook follows `on_operation_start`, its wrap brackets the body,
 /// and its end hook precedes `on_operation_end`.

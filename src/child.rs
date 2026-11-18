@@ -152,8 +152,8 @@ where
         )
         .await
         .into_parts();
-        // The end hooks report the replay state after the body: true when
-        // an earlier invocation already got past the child.
+        // The end hooks report the caller's replay state after the body: true
+        // when the caller's next operation already has a record.
         let ended = |status, error| {
             if let Some(plugins) = ctx.plugins() {
                 let info = rec
