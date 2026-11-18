@@ -1566,8 +1566,8 @@ mod tests {
     /// execution, so the step's first request is its START. Returns the
     /// response.
     ///
-    /// Checkpoint batching is off, so each checkpoint is its own request
-    /// and a test can count the requests.
+    /// The step awaits each checkpoint before it sends the next, so each
+    /// checkpoint is its own request and a test can count the requests.
     async fn invoke_one_step(sdk_client: aws_sdk_lambda::Client) -> serde_json::Value {
         let service = crate::wrap(
             |_event: serde_json::Value, ctx: crate::DurableContext| async move {
@@ -1576,7 +1576,6 @@ mod tests {
             },
             crate::Options::builder()
                 .execution_client(Arc::new(LambdaExecutionClient::new(sdk_client)))
-                .checkpoint_batching(false)
                 .build()
                 .expect("options build"),
         );

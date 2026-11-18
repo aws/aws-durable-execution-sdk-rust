@@ -1215,7 +1215,7 @@ mod tests {
             Arc::new(CheckpointLog::from_records(records)),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );

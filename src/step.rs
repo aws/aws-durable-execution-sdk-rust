@@ -1456,7 +1456,7 @@ mod tests {
             log,
             client.clone(),
             "token0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             None,
         );
@@ -1687,7 +1687,7 @@ mod tests {
     /// invocation's plugin, and the checkpoint buffer window `window`.
     fn context_with_plugin(
         hooks: &crate::plugin::test_support::OpHooks,
-        window: Option<Duration>,
+        window: Duration,
     ) -> (DurableContext, Arc<crate::client::InMemoryExecutionClient>) {
         let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
         let ctx = DurableContext::new_root_with_client_and_defaults(
@@ -1705,22 +1705,20 @@ mod tests {
 
     #[tokio::test]
     async fn hooks_run_outside_the_token_lock() {
-        for window in [Some(Duration::ZERO), None] {
-            let lock: Arc<std::sync::OnceLock<Arc<tokio::sync::Mutex<String>>>> = Arc::default();
-            let probe_lock = Arc::clone(&lock);
-            let hooks = crate::plugin::test_support::OpHooks::probing(move || {
-                let free = probe_lock
-                    .get()
-                    .is_some_and(|mutex| mutex.try_lock().is_ok());
-                free.to_string()
-            });
-            let (ctx, _client) = context_with_plugin(&hooks, window);
-            lock.set(ctx.checkpoint_token_mutex()).expect("set once");
-            let value = ctx.step(|_| async { Ok(1_u32) }).name("a").await.unwrap();
-            assert_eq!(value, 1);
-            let probes: Vec<String> = hooks.records().into_iter().map(|r| r.probe).collect();
-            assert_eq!(probes, ["true"; 4], "window {window:?}");
-        }
+        let lock: Arc<std::sync::OnceLock<Arc<tokio::sync::Mutex<String>>>> = Arc::default();
+        let probe_lock = Arc::clone(&lock);
+        let hooks = crate::plugin::test_support::OpHooks::probing(move || {
+            let free = probe_lock
+                .get()
+                .is_some_and(|mutex| mutex.try_lock().is_ok());
+            free.to_string()
+        });
+        let (ctx, _client) = context_with_plugin(&hooks, Duration::ZERO);
+        lock.set(ctx.checkpoint_token_mutex()).expect("set once");
+        let value = ctx.step(|_| async { Ok(1_u32) }).name("a").await.unwrap();
+        assert_eq!(value, 1);
+        let probes: Vec<String> = hooks.records().into_iter().map(|r| r.probe).collect();
+        assert_eq!(probes, ["true"; 4]);
     }
 
     #[tokio::test]
@@ -1728,7 +1726,7 @@ mod tests {
         let hooks = crate::plugin::test_support::OpHooks::probing(|| {
             format!("{:?}", tokio::task::try_id())
         });
-        let (ctx, _client) = context_with_plugin(&hooks, Some(Duration::ZERO));
+        let (ctx, _client) = context_with_plugin(&hooks, Duration::ZERO);
         let body_task = Arc::new(std::sync::Mutex::new(None));
         let seen = Arc::clone(&body_task);
         let value = ctx
@@ -1804,7 +1802,7 @@ mod tests {
     #[tokio::test]
     async fn failed_step_end_infos_carry_the_written_error() {
         let hooks = crate::plugin::test_support::OpHooks::default();
-        let (ctx, _client) = context_with_plugin(&hooks, None);
+        let (ctx, _client) = context_with_plugin(&hooks, Duration::ZERO);
         let err = ctx
             .step(|_| async { Err::<u32, BoxError>("boom".into()) })
             .name("a")
@@ -1837,7 +1835,7 @@ mod tests {
             Arc::new(CheckpointLog::from_records(records)),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -3725,7 +3723,7 @@ mod coordinator_tests {
             Arc::new(crate::engine::CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -3801,7 +3799,7 @@ mod coordinator_tests {
             Arc::new(crate::engine::CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -4163,7 +4161,7 @@ mod start_write_tests {
     /// Returns the client, the time the body started, and the handler's
     /// outcome: the step's value and the time the step returned.
     async fn timed_step(
-        buffer_window: Option<Duration>,
+        buffer_window: Duration,
         semantics: StepSemantics,
     ) -> (Arc<LatencyClient>, Duration, InvocationOutcome) {
         let client = Arc::new(LatencyClient::new(LATENCY));
@@ -4196,7 +4194,8 @@ mod start_write_tests {
 
     #[tokio::test(start_paused = true)]
     async fn at_least_once_body_starts_before_start_response() {
-        let (client, started, outcome) = timed_step(None, StepSemantics::AtLeastOncePerRetry).await;
+        let (client, started, outcome) =
+            timed_step(Duration::ZERO, StepSemantics::AtLeastOncePerRetry).await;
         assert_eq!(started, ms(0), "the body starts before START is answered");
         let start = client.request_with(&OperationAction::Start).expect("START");
         let succeed = client
@@ -4210,7 +4209,7 @@ mod start_write_tests {
     #[tokio::test(start_paused = true)]
     async fn buffered_start_precedes_outcome() {
         let (client, started, outcome) =
-            timed_step(Some(ms(50)), StepSemantics::AtLeastOncePerRetry).await;
+            timed_step(ms(50), StepSemantics::AtLeastOncePerRetry).await;
         assert_eq!(started, ms(0), "the body starts before START is answered");
         let requests = client.requests();
         let first = requests.first().expect("a request");
@@ -4236,7 +4235,8 @@ mod start_write_tests {
 
     #[tokio::test(start_paused = true)]
     async fn at_most_once_body_waits_for_start_response() {
-        let (_client, started, outcome) = timed_step(None, StepSemantics::AtMostOncePerRetry).await;
+        let (_client, started, outcome) =
+            timed_step(Duration::ZERO, StepSemantics::AtMostOncePerRetry).await;
         assert_eq!(started, ms(500), "the body starts after START is answered");
         assert!(matches!(outcome, InvocationOutcome::Complete(ref v) if v.starts_with("1@")));
     }
@@ -4261,16 +4261,20 @@ mod start_write_tests {
         let client = Arc::new(LatencyClient::new(LATENCY).failing_start());
         let runs = Arc::new(AtomicUsize::new(0));
         let body_runs = Arc::clone(&runs);
-        let outcome = drive_handler(latency_ctx(&client, None), None, move |ctx| async move {
-            ctx.step(move |_| async move {
-                body_runs.fetch_add(1, Ordering::SeqCst);
-                Ok(1_u32)
-            })
-            .name("s")
-            .await
-            .map_err(wire_err)?;
-            Ok("done".to_owned())
-        })
+        let outcome = drive_handler(
+            latency_ctx(&client, Duration::ZERO),
+            None,
+            move |ctx| async move {
+                ctx.step(move |_| async move {
+                    body_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(1_u32)
+                })
+                .name("s")
+                .await
+                .map_err(wire_err)?;
+                Ok("done".to_owned())
+            },
+        )
         .await
         .expect("no panic");
         assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran once");
@@ -4280,25 +4284,29 @@ mod start_write_tests {
         let client = Arc::new(LatencyClient::new(LATENCY).failing_start());
         let checks = Arc::new(AtomicUsize::new(0));
         let check_runs = Arc::clone(&checks);
-        let outcome = drive_handler(latency_ctx(&client, None), None, move |ctx| async move {
-            ctx.wait_for_condition(
-                move |_, state: u32| {
-                    let checks = Arc::clone(&check_runs);
-                    async move {
-                        checks.fetch_add(1, Ordering::SeqCst);
-                        Ok(state + 1)
-                    }
-                },
-                0,
-            )
-            .wait_strategy_fn(|_state, _attempt| {
-                crate::builders::wait_for_condition::WaitDecision::complete()
-            })
-            .name("c")
-            .await
-            .map_err(wire_err)?;
-            Ok("done".to_owned())
-        })
+        let outcome = drive_handler(
+            latency_ctx(&client, Duration::ZERO),
+            None,
+            move |ctx| async move {
+                ctx.wait_for_condition(
+                    move |_, state: u32| {
+                        let checks = Arc::clone(&check_runs);
+                        async move {
+                            checks.fetch_add(1, Ordering::SeqCst);
+                            Ok(state + 1)
+                        }
+                    },
+                    0,
+                )
+                .wait_strategy_fn(|_state, _attempt| {
+                    crate::builders::wait_for_condition::WaitDecision::complete()
+                })
+                .name("c")
+                .await
+                .map_err(wire_err)?;
+                Ok("done".to_owned())
+            },
+        )
         .await
         .expect("no panic");
         assert_eq!(checks.load(Ordering::SeqCst), 1, "the check ran once");
@@ -4334,7 +4342,7 @@ mod start_write_tests {
     /// Drives, on a client with [`LATENCY`] and `buffer_window`, a step
     /// whose body panics with `"boom"` at once, and asserts the `START`
     /// write was kept.
-    async fn panicking_step(buffer_window: Option<Duration>) {
+    async fn panicking_step(buffer_window: Duration) {
         let client = Arc::new(LatencyClient::new(LATENCY));
         let ctx = latency_ctx(&client, buffer_window);
         let clock = Arc::clone(&client);
@@ -4360,14 +4368,14 @@ mod start_write_tests {
 
     #[tokio::test(start_paused = true)]
     async fn body_panic_before_start_response_keeps_start_write() {
-        // (a) Batching off.
-        panicking_step(None).await;
-        // (b) Batching on, with a 50 ms delay.
-        panicking_step(Some(ms(50))).await;
+        // (a) No coalescing window.
+        panicking_step(Duration::ZERO).await;
+        // (b) A 50 ms coalescing window.
+        panicking_step(ms(50)).await;
 
-        // (c) A condition check, batching off.
+        // (c) A condition check, no coalescing window.
         let client = Arc::new(LatencyClient::new(LATENCY));
-        let ctx = latency_ctx(&client, None);
+        let ctx = latency_ctx(&client, Duration::ZERO);
         let clock = Arc::clone(&client);
         let result = drive_handler(ctx.clone(), None, |ctx| async move {
             #[expect(clippy::panic)] // reason: the scenario is a panicking check

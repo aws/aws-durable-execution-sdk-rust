@@ -4443,7 +4443,7 @@ mod tests {
     /// `window` and `plugins`.
     fn plugin_ctx(
         log: CheckpointLog,
-        window: Option<std::time::Duration>,
+        window: std::time::Duration,
         plugins: Arc<crate::plugin::InvocationPlugins>,
     ) -> (DurableContext, Arc<InMemoryExecutionClient>) {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
@@ -4493,7 +4493,7 @@ mod tests {
         let (buffer, _guard) = crate::plugin::test_support::capture();
         let (ctx, _client) = plugin_ctx(
             CheckpointLog::empty(),
-            None,
+            std::time::Duration::ZERO,
             crate::plugin::test_support::plugins_of(TraceSpan),
         );
         // A caller namespace with its own correlation operation ID, so a
@@ -4571,7 +4571,7 @@ mod tests {
                     record_of("2", CheckpointStatus::Started, "Wait", "Wait", "b"),
                     record_of("3", status.clone(), "Context", COMBINATOR_SUB_TYPE, "all"),
                 ]);
-                let (ctx, _client) = plugin_ctx(log, None, hooks.plugins());
+                let (ctx, _client) = plugin_ctx(log, std::time::Duration::ZERO, hooks.plugins());
                 let a = ctx
                     .wait(std::time::Duration::from_secs(1))
                     .name("a")
@@ -4715,43 +4715,41 @@ mod tests {
 
     /// Test 15: while the combinator's start hook dispatch blocks, the
     /// client receives no `START` of the combinator, on a multi-thread
-    /// runtime, with checkpoint batching off and on.
+    /// runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn combinator_queue_then_hook_blocks_start_send_until_hook_dispatch() {
         let mut failures = Vec::new();
         for outer in OUTERS {
-            for window in [None, Some(std::time::Duration::ZERO)] {
-                let hooks = LogHooks {
-                    gate: Some(Arc::default()),
-                    ..LogHooks::default()
-                };
-                let (ctx, client) = plugin_ctx(
-                    CheckpointLog::empty(),
-                    window,
-                    crate::plugin::test_support::plugins_of(hooks.clone()),
-                );
-                let sent = || {
-                    client.recorded_updates().iter().any(|u| {
-                        u.action() == &aws_sdk_lambda::types::OperationAction::Start
-                            && u.name() == Some("all")
-                    })
-                };
-                let handle = spawn_outer(&ctx, outer, vec![ready(1_i32), ready(2_i32)]);
-                let entered = within_two_seconds(|| hooks.entered()).await;
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let sent_while_blocked = sent();
-                hooks.release();
-                let succeeded = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
-                    .await
-                    .unwrap_or(false);
-                let sent_after = sent();
-                if !entered || sent_while_blocked || !sent_after || !succeeded {
-                    failures.push(format!(
-                        "{outer:?} window={window:?}: entered={entered} \
-                         sent_while_blocked={sent_while_blocked} sent_after={sent_after} \
-                         succeeded={succeeded}"
-                    ));
-                }
+            let hooks = LogHooks {
+                gate: Some(Arc::default()),
+                ..LogHooks::default()
+            };
+            let (ctx, client) = plugin_ctx(
+                CheckpointLog::empty(),
+                std::time::Duration::ZERO,
+                crate::plugin::test_support::plugins_of(hooks.clone()),
+            );
+            let sent = || {
+                client.recorded_updates().iter().any(|u| {
+                    u.action() == &aws_sdk_lambda::types::OperationAction::Start
+                        && u.name() == Some("all")
+                })
+            };
+            let handle = spawn_outer(&ctx, outer, vec![ready(1_i32), ready(2_i32)]);
+            let entered = within_two_seconds(|| hooks.entered()).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let sent_while_blocked = sent();
+            hooks.release();
+            let succeeded = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .unwrap_or(false);
+            let sent_after = sent();
+            if !entered || sent_while_blocked || !sent_after || !succeeded {
+                failures.push(format!(
+                    "{outer:?}: entered={entered} \
+                     sent_while_blocked={sent_while_blocked} sent_after={sent_after} \
+                     succeeded={succeeded}"
+                ));
             }
         }
         assert!(failures.is_empty(), "failed cases: {failures:#?}");
@@ -4792,7 +4790,7 @@ mod tests {
                 let hooks = LogHooks::default();
                 let (ctx, _client) = plugin_ctx(
                     CheckpointLog::empty(),
-                    None,
+                    std::time::Duration::ZERO,
                     crate::plugin::test_support::plugins_of(hooks.clone()),
                 );
                 let log = Arc::clone(&hooks.log);

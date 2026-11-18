@@ -1706,7 +1706,7 @@ mod tests {
             Arc::new(CheckpointLog::from_records(records)),
             Arc::new(InMemoryExecutionClient::new(vec![])),
             "token-1".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         )
@@ -1774,7 +1774,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             client,
             "token-1".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -1951,7 +1951,7 @@ mod tests {
                 Arc::new(CheckpointLog::from_records(vec![record])),
                 Arc::new(InMemoryExecutionClient::new(vec![])),
                 "token-1".to_owned(),
-                None,
+                Duration::ZERO,
                 0,
                 Some(plugins),
             );
@@ -2316,16 +2316,32 @@ mod tests {
     // Submitter-as-step tests (verifies the fix for missing StepStarted/
     //    StepSucceeded events in the WaitForCallback child context)
 
+    /// Asserts that `client` recorded an update of each type and action in
+    /// `expected`.
+    fn assert_updates_include(
+        client: &InMemoryExecutionClient,
+        expected: &[(OperationType, OperationAction)],
+    ) {
+        let updates = client.recorded_updates();
+        for (kind, action) in expected {
+            assert!(
+                updates
+                    .iter()
+                    .any(|u| u.r#type() == kind && u.action() == action),
+                "no {kind:?} {action:?} update in {updates:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn wfcb_submitter_executes_as_step_with_checkpoints() {
         // The submitter must go through StepExecution, producing checkpoint
-        // calls for StepStarted and StepSucceeded. With the child context's
-        // callback START checkpoint, we expect at least 4 checkpoint calls:
+        // updates for StepStarted and StepSucceeded. With the child context's
+        // callback START checkpoint, we expect these updates:
         //   1. ContextStarted (from WaitForCallbackExecution)
         //   2. CallbackStarted (from CreateCallbackExecution)
         //   3. StepStarted (from StepExecution wrapping submitter)
         //   4. StepSucceeded (from StepExecution wrapping submitter)
-        // Plus ContextSucceeded for the outer context.
         let client = Arc::new(InMemoryExecutionClient::new(vec![]));
         let ctx = DurableContext::new_root_with_client(
             "arn:test".to_owned(),
@@ -2372,16 +2388,16 @@ mod tests {
             "submitter should have been invoked"
         );
 
-        // Verify checkpoint calls were made (at minimum: ContextStart,
-        // CallbackStart, StepStart, StepSucceed).
-        let call_count = *client
-            .checkpoint_call_count
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            call_count >= 4,
-            "expected at least 4 checkpoint calls (ContextStart + CallbackStart + \
-             StepStart + StepSucceed), got {call_count}"
+        // Verify the checkpoint updates: ContextStart, CallbackStart,
+        // StepStart and StepSucceed.
+        assert_updates_include(
+            &client,
+            &[
+                (OperationType::Context, OperationAction::Start),
+                (OperationType::Callback, OperationAction::Start),
+                (OperationType::Step, OperationAction::Start),
+                (OperationType::Step, OperationAction::Succeed),
+            ],
         );
     }
 
@@ -2569,19 +2585,17 @@ mod tests {
         .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
 
-        // Verify checkpoint calls were made for the step execution path:
-        //   1. ContextStarted
-        //   2. CallbackStarted
-        //   3. StepStarted
-        //   4. StepRetry or StepFail (depends on default retry strategy)
-        //   5+. Possible ContextFailed
-        let call_count = *client
-            .checkpoint_call_count
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            call_count >= 4,
-            "expected at least 4 checkpoint calls for failed submitter path, got {call_count}"
+        // Verify the checkpoint updates of the step execution path:
+        // ContextStart, CallbackStart, StepStart, and the StepRetry the
+        // default retry strategy schedules.
+        assert_updates_include(
+            &client,
+            &[
+                (OperationType::Context, OperationAction::Start),
+                (OperationType::Callback, OperationAction::Start),
+                (OperationType::Step, OperationAction::Start),
+                (OperationType::Step, OperationAction::Retry),
+            ],
         );
     }
 
@@ -5447,7 +5461,7 @@ mod coordinator_tests {
             Arc::new(crate::engine::CheckpointLog::empty()),
             Arc::new(client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
-            None,
+            std::time::Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -5654,7 +5668,7 @@ mod start_order_tests {
     /// action.
     type Submission = (String, String, OperationAction);
 
-    /// A context with direct writes over `client`, whose submissions
+    /// A context over `client`, whose submissions
     /// `submissions` records, and with the plugin `hooks`.
     fn recorded_context(
         client: Arc<dyn crate::client::ExecutionClient>,
@@ -5667,7 +5681,7 @@ mod start_order_tests {
             Arc::new(CheckpointLog::from_records(Vec::new())),
             client,
             "token-0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             hooks.map(crate::plugin::test_support::OpHooks::plugins),
         );

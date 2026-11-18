@@ -2071,10 +2071,10 @@ impl LocalRunner {
     /// use aws_durable_execution_sdk::Options;
     /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
-    /// // Send each checkpoint in its own request.
+    /// // Coalesce checkpoints in a 20 ms window.
     /// let runner = LocalRunner::new().options(
     ///     Options::builder()
-    ///         .checkpoint_batching(false)
+    ///         .checkpoint_delay(std::time::Duration::from_millis(20))
     ///         .build()
     ///         .expect("valid options"),
     /// );
@@ -9894,6 +9894,7 @@ mod tests {
                         let e = e2;
                         async move {
                             e.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                             Ok(2_i32)
                         }
                     })
@@ -9931,16 +9932,11 @@ mod tests {
     /// flushed before the invocation reported PENDING.
     #[tokio::test(start_paused = true)]
     async fn checkpoint_delay_coalesces_and_flushes_before_suspension() {
-        // Baseline: identical handler, no coalescing. Batching is on by
-        // default, so the baseline opts out to stay the immediate-write
-        // baseline.
+        // Baseline: identical handler with the default zero window. Step
+        // `b` returns 10 ms after `a`, so without a window their SUCCEED
+        // updates go in separate requests.
         let baseline_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let baseline_runner = LocalRunner::new().single_page().options(
-            crate::Options::builder()
-                .checkpoint_batching(false)
-                .build()
-                .expect("valid options"),
-        );
+        let baseline_runner = LocalRunner::new().single_page();
         let baseline_backend = Arc::new(Backend::new(QueuedReplies::default(), None));
         let baseline = baseline_runner
             .run_on_backend(
@@ -9978,7 +9974,7 @@ mod tests {
         );
 
         // Coalescing must have merged the concurrent steps' checkpoints
-        // into fewer API calls than the immediate-write baseline.
+        // into fewer API calls than the zero-window baseline.
         let baseline_calls = baseline_backend.checkpoint_call_count();
         let coalesced_calls = coalesced_backend.checkpoint_call_count();
         assert!(
@@ -10002,16 +9998,6 @@ mod tests {
         );
     }
 
-    /// A runner that sends each checkpoint in its own request.
-    fn unbatched_runner() -> LocalRunner {
-        LocalRunner::new().single_page().options(
-            crate::Options::builder()
-                .checkpoint_batching(false)
-                .build()
-                .expect("valid options"),
-        )
-    }
-
     /// Runs `handler` on a retained backend and returns the number of
     /// checkpoint calls the backend received.
     async fn checkpoint_calls<O, F, Fut>(runner: &LocalRunner, handler: F) -> usize
@@ -10032,32 +10018,10 @@ mod tests {
         backend.checkpoint_call_count()
     }
 
-    /// A runner built with `new()` batches checkpoints: concurrent steps
-    /// send fewer checkpoint calls than with `checkpoint_batching(false)`.
+    /// Two top-level steps awaited one after the other send four requests:
+    /// one for each `START` and `SUCCEED` update.
     #[tokio::test(start_paused = true)]
-    async fn new_runner_batches_by_default() {
-        let execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let default_calls = checkpoint_calls(
-            &LocalRunner::new().single_page(),
-            coalescing_probe_handler(Arc::clone(&execs)),
-        )
-        .await;
-        let unbatched_calls = checkpoint_calls(
-            &unbatched_runner(),
-            coalescing_probe_handler(Arc::clone(&execs)),
-        )
-        .await;
-        assert!(
-            default_calls < unbatched_calls,
-            "the default runner must batch: default={default_calls}, \
-             unbatched={unbatched_calls}"
-        );
-    }
-
-    /// A sequential handler has no concurrent writes to batch, so it sends
-    /// the same number of checkpoint calls with and without batching.
-    #[tokio::test(start_paused = true)]
-    async fn sequential_handler_sends_one_request_per_checkpoint() {
+    async fn top_level_steps_awaited_in_sequence_send_separate_requests() {
         let handler = |(), ctx: DurableContext| async move {
             let a = ctx.step(|_| async { Ok(1_i32) }).name("a").await?;
             let b = ctx
@@ -10066,12 +10030,8 @@ mod tests {
                 .await?;
             Ok::<_, BoxError>(b)
         };
-        let default_calls = checkpoint_calls(&LocalRunner::new().single_page(), handler).await;
-        let unbatched_calls = checkpoint_calls(&unbatched_runner(), handler).await;
-        assert_eq!(
-            default_calls, unbatched_calls,
-            "a sequential handler must send one request per checkpoint"
-        );
+        let calls = checkpoint_calls(&LocalRunner::new().single_page(), handler).await;
+        assert_eq!(calls, 4, "one request per START and SUCCEED");
     }
 
     /// A transport that fails every call and counts how often it was used.
@@ -10203,46 +10163,6 @@ mod tests {
         );
     }
 
-    /// `checkpoint_batching` preserves handler semantics end-to-end: the
-    /// same probe handler (concurrent steps, a suspension, a post-resume
-    /// step) completes with the same output, and every step body runs
-    /// exactly once across the suspend/resume boundary: proving the
-    /// batched checkpoints flushed (and any in-flight batched write was
-    /// awaited) before the invocation reported PENDING.
-    #[tokio::test(start_paused = true)]
-    async fn checkpoint_batching_preserves_handler_semantics() {
-        let execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let backend = Arc::new(Backend::new(QueuedReplies::default(), None));
-        let result = LocalRunner::new()
-            .single_page()
-            .options(
-                crate::Options::builder()
-                    .checkpoint_batching(true)
-                    .build()
-                    .expect("valid options"),
-            )
-            .run_on_backend(
-                Arc::clone(&backend),
-                coalescing_probe_handler(Arc::clone(&execs)),
-                "null".to_owned(),
-            )
-            .await
-            .expect("runner");
-
-        assert!(result.is_success(), "{:?}", result.error_message());
-        assert_eq!(
-            result.output(),
-            Some(&42),
-            "batching must not change the handler's result"
-        );
-        assert_eq!(
-            execs.load(Ordering::SeqCst),
-            3,
-            "each step body must run exactly once across suspend/resume — \
-             a checkpoint held past the PENDING boundary would re-execute it"
-        );
-    }
-
     /// A non-retryable failure of a detached batch flush whose only
     /// contributor was dropped before the rejection arrived fails the
     /// execution in this invocation. The failure is recorded where the
@@ -10252,12 +10172,7 @@ mod tests {
     /// accepted START.
     #[tokio::test]
     async fn nonretryable_failure_of_dropped_contributor_fails_execution() {
-        let runner = LocalRunner::new().options(
-            crate::Options::builder()
-                .checkpoint_batching(true)
-                .build()
-                .expect("valid options"),
-        );
+        let runner = LocalRunner::new();
         let backend = Arc::new(Backend::new(
             QueuedReplies::default(),
             runner.checkpoint_page_size,
@@ -10447,7 +10362,6 @@ mod tests {
         let plugin = crate::plugin::test_support::Hooks::default();
         let runner = LocalRunner::new().options(
             crate::Options::builder()
-                .checkpoint_batching(true)
                 .plugin(plugin.clone())
                 .build()
                 .expect("valid options"),
@@ -10593,21 +10507,14 @@ mod tests {
 
     /// A retry delayed by 300 seconds loses a race against a 1 second wait.
     ///
-    /// The runner sends each checkpoint in its own request, so the test
-    /// fails on a backend that fires every timer in one advance. Such a
+    /// The test fails on a backend that fires every timer in one advance. Such a
     /// backend fires the retry and the wait together. The next invocation
-    /// re-runs the step body while the wait child replays, and with
-    /// unbatched checkpoints the step's child settles first, so the race
+    /// re-runs the step body while the wait child replays, and the step's
+    /// child settles first, so the race
     /// returns `"retried"`.
     #[tokio::test]
     async fn virtual_clock_orders_retry_delay_against_wait() {
         let result = LocalRunner::new()
-            .options(
-                crate::Options::builder()
-                    .checkpoint_batching(false)
-                    .build()
-                    .expect("valid options"),
-            )
             .run(
                 |(), ctx: DurableContext| async move {
                     let retried = ctx
@@ -10924,15 +10831,7 @@ mod tests {
     /// before the backend applies it, and changes nothing else.
     #[tokio::test(start_paused = true)]
     async fn checkpoint_latency_delays_each_checkpoint() {
-        let unbatched = || {
-            LocalRunner::new().options(
-                crate::Options::builder()
-                    .checkpoint_batching(false)
-                    .build()
-                    .expect("valid options"),
-            )
-        };
-        let runner = unbatched().checkpoint_latency(std::time::Duration::from_millis(50));
+        let runner = LocalRunner::new().checkpoint_latency(std::time::Duration::from_millis(50));
         let backend = Arc::new(runner.new_backend());
 
         // The handler runs on its own task, so each step lets that task run
@@ -10964,7 +10863,10 @@ mod tests {
         );
         let delayed = delayed.expect("runner");
 
-        let baseline = unbatched().run(one_step_handler, ()).await.expect("runner");
+        let baseline = LocalRunner::new()
+            .run(one_step_handler, ())
+            .await
+            .expect("runner");
         assert!(delayed.is_success(), "{:?}", delayed.error_message());
         assert_eq!(delayed.output(), baseline.output());
         // Each run reports times from its own start, so the comparison
@@ -13594,11 +13496,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn durable_target_uses_outer_checkpoint_latency() -> Result<(), BoxError> {
         let result = LocalRunner::new()
-            .options(
-                crate::Options::builder()
-                    .checkpoint_batching(false)
-                    .build()?,
-            )
             .checkpoint_latency(std::time::Duration::from_millis(100))
             .register_durable_function("timed", |(): (), ctx: DurableContext| async move {
                 let before = tokio::time::Instant::now();

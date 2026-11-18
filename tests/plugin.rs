@@ -912,11 +912,10 @@ impl PluginFactory for FailsWhenRetrying {
     }
 }
 
-/// A runner with checkpoint batching, `plugin` and [`FailsWhenRetrying`].
-fn batching_runner(plugin: &Lifecycle) -> LocalRunner {
+/// A runner with `plugin` and [`FailsWhenRetrying`].
+fn failing_retry_runner(plugin: &Lifecycle) -> LocalRunner {
     LocalRunner::new().options(
         Options::builder()
-            .checkpoint_batching(true)
             .plugin(plugin.clone())
             .plugin(FailsWhenRetrying)
             .build()
@@ -955,7 +954,7 @@ async fn orphaned_step(_event: (), ctx: DurableContext) -> Result<String, BoxErr
 #[tokio::test]
 async fn end_hook_failed_after_nonretryable_flush_failure() {
     let plugin = Lifecycle::default();
-    let result = batching_runner(&plugin)
+    let result = failing_retry_runner(&plugin)
         .fail_checkpoints_after(1, 1)
         .run(orphaned_step, ())
         .await
@@ -981,7 +980,7 @@ async fn end_hook_failed_after_nonretryable_flush_failure() {
 #[tokio::test]
 async fn end_hook_retrying_after_retryable_orphaned_write_failure() {
     let plugin = Lifecycle::default();
-    let result = batching_runner(&plugin)
+    let result = failing_retry_runner(&plugin)
         .fail_checkpoints_after_retryable(1, 1)
         .run(orphaned_step, ())
         .await

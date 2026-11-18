@@ -1169,19 +1169,13 @@ where
         lambda_client,
         execution_client,
         checkpoint_delay,
-        checkpoint_batching,
         plugins,
         plugin_child_operations_depth,
     } = options;
     // The checkpoint buffer window: a configured delay is the coalescing
-    // window; batching without a delay buffers with a zero window (writes
-    // batch behind the single-writer lock but are never held back); batching
-    // off without a delay means immediate writes.
-    let checkpoint_buffer_window = match (checkpoint_delay, checkpoint_batching) {
-        (Some(delay), _) => Some(delay),
-        (None, true) => Some(Duration::ZERO),
-        (None, false) => None,
-    };
+    // window; without one, writes batch behind the single-writer lock with
+    // a zero window and are never held back.
+    let checkpoint_buffer_window = checkpoint_delay.unwrap_or(Duration::ZERO);
     // A supplied transport replaces the Lambda transport; `build()` already
     // rejected it together with `lambda_client` or `sdk_config`.
     let preset_client: Option<StdArc<dyn ExecutionClient>> = execution_client.or_else(|| {
@@ -1206,7 +1200,7 @@ where
 fn wrap_with_provider<F, E, Fut, O>(
     handler: F,
     provider: ClientProvider,
-    checkpoint_buffer_window: Option<Duration>,
+    checkpoint_buffer_window: Duration,
     plugin_child_operations_depth: u32,
     plugin_factories: std::sync::Arc<plugin::Factories>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
@@ -1551,13 +1545,13 @@ where
     test_hooks::pending_holding_guard().await;
 
     // Unconditional flush point of the checkpoint buffering
-    // contract (`checkpoint_delay` / `checkpoint_batching`):
+    // contract (`checkpoint_delay`):
     // whatever the outcome, suspension (PENDING), completion
     // (SUCCEEDED), or failure (FAILED), every buffered checkpoint
     // is written, and every in-flight batched write is awaited,
     // BEFORE the envelope reports the invocation's state to the
     // service, so buffering can never hold a checkpoint past the
-    // end of the invocation. A no-op without configured buffering.
+    // end of the invocation. A no-op when nothing is buffered.
     // A `Fault` outcome skips the flush: the invocation fails, and the
     // service invokes the function again. After a failed write the flush
     // sends nothing (see `DurableContext::flush_pending_checkpoints`).
@@ -2373,7 +2367,7 @@ mod tests {
         let service = wrap_with_provider(
             |_event: serde_json::Value, _ctx: DurableContext| async move { boom() },
             ClientProvider::new(Some(client)),
-            None,
+            Duration::ZERO,
             0,
             std::sync::Arc::from(Vec::new()),
         );
@@ -3749,7 +3743,7 @@ mod tests {
             std::sync::Arc::new(engine::CheckpointLog::empty()),
             std::sync::Arc::clone(&client) as std::sync::Arc<dyn ExecutionClient>,
             "t0".to_owned(),
-            Some(Duration::from_secs(60)),
+            Duration::from_secs(60),
             0,
             None,
         );
@@ -5090,7 +5084,7 @@ mod tests {
             std::sync::Arc::new(engine::CheckpointLog::empty()),
             std::sync::Arc::clone(&client) as std::sync::Arc<dyn ExecutionClient>,
             "t0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             None,
         );

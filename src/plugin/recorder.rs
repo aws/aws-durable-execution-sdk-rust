@@ -92,7 +92,7 @@ pub(crate) fn context_over(
         Arc::new(crate::engine::CheckpointLog::from_records(records)),
         client,
         "token0".to_owned(),
-        None,
+        std::time::Duration::ZERO,
         0,
         Some(hooks.plugins()),
     )

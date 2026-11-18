@@ -818,9 +818,9 @@ mod tests {
     }
 
     /// A root context over a recording in-memory client, with the
-    /// coalescer `window` (`None`: direct writes).
+    /// coalescer `window`.
     fn recording_context(
-        window: Option<Duration>,
+        window: Duration,
     ) -> (
         DurableContext,
         std::sync::Arc<crate::client::InMemoryExecutionClient>,
@@ -844,11 +844,11 @@ mod tests {
     /// to the no-runtime error and no `START` is queued or written.
     #[test]
     fn spawn_without_runtime_queues_nothing() {
-        let (ctx, client) = recording_context(None);
+        let (ctx, client) = recording_context(Duration::ZERO);
         let step = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
-        let (wait_ctx, wait_client) = recording_context(None);
+        let (wait_ctx, wait_client) = recording_context(Duration::ZERO);
         let wait = wait_ctx.wait(Duration::from_secs(1)).name("w").spawn();
-        let (map_ctx, map_client) = recording_context(None);
+        let (map_ctx, map_client) = recording_context(Duration::ZERO);
         let map = map_ctx
             .map(vec![1_u32], |_child, item, _| async move { Ok(item) })
             .name("m")
@@ -966,7 +966,7 @@ mod tests {
     /// runs no body, and its handle never resolves.
     #[tokio::test]
     async fn spawn_from_abandoned_owner_stays_refused() {
-        let (root, client) = recording_context(Some(Duration::ZERO));
+        let (root, client) = recording_context(Duration::ZERO);
         let child = root.new_child("1", None);
         root.admission()
             .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
@@ -1046,7 +1046,7 @@ mod tests {
             )])),
             client.clone(),
             "token-0".to_owned(),
-            Some(Duration::ZERO),
+            Duration::ZERO,
             0,
             None,
         );
@@ -1111,7 +1111,7 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::disallowed_methods)] // reason: the test calls `.spawn()` from a task the SDK did not start
     async fn spawn_from_unblessed_caller_in_abandoned_owner_is_refused() {
-        let (root, client) = recording_context(Some(Duration::ZERO));
+        let (root, client) = recording_context(Duration::ZERO);
         let child = root.new_child("1", None);
         root.admission()
             .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
@@ -1149,7 +1149,7 @@ mod tests {
     /// `START` in the coalescer. Both queue it once their tasks run.
     #[tokio::test(flavor = "current_thread")]
     async fn spawn_of_invoke_and_condition_queues_no_start_before_returning() {
-        let (ctx, _client) = recording_context(Some(Duration::from_hours(1)));
+        let (ctx, _client) = recording_context(Duration::from_hours(1));
         let invoke = ctx
             .invoke::<serde_json::Value>("target", serde_json::json!({}))
             .name("i")

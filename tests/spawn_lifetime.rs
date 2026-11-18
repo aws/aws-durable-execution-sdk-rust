@@ -932,3 +932,175 @@ async fn detached_panic_fails_the_invocation() {
         "the detached panic fails the invocation"
     );
 }
+
+/// Paused-time instant `n` ms after `base`.
+fn at(base: tokio::time::Instant, n: u64) -> tokio::time::Instant {
+    base + Duration::from_millis(n)
+}
+
+/// A runner whose checkpoint responses take 20 ms, so a write submitted
+/// while another is in flight waits behind it.
+fn slow_checkpoint_runner() -> LocalRunner {
+    LocalRunner::new().checkpoint_latency(Duration::from_millis(20))
+}
+
+/// A step's `SUCCEED`, submitted while its child is open and while another
+/// write is in flight, is written although the child returns before the
+/// write is sent.
+#[tokio::test(start_paused = true)]
+async fn update_queued_before_child_returns_is_written() {
+    let result = slow_checkpoint_runner()
+        .run(
+            |(), ctx: DurableContext| async move {
+                let base = tokio::time::Instant::now();
+                let holder: Holder = Arc::default();
+                let kept = Arc::clone(&holder);
+                ctx.run_in_child_context(move |child| async move {
+                    let escaped = child
+                        .step(move |_| async move {
+                            tokio::time::sleep_until(at(base, 1000)).await;
+                            Ok(())
+                        })
+                        .name("escaped")
+                        .spawn();
+                    tokio::time::sleep_until(at(base, 995)).await;
+                    let blocker = child
+                        .step(|_| async {
+                            std::future::pending::<()>().await;
+                            Ok(())
+                        })
+                        .name("blocker")
+                        .spawn();
+                    kept.lock().expect("lock").extend([escaped, blocker]);
+                    tokio::time::sleep_until(at(base, 1005)).await;
+                    Ok(())
+                })
+                .name("child")
+                .await?;
+                ctx.step(|_| async { Ok(()) }).name("keep").await?;
+                drop(holder);
+                Ok::<_, BoxError>(())
+            },
+            (),
+        )
+        .await
+        .expect("the run finishes");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(
+        status(&result, "escaped"),
+        Some(OperationStatus::Succeeded),
+        "{result}"
+    );
+}
+
+/// A map item's `SUCCEED`, submitted while the map is open and while
+/// another write is in flight, is written although the map completes
+/// early before the write is sent.
+#[tokio::test(start_paused = true)]
+async fn update_queued_before_early_batch_completion_is_written() {
+    let result = slow_checkpoint_runner()
+        .run(
+            |(), ctx: DurableContext| async move {
+                let base = tokio::time::Instant::now();
+                ctx.map(vec![0_u32, 1, 2], move |child, item, _idx| async move {
+                    match item {
+                        0 => {
+                            child
+                                .step(move |_| async move {
+                                    tokio::time::sleep_until(at(base, 1000)).await;
+                                    Ok(())
+                                })
+                                .name("quick")
+                                .await?;
+                        }
+                        1 => {
+                            child
+                                .step(move |_| async move {
+                                    tokio::time::sleep_until(at(base, 1030)).await;
+                                    Ok(())
+                                })
+                                .name("s1")
+                                .await?;
+                        }
+                        _ => {
+                            tokio::time::sleep_until(at(base, 1025)).await;
+                            child
+                                .step(|_| async {
+                                    std::future::pending::<()>().await;
+                                    Ok(())
+                                })
+                                .name("x")
+                                .await?;
+                        }
+                    }
+                    Ok(())
+                })
+                .name("m")
+                .completion(CompletionConfig::with_min_successful(1))
+                .await?;
+                ctx.step(|_| async { Ok(()) }).name("keep").await?;
+                Ok::<_, BoxError>(())
+            },
+            (),
+        )
+        .await
+        .expect("the run finishes");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(
+        status(&result, "s1"),
+        Some(OperationStatus::Succeeded),
+        "{result}"
+    );
+}
+
+/// Polls one step `lost` once inside a new current-thread runtime, runs
+/// that runtime for `run_for` (not at all when it is zero), and drops the
+/// step and the runtime.
+fn abandon_a_step_on_a_dropped_runtime(ctx: &DurableContext, run_for: Duration) {
+    tokio::task::block_in_place(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let step = ctx.step(|_| async { Ok(1_u32) }).name("lost").into_future();
+            let mut step = std::pin::pin!(step);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(step.as_mut().poll(&mut cx).is_pending());
+            if !run_for.is_zero() {
+                tokio::time::sleep(run_for).await;
+            }
+        });
+        drop(runtime);
+    });
+}
+
+/// Runs a handler that abandons step `lost` on a dropped second runtime,
+/// then awaits step `after`, with checkpoint responses that take
+/// `latency`. Asserts the run finishes within 10 s with `after`'s value.
+async fn run_after_abandoned_step(latency: Duration, run_for: Duration) {
+    let runner = LocalRunner::new().checkpoint_latency(latency);
+    let handler = move |(), ctx: DurableContext| async move {
+        abandon_a_step_on_a_dropped_runtime(&ctx, run_for);
+        Ok::<_, BoxError>(ctx.step(|_| async { Ok(2_u32) }).name("after").await?)
+    };
+    let result = tokio::time::timeout(Duration::from_secs(10), runner.run(handler, ()))
+        .await
+        .expect("the run finishes within 10 s")
+        .expect("the run finishes");
+    assert_eq!(result.output(), Some(&2));
+}
+
+/// A write after a second runtime that held the batch flusher was dropped
+/// is still written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_after_a_dropped_nested_runtime_is_written() {
+    run_after_abandoned_step(Duration::ZERO, Duration::ZERO).await;
+}
+
+/// A write after a second runtime was dropped while its flusher awaited a
+/// request the runner had not applied yet is still written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_after_a_nested_runtime_dropped_mid_write_is_written() {
+    run_after_abandoned_step(Duration::from_millis(500), Duration::from_millis(50)).await;
+}

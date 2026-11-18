@@ -646,11 +646,9 @@ fn operations_from(accepted: &[OperationUpdate]) -> Vec<serde_json::Value> {
     operations
 }
 
-/// Runs `handler` once over `transport`, with the recording plugin, and
-/// with `checkpoint_batching(false)` when `unbatched`.
+/// Runs `handler` once over `transport`, with the recording plugin.
 async fn invoke_handler<F, Fut>(
     transport: &Arc<Answering>,
-    unbatched: bool,
     operations: Vec<serde_json::Value>,
     handler: F,
 ) -> (
@@ -662,13 +660,12 @@ where
     Fut: Future<Output = Result<String, BoxError>> + Send,
 {
     let recorder = EndRecorder::default();
-    let mut options = Options::builder()
+    let options = Options::builder()
         .execution_client(Arc::clone(transport) as Arc<dyn ExecutionClient>)
-        .plugin(recorder.clone());
-    if unbatched {
-        options = options.checkpoint_batching(false);
-    }
-    let service = aws_durable_execution_sdk::wrap(handler, options.build().expect("valid options"));
+        .plugin(recorder.clone())
+        .build()
+        .expect("valid options");
+    let service = aws_durable_execution_sdk::wrap(handler, options);
     let event = lambda_runtime::LambdaEvent::new(
         payload_with(operations),
         lambda_runtime::Context::default(),
@@ -725,7 +722,7 @@ async fn orphan_then_next(
     EndRecorder,
 ) {
     let seen = Arc::clone(transport);
-    invoke_handler(transport, true, Vec::new(), move |_event, ctx| {
+    invoke_handler(transport, Vec::new(), move |_event, ctx| {
         let seen = Arc::clone(&seen);
         async move {
             ctx.run_in_child_context(move |child| async move {
@@ -744,7 +741,7 @@ async fn orphan_then_next(
 }
 
 #[tokio::test(start_paused = true)]
-async fn stopped_child_step_write_failure_fails_execution_unbatched() {
+async fn stopped_child_step_write_failure_fails_execution() {
     let transport = Answering::failing(
         "orphan",
         OperationAction::Succeed,
@@ -777,7 +774,7 @@ where
     CFut: Future<Output = Result<u32, aws_durable_execution_sdk::OperationError>> + Send,
 {
     let combine = Arc::new(combine);
-    invoke_handler(transport, true, Vec::new(), move |_event, ctx| {
+    invoke_handler(transport, Vec::new(), move |_event, ctx| {
         let combine = Arc::clone(&combine);
         async move {
             let order = Arc::new(tokio::sync::Notify::new());
@@ -810,7 +807,7 @@ where
 }
 
 #[tokio::test(start_paused = true)]
-async fn race_loser_write_failure_fails_execution_unbatched() {
+async fn race_loser_write_failure_fails_execution() {
     let transport = Answering::failing(
         "b",
         OperationAction::Succeed,
@@ -825,7 +822,7 @@ async fn race_loser_write_failure_fails_execution_unbatched() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn select_ok_loser_write_failure_fails_execution_unbatched() {
+async fn select_ok_loser_write_failure_fails_execution() {
     let transport = Answering::failing(
         "b",
         OperationAction::Succeed,
@@ -840,15 +837,31 @@ async fn select_ok_loser_write_failure_fails_execution_unbatched() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn queued_write_behind_failed_write_is_not_sent_unbatched() {
+async fn queued_write_behind_failed_write_is_not_sent() {
     let transport = Answering::failing(
         "a",
         OperationAction::Succeed,
         ExecutionClientErrorScope::Execution,
     );
-    let (result, recorder) = ordered_pair(&transport, |_ctx, a, b| async move {
-        let (a, b) = tokio::join!(a, b);
-        Ok(a? + b?)
+    let seen = Arc::clone(&transport);
+    let (result, recorder) = invoke_handler(&transport, Vec::new(), move |_event, ctx| {
+        let seen = Arc::clone(&seen);
+        async move {
+            let a = ctx.step(|_| async { Ok(1_u32) }).name("a").future();
+            let b = ctx
+                .step(move |_| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        seen.until_received(|r| has(r, "a", &OperationAction::Succeed))
+                            .await;
+                        Ok(2_u32)
+                    }
+                })
+                .name("b")
+                .future();
+            let (a, b) = tokio::join!(a, b);
+            Ok((a? + b?).to_string())
+        }
     })
     .await;
     assert_execution_failed(&result, &recorder);
@@ -866,7 +879,7 @@ async fn queued_write_behind_failed_write_is_not_sent_unbatched() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn first_failure_decides_unbatched() {
+async fn first_failure_decides() {
     let transport = Answering::new(|updates| {
         if has(updates, "orphan", &OperationAction::Succeed) {
             Some(ExecutionClientError::new(
@@ -895,7 +908,6 @@ async fn first_failure_decides_unbatched() {
 /// step error into `Ok("caught")`, and counts the body runs in `runs`.
 async fn caught_step(
     transport: &Arc<Answering>,
-    unbatched: bool,
     operations: Vec<serde_json::Value>,
     runs: &Arc<std::sync::atomic::AtomicU32>,
 ) -> (
@@ -903,7 +915,7 @@ async fn caught_step(
     EndRecorder,
 ) {
     let runs = Arc::clone(runs);
-    invoke_handler(transport, unbatched, operations, move |_event, ctx| {
+    invoke_handler(transport, operations, move |_event, ctx| {
         let runs = Arc::clone(&runs);
         async move {
             let value = ctx
@@ -923,14 +935,14 @@ async fn caught_step(
 }
 
 #[tokio::test(start_paused = true)]
-async fn failed_write_sends_nothing_more_unbatched() {
+async fn failed_write_sends_nothing_more() {
     let transport = Answering::failing(
         "s",
         OperationAction::Succeed,
         ExecutionClientErrorScope::Execution,
     );
     let runs = Arc::default();
-    let (result, recorder) = caught_step(&transport, true, Vec::new(), &runs).await;
+    let (result, recorder) = caught_step(&transport, Vec::new(), &runs).await;
     assert_execution_failed(&result, &recorder);
     let requests = transport.requests();
     assert_eq!(requests.len(), 2, "{requests:?}");
@@ -951,7 +963,7 @@ async fn failed_state_read_after_accepted_write_fails_execution() {
         )),
     });
     let runs = Arc::default();
-    let (result, recorder) = caught_step(&transport, false, Vec::new(), &runs).await;
+    let (result, recorder) = caught_step(&transport, Vec::new(), &runs).await;
     assert_execution_failed(&result, &recorder);
     transport.assert_last_request_has("s", &OperationAction::Succeed);
     // The SDK reads the whole state from its first page.
@@ -983,15 +995,14 @@ async fn lost_failed_response_replays_last_accepted_record() {
         ExecutionClientErrorScope::Execution,
     );
     let runs = Arc::default();
-    let (result, recorder) = caught_step(&first, true, Vec::new(), &runs).await;
+    let (result, recorder) = caught_step(&first, Vec::new(), &runs).await;
     assert_execution_failed(&result, &recorder);
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 
     // The FAILED response is lost, and the service invokes the function
     // again from the records it accepted.
     let second = Answering::accepting();
-    let (result, _recorder) =
-        caught_step(&second, true, operations_from(&first.accepted()), &runs).await;
+    let (result, _recorder) = caught_step(&second, operations_from(&first.accepted()), &runs).await;
     let response = result.expect("the second invocation answers");
     assert_eq!(status(&response), Some("SUCCEEDED"), "{response}");
     assert_eq!(
@@ -1003,14 +1014,14 @@ async fn lost_failed_response_replays_last_accepted_record() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn refresh_failure_stops_later_writes_unbatched() {
+async fn refresh_failure_stops_later_writes() {
     let transport = Answering::new(|updates| {
         updates
             .is_empty()
             .then(|| ExecutionClientError::new(ExecutionClientErrorScope::Invocation, "throttled"))
     });
     let seen = Arc::clone(&transport);
-    let (result, recorder) = invoke_handler(&transport, true, Vec::new(), move |_event, ctx| {
+    let (result, recorder) = invoke_handler(&transport, Vec::new(), move |_event, ctx| {
         let seen = Arc::clone(&seen);
         async move {
             let cb = ctx.create_callback::<String>().name("cb").await?;

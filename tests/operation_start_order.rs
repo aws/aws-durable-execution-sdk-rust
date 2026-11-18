@@ -197,20 +197,13 @@ impl PluginFactory for HookLog {
 
 /// Runs `handler` once through `wrap` over the logging transport, with the
 /// plugin `factory`, and returns the invocation's status.
-async fn invoke<F, Fut, P>(log: &Log, batching: bool, factory: P, handler: F) -> String
+async fn invoke<F, Fut, P>(log: &Log, factory: P, handler: F) -> String
 where
     F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, BoxError>> + Send + 'static,
     P: PluginFactory,
 {
-    invoke_with(
-        Transport::new(log.clone()),
-        payload(),
-        batching,
-        factory,
-        handler,
-    )
-    .await
+    invoke_with(Transport::new(log.clone()), payload(), factory, handler).await
 }
 
 /// Runs `handler` once through `wrap` over `transport`, with the initial
@@ -219,7 +212,6 @@ where
 async fn invoke_with<F, Fut, P>(
     transport: Transport,
     payload: InvocationPayload,
-    batching: bool,
     factory: P,
     handler: F,
 ) -> String
@@ -232,7 +224,6 @@ where
         handler,
         Options::builder()
             .execution_client(Arc::new(transport))
-            .checkpoint_batching(batching)
             .plugin(factory)
             .build()
             .expect("valid options"),
@@ -247,19 +238,19 @@ where
         .to_owned()
 }
 
-/// Runs `handler` with checkpoint batching disabled and the hook log.
-async fn invoke_unbatched<F, Fut>(log: &Log, handler: F) -> String
+/// Runs `handler` with the hook log.
+async fn invoke_logged<F, Fut>(log: &Log, handler: F) -> String
 where
     F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, BoxError>> + Send + 'static,
 {
-    invoke(log, false, HookLog(log.clone()), handler).await
+    invoke(log, HookLog(log.clone()), handler).await
 }
 
 #[tokio::test]
 async fn default_step_start_hook_fires_before_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         Ok(ctx.step(|_| async { Ok("v".to_owned()) }).name("a").await?)
     })
     .await;
@@ -274,7 +265,7 @@ async fn default_step_start_hook_fires_before_start_response() {
 #[tokio::test]
 async fn at_most_once_step_start_hook_fires_after_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         Ok(ctx
             .step(|_| async { Ok("v".to_owned()) })
             .name("a")
@@ -293,7 +284,7 @@ async fn at_most_once_step_start_hook_fires_after_start_response() {
 #[tokio::test]
 async fn wait_start_hook_fires_after_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         ctx.wait(Duration::from_secs(1)).name("w").await?;
         Ok(String::new())
     })
@@ -309,7 +300,7 @@ async fn wait_start_hook_fires_after_start_response() {
 #[tokio::test]
 async fn create_callback_start_hook_fires_after_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         let cb = ctx.create_callback::<String>().name("cb").await?;
         Ok(cb.id().to_owned())
     })
@@ -347,27 +338,20 @@ impl QueueThenHook {
     }
 }
 
-/// Every case of test 7: each "queue, then hook" operation, with
-/// checkpoint batching disabled and enabled.
-fn cases() -> Vec<(QueueThenHook, bool)> {
-    [QueueThenHook::Step, QueueThenHook::WaitForCondition]
-        .into_iter()
-        .flat_map(|op| [(op, false), (op, true)])
-        .collect()
+/// Every case of test 7: each "queue, then hook" operation.
+fn cases() -> Vec<QueueThenHook> {
+    vec![QueueThenHook::Step, QueueThenHook::WaitForCondition]
 }
 
 #[tokio::test]
 async fn queue_then_hook_returns_before_start_send_current_thread() {
-    for (op, batching) in cases() {
+    for op in cases() {
         let log = Log::default();
-        let status = invoke(&log, batching, HookLog(log.clone()), move |_, ctx| {
-            op.run(ctx)
-        })
-        .await;
-        assert_eq!(status, "SUCCEEDED", "{op:?} batching={batching}");
+        let status = invoke(&log, HookLog(log.clone()), move |_, ctx| op.run(ctx)).await;
+        assert_eq!(status, "SUCCEEDED", "{op:?}");
         assert!(
             log.index("hook-return a") < log.index("send START a"),
-            "{op:?} batching={batching}: {:?}",
+            "{op:?}: {:?}",
             log.entries()
         );
     }
@@ -431,13 +415,13 @@ impl PluginFactory for BlockingHook {
 #[expect(clippy::disallowed_methods)] // reason: the invocation runs beside the test's observer
 async fn queue_then_hook_blocks_start_send_until_hook_dispatch() {
     let mut failures = Vec::new();
-    for (op, batching) in cases() {
+    for op in cases() {
         let log = Log::default();
         let hook = BlockingHook::default();
         let invocation = tokio::spawn({
             let log = log.clone();
             let hook = hook.clone();
-            async move { invoke(&log, batching, hook, move |_, ctx| op.run(ctx)).await }
+            async move { invoke(&log, hook, move |_, ctx| op.run(ctx)).await }
         });
         hook.entered().await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -447,7 +431,7 @@ async fn queue_then_hook_blocks_start_send_until_hook_dispatch() {
         let sent_after = log.contains("send START a");
         if sent_while_blocked || !sent_after || status != "SUCCEEDED" {
             failures.push(format!(
-                "{op:?} batching={batching}: sent while blocked={sent_while_blocked}, \
+                "{op:?}: sent while blocked={sent_while_blocked}, \
                  sent after={sent_after}, status={status}, log={:?}",
                 log.entries()
             ));
@@ -761,7 +745,7 @@ fn wire(positional: &str) -> String {
 #[tokio::test]
 async fn child_start_hook_fires_before_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         ctx.run_in_child_context(|child| async move {
             Ok(child.step(|_| async { Ok(1_u32) }).name("c.s").await?)
         })
@@ -781,7 +765,7 @@ async fn child_start_hook_fires_before_start_response() {
 #[tokio::test]
 async fn map_start_hook_fires_before_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         ctx.map(vec![1_u32], |_child, item, _| async move { Ok(item) })
             .name("m")
             .await?;
@@ -833,7 +817,7 @@ async fn spawned_child_replays_without_second_start() {
 #[tokio::test]
 async fn map_item_start_hook_fires_before_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         ctx.map(vec![1_u32], |_child, item, _| async move { Ok(item) })
             .name("m")
             .await?;
@@ -851,7 +835,7 @@ async fn map_item_start_hook_fires_before_start_response() {
 #[tokio::test]
 async fn parallel_branch_start_hook_fires_before_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         ctx.parallel(vec![durable::Branch::new("b0", |_child| async {
             Ok(1_u32)
         })])
@@ -871,7 +855,7 @@ async fn parallel_branch_start_hook_fires_before_start_response() {
 #[tokio::test]
 async fn parallel_mixed_branch_start_hook_fires_before_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         let mut branches = durable::BranchSet::new();
         let _handle = branches.add("pb0", |_child| async { Ok(1_u32) });
         ctx.parallel_mixed(branches).name("pm").await?;
@@ -889,7 +873,7 @@ async fn parallel_mixed_branch_start_hook_fires_before_start_response() {
 #[tokio::test]
 async fn wait_for_callback_start_hook_fires_before_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         let value = ctx
             .wait_for_callback::<String>(|_, _id| async { Ok(()) })
             .name("wcb")
@@ -908,7 +892,7 @@ async fn wait_for_callback_start_hook_fires_before_start_response() {
 #[tokio::test]
 async fn child_outcome_waits_for_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         ctx.run_in_child_context(|child| async move {
             Ok(child.step(|_| async { Ok(1_u32) }).name("c.s").await?)
         })
@@ -928,7 +912,7 @@ async fn child_outcome_waits_for_start_response() {
 #[tokio::test]
 async fn map_item_outcome_waits_for_start_response() {
     let log = Log::default();
-    let status = invoke_unbatched(&log, |_, ctx| async move {
+    let status = invoke_logged(&log, |_, ctx| async move {
         ctx.map(vec![1_u32], |_child, item, _| async move { Ok(item) })
             .name("m")
             .await?;
@@ -978,7 +962,6 @@ async fn spawned_step_replay_hook_precedes_post_spawn_marker() {
     let status = invoke_with(
         Transport::new(log.clone()),
         started_step_payload(),
-        false,
         HookLog(log.clone()),
         move |_, ctx| {
             let log = handler_log.clone();
@@ -1005,7 +988,7 @@ async fn spawned_step_replay_hook_precedes_post_spawn_marker() {
 async fn spawn_from_unblessed_task_is_rejected_before_start() {
     let log = Log::default();
     let handler_log = log.clone();
-    let status = invoke_unbatched(&log, move |_, ctx| {
+    let status = invoke_logged(&log, move |_, ctx| {
         let log = handler_log.clone();
         async move {
             let body_log = log.clone();
@@ -1066,7 +1049,7 @@ where
         let transport = Transport::holding(log.clone(), target, Arc::clone(&semaphore));
         let factory = HookLog(log.clone());
         async move {
-            invoke_with(transport, payload(), false, factory, move |_, ctx| {
+            invoke_with(transport, payload(), factory, move |_, ctx| {
                 handler(log.clone(), Arc::clone(&started), ctx)
             })
             .await
@@ -1337,32 +1320,30 @@ async fn child_backed_queue_then_hook_blocks_start_send_until_hook_dispatch() {
         ChildBacked::MapItem,
         ChildBacked::WaitForCallback,
     ] {
-        for batching in [false, true] {
-            let log = Log::default();
-            let hook = BlockingHook::default();
-            let target = op.target();
-            let invocation = tokio::spawn({
-                let log = log.clone();
-                let factory = BlockingTarget {
-                    target,
-                    hook: hook.clone(),
-                };
-                async move { invoke(&log, batching, factory, move |_, ctx| op.run(ctx)).await }
-            });
-            hook.entered().await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let start = format!("send START {target}");
-            let sent_while_blocked = log.contains(&start);
-            hook.release();
-            let status = invocation.await.expect("the invocation task completes");
-            let sent_after = log.contains(&start);
-            if sent_while_blocked || !sent_after || status != op.expected_status() {
-                failures.push(format!(
-                    "{op:?} batching={batching}: sent while blocked={sent_while_blocked}, \
-                     sent after={sent_after}, status={status}, log={:?}",
-                    log.entries()
-                ));
-            }
+        let log = Log::default();
+        let hook = BlockingHook::default();
+        let target = op.target();
+        let invocation = tokio::spawn({
+            let log = log.clone();
+            let factory = BlockingTarget {
+                target,
+                hook: hook.clone(),
+            };
+            async move { invoke(&log, factory, move |_, ctx| op.run(ctx)).await }
+        });
+        hook.entered().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let start = format!("send START {target}");
+        let sent_while_blocked = log.contains(&start);
+        hook.release();
+        let status = invocation.await.expect("the invocation task completes");
+        let sent_after = log.contains(&start);
+        if sent_while_blocked || !sent_after || status != op.expected_status() {
+            failures.push(format!(
+                "{op:?}: sent while blocked={sent_while_blocked}, \
+                 sent after={sent_after}, status={status}, log={:?}",
+                log.entries()
+            ));
         }
     }
     assert!(failures.is_empty(), "failed cases: {failures:#?}");

@@ -1359,17 +1359,14 @@ where
 }
 
 /// Not aborted on drop or by `abort_all`, still counted. For the batch
-/// flusher and for detached checkpoint writes. Takes no ownership handle
+/// flusher. Takes no ownership handle
 /// and never blesses its task, because this work never creates a durable
 /// operation. Takes no activity permit and is polled whatever the phase.
 /// The task's outcome has no reader: a panic of its future, while it is
 /// polled or dropped, is recorded on the coordinator.
-/// While the phase is `Running`, a permit keeps the invocation open until
-/// the write's response is merged: the checkpoint permit of a buffered or
-/// direct write, or the refresh scheduler's permit for an unbatched
-/// refresh, which the scheduler holds until it gets the result. The
-/// scheduler is dropped when the drive ends, and its permit with it. From
-/// then on only the task count keeps the write alive: the cleanup's
+/// While the phase is `Running`, the checkpoint permits of the batch keep
+/// the invocation open until the write's response is merged. From the end
+/// of the drive only the task count keeps the write alive: the cleanup's
 /// `wait_idle` waits for it.
 pub(crate) fn spawn_detached<F>(
     coordinator: &Arc<InvocationCoordinator>,

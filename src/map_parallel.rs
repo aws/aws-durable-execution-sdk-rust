@@ -4868,7 +4868,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
-            None,
+            std::time::Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -5302,7 +5302,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             client as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
-            None,
+            std::time::Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -8787,8 +8787,8 @@ mod tests {
         current_token: std::sync::Mutex<String>,
         /// Counter for generating unique next tokens.
         counter: std::sync::Mutex<u32>,
-        /// Count of successful checkpoint calls.
-        success_count: std::sync::Mutex<u32>,
+        /// The number of updates the successful checkpoint calls carried.
+        update_count: std::sync::Mutex<u32>,
         /// Count of calls that arrived with a stale (wrong) token.
         stale_token_count: std::sync::Mutex<u32>,
     }
@@ -8798,14 +8798,14 @@ mod tests {
             Self {
                 current_token: std::sync::Mutex::new(initial_token.to_owned()),
                 counter: std::sync::Mutex::new(0),
-                success_count: std::sync::Mutex::new(0),
+                update_count: std::sync::Mutex::new(0),
                 stale_token_count: std::sync::Mutex::new(0),
             }
         }
 
-        fn success_count(&self) -> u32 {
+        fn update_count(&self) -> u32 {
             *self
-                .success_count
+                .update_count
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
@@ -8823,7 +8823,7 @@ mod tests {
             &self,
             _execution_arn: &str,
             checkpoint_token: &str,
-            _updates: Vec<OperationUpdate>,
+            updates: Vec<OperationUpdate>,
         ) -> Pin<
             Box<
                 dyn Future<
@@ -8836,6 +8836,7 @@ mod tests {
             >,
         > {
             let submitted_token = checkpoint_token.to_owned();
+            let carried = u32::try_from(updates.len()).expect("a small request");
             Box::pin(async move {
                 // Simulate a brief network delay to increase race window.
                 tokio::task::yield_now().await;
@@ -8867,11 +8868,11 @@ mod tests {
                 let new_token = format!("token-{counter}");
                 *current = new_token.clone();
 
-                let mut success = self
-                    .success_count
+                let mut update_count = self
+                    .update_count
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *success += 1;
+                *update_count += carried;
 
                 Ok(crate::client::CheckpointOutput {
                     checkpoint_token: Some(new_token),
@@ -8946,7 +8947,7 @@ mod tests {
         }
 
         assert_eq!(success_count, num_concurrent);
-        assert_eq!(client.success_count(), num_concurrent);
+        assert_eq!(client.update_count(), num_concurrent);
         assert_eq!(
             client.stale_token_count(),
             0,
@@ -9015,9 +9016,9 @@ mod tests {
         // At minimum: parent START + child START + child FAIL + parent SUCCEED = 4.
         // (Other children may or may not start depending on scheduling.)
         assert!(
-            client.success_count() >= 4,
-            "expected at least 4 checkpoint calls (parent start + child start + child fail + parent succeed), got {}",
-            client.success_count()
+            client.update_count() >= 4,
+            "expected at least 4 checkpoint updates (parent start + child start + child fail + parent succeed), got {}",
+            client.update_count()
         );
     }
 

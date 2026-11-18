@@ -751,10 +751,10 @@ impl InvocationCoordinator {
     ///    resolving its caller.
     /// 4. It wakes the driver.
     ///
-    /// The latch is set before `drop_queued` takes the queue locks, and
-    /// every step that adds a write to a queue or hands a queued write a
-    /// result without sending it (a writer that cannot be spawned) reads
-    /// the latch under the queue's lock. So each such step happens wholly
+    /// The latch is set before `drop_queued` takes the buffer lock, and
+    /// every step that adds a write to the buffer or hands a buffered write
+    /// a result without sending it (a flusher that cannot be spawned) reads
+    /// the latch under the buffer lock. So each such step happens wholly
     /// before the failure, and the failure then drops what it queued, or
     /// wholly after it, and it adds nothing and resolves nothing.
     pub(crate) fn fail_write(&self, fatal: FatalError, drop_queued: impl FnOnce()) {
@@ -1044,14 +1044,8 @@ pub(crate) mod race_points {
     /// A point in the write path (see [`reach`]).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum RacePoint {
-        /// A direct write is about to take the direct queue's lock to
-        /// enter the queue.
-        DirectQueueLock,
         /// A buffered join is about to take the buffer lock.
         BufferLock,
-        /// The direct writer could not be spawned, and the write is about
-        /// to take the direct queue's lock to drain the queue.
-        DirectNoRuntimeDrain,
         /// A batch flusher could not be spawned, and the write is about to
         /// take the buffer lock to claim the batch.
         BatchNoRuntimeClaim,

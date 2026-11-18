@@ -1,18 +1,18 @@
-//! Checkpoint write buffering for the `checkpoint_delay` and
-//! `checkpoint_batching` options.
+//! Checkpoint write buffering.
 //!
-//! When [`Options`](crate::Options) configures a
-//! [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay) and/or
-//! [`checkpoint_batching`](crate::OptionsBuilder::checkpoint_batching),
-//! checkpoint writes from concurrently running operations are held in a
-//! shared buffer, then written together in fewer `CheckpointDurableExecution`
-//! calls. A non-zero delay holds a write for up to the configured window so
-//! neighbors can join it; a zero delay (pure batching mode) requests the
-//! write immediately, and batching emerges from accumulation while an
-//! earlier write is in flight. This module owns the buffer, the batch
-//! handshake, the single-writer lock, and the size-capped batch splitting;
-//! the actual API call stays in `DurableContext::write_batched_updates`,
-//! which the flusher invokes with the drained buffer.
+//! Every checkpoint write goes through this module's writer. A write made
+//! while the invocation drive runs joins a shared buffer, and updates
+//! written concurrently go out together in fewer
+//! `CheckpointDurableExecution` calls, as the JavaScript SDK's checkpoint
+//! queue does; the write after the drive takes the writer lock directly. A
+//! non-zero [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay)
+//! holds a write for up to the configured window so neighbors can join it;
+//! without one (the default) the write is requested immediately, and
+//! batching emerges from accumulation while an earlier write is in flight.
+//! This module owns the buffer, the batch handshake, the single-writer
+//! lock, and the size-capped batch splitting; the actual API call stays in
+//! `DurableContext::write_batched_updates`, which the flusher invokes with
+//! the drained buffer.
 //!
 //! # Invariants
 //!
@@ -92,8 +92,9 @@ use crate::tracing_layer::PendingTransitionEvent;
 pub(crate) struct TrackedUpdate {
     /// The update to checkpoint.
     pub(crate) update: OperationUpdate,
-    /// The lifecycle event to emit once the update is persisted.
-    pub(crate) event: PendingTransitionEvent,
+    /// The lifecycle event to emit once the update is persisted, or `None`
+    /// for an update that emits none.
+    pub(crate) event: Option<PendingTransitionEvent>,
 }
 
 impl TrackedUpdate {
@@ -102,8 +103,17 @@ impl TrackedUpdate {
     /// the originating operation's context (the checkpoint chokepoint),
     /// not from the flush task.
     pub(crate) fn capture(update: OperationUpdate, attempt: u32) -> Self {
-        let event = PendingTransitionEvent::capture(&update, attempt);
+        let event = Some(PendingTransitionEvent::capture(&update, attempt));
         Self { update, event }
+    }
+
+    /// An update that emits no lifecycle event: the execution's own update,
+    /// which the write after the drive sends.
+    pub(crate) fn untracked(update: OperationUpdate) -> Self {
+        Self {
+            update,
+            event: None,
+        }
     }
 }
 
@@ -129,12 +139,11 @@ impl TrackedUpdate {
 ///    stops at its next `.await`.
 ///
 /// The admission check runs where an update enters the ordered write path:
-/// inside [`CheckpointCoalescer::join`] under the buffer lock, and after a
-/// direct write takes the checkpoint-token lock. An update admitted before
-/// a scope closes is already in the buffer or already holds the token
-/// lock. The parent's final update is issued after the close, so it is
-/// written after that update. [`Self::abandon`] takes only the admission
-/// lock, and the buffer lock is never taken inside it.
+/// inside [`CheckpointCoalescer::join_owned`] under the buffer lock. An
+/// update admitted before a scope closes is already in the buffer, and the
+/// flusher writes it. The parent's final update is issued after the close,
+/// so it is written after that update. [`Self::abandon`] takes only the
+/// admission lock, and the buffer lock is never taken inside it.
 #[derive(Debug, Default)]
 pub(crate) struct Admission {
     state: Mutex<AdmissionState>,
@@ -323,8 +332,7 @@ pub(crate) fn estimated_update_size(update: &OperationUpdate) -> usize {
 /// Splits a sealed batch into request-sized chunks, each within `limits`,
 /// preserving order. A single update whose estimated size alone exceeds the
 /// payload cap is emitted as its own one-update request (it cannot be split
-/// further; the service applies its own limit to it exactly as it would to
-/// an immediate write). Each update's lifecycle event stays paired with it
+/// further; the service applies its own limit to it). Each update's lifecycle event stays paired with it
 /// across the split, so the writer emits exactly the events of the chunk it
 /// just persisted.
 pub(crate) fn split_into_requests(
@@ -358,10 +366,10 @@ pub(crate) fn split_into_requests(
 #[derive(Debug)]
 pub(crate) struct CheckpointCoalescer {
     /// The coalescing window: how long a contributor waits for co-batched
-    /// updates before flushing the batch itself. `Duration::ZERO` means no
-    /// window (pure `checkpoint_batching` mode): the write is requested
-    /// immediately, and batching comes from accumulation behind the
-    /// writer lock while an earlier write is in flight.
+    /// updates before flushing the batch itself. `Duration::ZERO`, the
+    /// default, means no window: the write is requested immediately, and
+    /// batching comes from accumulation behind the writer lock while an
+    /// earlier write is in flight.
     delay: Duration,
     state: Mutex<CoalescerState>,
     /// The single-writer lock: every sealed batch is claimed and written

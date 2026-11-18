@@ -212,11 +212,11 @@ mod tests {
     }
 
     /// A root context over `records` and `client`, with the coalescer
-    /// `window` (`None`: direct writes) and the plugin `hooks`.
+    /// `window` and the plugin `hooks`.
     fn context(
         records: Vec<(String, CheckpointRecord)>,
         client: Arc<dyn ExecutionClient>,
-        window: Option<Duration>,
+        window: Duration,
         hooks: Option<&OpHooks>,
     ) -> DurableContext {
         DurableContext::new_root_with_client_and_defaults(
@@ -319,23 +319,21 @@ mod tests {
 
     #[tokio::test]
     async fn start_step_queues_start_before_returning() {
-        for window in [None, Some(Duration::ZERO)] {
-            let client = in_memory();
-            let ctx = context(Vec::new(), client.clone(), window, None);
-            let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
-            assert!(matches!(started, StartStep::Queued(_)), "{window:?}");
-            assert_eq!(
-                ctx.queued_update_ids(),
-                [crate::engine::compute_wire_id_public("1")],
-                "START is queued before anything is polled ({window:?})"
-            );
-            assert!(client.recorded_updates().is_empty(), "{window:?}");
-            let StartStep::Queued(write) = started else {
-                unreachable!("checked above")
-            };
-            write.await.expect("START is written");
-            assert_eq!(client.recorded_updates().len(), 1, "{window:?}");
-        }
+        let client = in_memory();
+        let ctx = context(Vec::new(), client.clone(), Duration::ZERO, None);
+        let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
+        assert!(matches!(started, StartStep::Queued(_)));
+        assert_eq!(
+            ctx.queued_update_ids(),
+            [crate::engine::compute_wire_id_public("1")],
+            "START is queued before anything is polled"
+        );
+        assert!(client.recorded_updates().is_empty(), "nothing is sent yet");
+        let StartStep::Queued(write) = started else {
+            unreachable!("checked above")
+        };
+        write.await.expect("START is written");
+        assert_eq!(client.recorded_updates().len(), 1);
     }
 
     #[tokio::test]
@@ -343,7 +341,7 @@ mod tests {
         let ctx = context(
             vec![step_record(CheckpointStatus::Started, 0, "Step")],
             in_memory(),
-            None,
+            Duration::ZERO,
             None,
         );
         let started = step_start(&ctx, StepSemantics::AtMostOncePerRetry).expect("no error");
@@ -357,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn start_step_refused_by_admission_queues_nothing() {
         let client = in_memory();
-        let root = context(Vec::new(), client.clone(), Some(Duration::ZERO), None);
+        let root = context(Vec::new(), client.clone(), Duration::ZERO, None);
         let child = root.new_child("1", None);
         root.admission()
             .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
@@ -391,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn start_step_fires_live_hook_only_for_queue_then_hook() {
         let hooks = OpHooks::default();
-        let ctx = context(Vec::new(), in_memory(), None, Some(&hooks));
+        let ctx = context(Vec::new(), in_memory(), Duration::ZERO, Some(&hooks));
         let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
         assert!(matches!(started, StartStep::Queued(_)));
         assert_eq!(
@@ -401,7 +399,7 @@ mod tests {
         );
 
         let hooks = OpHooks::default();
-        let ctx = context(Vec::new(), in_memory(), None, Some(&hooks));
+        let ctx = context(Vec::new(), in_memory(), Duration::ZERO, Some(&hooks));
         let started =
             response_then_hook_start(&ctx, "Wait", OperationType::Wait, StartOrder::AwaitResponse);
         assert!(matches!(started, StartStep::Queued(_)));
@@ -417,7 +415,7 @@ mod tests {
         let ctx = context(
             vec![step_record(CheckpointStatus::Started, 0, "Step")],
             in_memory(),
-            None,
+            Duration::ZERO,
             Some(&hooks),
         );
         let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
@@ -433,12 +431,7 @@ mod tests {
     #[tokio::test]
     async fn start_step_queues_callback_start_urgently_before_returning() {
         let client = in_memory();
-        let ctx = context(
-            Vec::new(),
-            client.clone(),
-            Some(Duration::from_hours(1)),
-            None,
-        );
+        let ctx = context(Vec::new(), client.clone(), Duration::from_hours(1), None);
         let started = response_then_hook_start(
             &ctx,
             "Callback",
@@ -467,7 +460,7 @@ mod tests {
         let ctx = context(
             vec![step_record(CheckpointStatus::Started, 0, "Wait")],
             in_memory(),
-            None,
+            Duration::ZERO,
             None,
         );
         let Err(err) = step_start(&ctx, StepSemantics::AtLeastOncePerRetry) else {
@@ -490,7 +483,7 @@ mod tests {
             let ctx = context(
                 vec![step_record(status.clone(), 1, "Step")],
                 client.clone(),
-                None,
+                Duration::ZERO,
                 Some(&hooks),
             );
             let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
@@ -512,7 +505,7 @@ mod tests {
         let ctx = context(
             vec![step_record(CheckpointStatus::Started, 1, "Step")],
             in_memory(),
-            None,
+            Duration::ZERO,
             Some(&hooks),
         );
         let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
@@ -577,7 +570,7 @@ mod tests {
         let ctx = context(
             vec![step_record(CheckpointStatus::Ready, 1, "Step")],
             client,
-            None,
+            Duration::ZERO,
             Some(&hooks),
         );
         let op_id = ctx.mint_id();
@@ -847,7 +840,12 @@ mod tests {
     #[expect(clippy::too_many_lines)] // reason: the test's setup and its ordered checks read as one scenario
     async fn outcome_waits_for_failed_start(case: Settler) {
         let target = case.target();
-        let ctx = context(Vec::new(), Arc::new(FailStartClient { target }), None, None);
+        let ctx = context(
+            Vec::new(),
+            Arc::new(FailStartClient { target }),
+            Duration::ZERO,
+            None,
+        );
         let gate = Arc::new(tokio::sync::Notify::new());
         let held = Arc::clone(&gate);
         ctx.set_pre_lock_gate(Arc::new(move |updates: &[OperationUpdate]| {

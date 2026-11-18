@@ -322,9 +322,8 @@ impl Drop for TeardownGuard {
 /// 1. A fatal error is recorded.
 /// 2. An invocation-failing panic is recorded on the coordinator: the
 ///    handler panicked, the refresh scheduler panicked, a detached task
-///    (the batch flusher or a direct write, which run the checkpoint
-///    client) panicked, or a task's outcome holding a panic lost its
-///    reader.
+///    (the batch flusher, which runs the checkpoint client) panicked, or a
+///    task's outcome holding a panic lost its reader.
 /// 3. The phase becomes `Suspending`.
 /// 4. The handler resolves. A wait whose handle the handler dropped does
 ///    not change that; its record can stay `STARTED`.
@@ -1423,11 +1422,11 @@ pub(crate) mod test_support {
     }
 
     /// A root context on `client`, with an empty checkpoint log.
-    /// `buffer_window` is `None` for direct writes (batching off), and
-    /// `Some(delay)` for batching with `checkpoint_delay(delay)`.
+    /// `buffer_window` is the coalescing window: zero by default, and
+    /// `delay` under `checkpoint_delay(delay)`.
     pub(crate) fn latency_ctx(
         client: &Arc<LatencyClient>,
-        buffer_window: Option<Duration>,
+        buffer_window: Duration,
     ) -> crate::DurableContext {
         crate::DurableContext::new_root_with_client_and_defaults(
             "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
@@ -4815,7 +4814,7 @@ mod refresh_scheduler {
         .expect("no panic")
     }
 
-    /// A refresh failure under checkpoint batching is recorded where the
+    /// A refresh failure is recorded where the
     /// response arrives, on the detached flush task, for the refresh's
     /// first due registration. No later write observes the failed batch,
     /// so without that record the invocation would suspend on the callback
@@ -5014,9 +5013,9 @@ mod refresh_scheduler {
         assert!(!coordinator.has_panic());
     }
 
-    /// The handler returns while a refresh is in flight, without
-    /// checkpoint batching. The driver drops the scheduler at once, so
-    /// only the write task can record the failure. A retryable failure
+    /// The handler returns while a refresh is in flight. The driver drops
+    /// the scheduler at once, so only the flush task can record the
+    /// failure. A retryable failure
     /// must still fail the invocation, and a non-retryable one the
     /// execution, instead of the handler's `Complete`.
     #[tokio::test(start_paused = true)]
@@ -5070,15 +5069,15 @@ mod refresh_scheduler {
         assert_times(&client.empty_calls(), &[secs(1)]);
     }
 
-    /// The panic payload of the unbatched refresh tests below.
+    /// The panic payload of the refresh panic tests below.
     struct RefreshPanic(u32);
 
-    /// Drives a handler that returns while an unbatched refresh is in
+    /// Drives a handler that returns while a refresh is in
     /// flight, after recording a fatal error when `fatal` is set. The
     /// checkpoint client panics with `RefreshPanic(7)` after the handler
     /// returned, so the driver has already dropped the scheduler, and with
     /// it the refresh's receiver.
-    async fn drive_unbatched_refresh_panic_after_return(
+    async fn drive_refresh_panic_after_return(
         fatal: bool,
     ) -> (
         Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>,
@@ -5114,14 +5113,14 @@ mod refresh_scheduler {
         (outcome, coordinator)
     }
 
-    /// The checkpoint client panics during an unbatched refresh after the
-    /// handler returned, so the driver has already dropped the scheduler.
-    /// The task gateway records the panic of the detached write task on
+    /// The checkpoint client panics during a refresh after the handler
+    /// returned, so the driver has already dropped the scheduler.
+    /// The task gateway records the panic of the detached flush task on
     /// the coordinator, and the drive returns that payload instead of the
     /// handler's `Complete`.
     #[tokio::test(start_paused = true)]
-    async fn unbatched_refresh_panic_after_handler_returns() {
-        let (outcome, coordinator) = drive_unbatched_refresh_panic_after_return(false).await;
+    async fn refresh_panic_after_handler_returns() {
+        let (outcome, coordinator) = drive_refresh_panic_after_return(false).await;
         let Err(payload) = outcome else {
             panic!("expected the refresh panic, got {outcome:?}");
         };
@@ -5129,11 +5128,11 @@ mod refresh_scheduler {
         assert_eq!(coordinator.tasks().live(), 0);
     }
 
-    /// A fatal error recorded before the unbatched refresh panic still
+    /// A fatal error recorded before the refresh panic still
     /// takes precedence over it.
     #[tokio::test(start_paused = true)]
-    async fn fatal_wins_over_unbatched_refresh_panic_after_handler_returns() {
-        let (outcome, coordinator) = drive_unbatched_refresh_panic_after_return(true).await;
+    async fn fatal_wins_over_refresh_panic_after_handler_returns() {
+        let (outcome, coordinator) = drive_refresh_panic_after_return(true).await;
         let Ok(InvocationOutcome::Fault { message, .. }) = &outcome else {
             panic!("expected the fatal outcome, got {outcome:?}");
         };
@@ -5204,10 +5203,9 @@ mod refresh_scheduler {
         assert_eq!(error.error_type(), expected.error_type());
     }
 
-    /// The checkpoint client panics during an unbatched refresh while the
-    /// handler runs. The task gateway records the panic of the detached
-    /// write task, and the scheduler waits on a channel that never carries
-    /// it. The driver must still run its cleanup, so no task outlives the
+    /// The checkpoint client panics during a refresh while the handler
+    /// runs. The task gateway records the panic of the detached flush task,
+    /// and the scheduler waits on a batch that is never published. The driver must still run its cleanup, so no task outlives the
     /// drive, and then return the original payload.
     #[tokio::test(start_paused = true)]
     async fn refresh_client_panic_cleans_up_and_propagates() {
@@ -6409,7 +6407,7 @@ mod panic_owner {
         }
     }
 
-    /// Test 15. With checkpoint batching, the client's checkpoint future
+    /// Test 15. The client's checkpoint future
     /// returns and then panics when the flusher drops it. The gateway
     /// records the flusher's panic.
     #[tokio::test]
@@ -6443,9 +6441,8 @@ mod panic_owner {
         assert_eq!(live, 0);
     }
 
-    /// Test 17. Without batching, an operation's write future is polled
-    /// after its client panicked: it stays pending, because the write
-    /// channel carries no payload. The drive returns the client's payload.
+    /// Test 17. An operation's write future is polled after its client
+    /// panicked: it stays pending, because the batch is never published. The drive returns the client's payload.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_waiter_stays_pending_when_client_panics() {
         let ctx = ctx_with(Arc::new(PanickingClient {
@@ -6791,11 +6788,9 @@ mod withdrawal_tests {
     }
 
     /// Runs `handler` behind `wrap` over `client` on a new execution, with
-    /// checkpoint batching `batching` and `factory`, and returns the
-    /// response.
+    /// `factory`, and returns the response.
     async fn run<F, Fut>(
         client: &Arc<WithdrawingClient>,
-        batching: bool,
         factory: &RecordingFactory,
         handler: F,
     ) -> serde_json::Value
@@ -6803,13 +6798,12 @@ mod withdrawal_tests {
         F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<u32, BoxError>> + Send,
     {
-        run_on(client, batching, factory, &[], handler).await
+        run_on(client, factory, &[], handler).await
     }
 
     /// [`run`] on an execution whose state also holds `records`.
     async fn run_on<F, Fut>(
         client: &Arc<WithdrawingClient>,
-        batching: bool,
         factory: &RecordingFactory,
         records: &[serde_json::Value],
         handler: F,
@@ -6818,7 +6812,7 @@ mod withdrawal_tests {
         F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<u32, BoxError>> + Send,
     {
-        run_result(client, batching, factory, records, handler)
+        run_result(client, factory, records, handler)
             .await
             .expect("the invocation answers a response")
     }
@@ -6826,7 +6820,6 @@ mod withdrawal_tests {
     /// [`run_on`] that returns a Lambda error instead of failing.
     async fn run_result<F, Fut>(
         client: &Arc<WithdrawingClient>,
-        batching: bool,
         factory: &RecordingFactory,
         records: &[serde_json::Value],
         handler: F,
@@ -6844,7 +6837,6 @@ mod withdrawal_tests {
         operations.extend_from_slice(records);
         let options = Options::builder()
             .execution_client(Arc::clone(client) as Arc<dyn ExecutionClient>)
-            .checkpoint_batching(batching)
             .plugin(factory.clone())
             .build()
             .unwrap();
@@ -6939,8 +6931,8 @@ mod withdrawal_tests {
             .all(|u| u.action() != &OperationAction::Fail)
     }
 
-    /// A root context on `client`, without buffering.
-    fn direct_ctx(client: &Arc<WithdrawingClient>) -> DurableContext {
+    /// A root context on `client`.
+    fn root_ctx(client: &Arc<WithdrawingClient>) -> DurableContext {
         DurableContext::new_root_with_client(
             ARN.to_owned(),
             lambda_runtime::Context::default(),
@@ -6960,10 +6952,10 @@ mod withdrawal_tests {
     }
 
     #[tokio::test]
-    async fn tokenless_direct_checkpoint_answers_pending() {
+    async fn tokenless_single_checkpoint_answers_pending() {
         let client = WithdrawingClient::tokenless_at(1);
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             Ok(ctx.step(|_| async { Ok(1_u32) }).name("a").await?)
         })
         .await;
@@ -6977,7 +6969,7 @@ mod withdrawal_tests {
     async fn tokenless_buffered_checkpoint_answers_pending() {
         let client = WithdrawingClient::tokenless_at(1);
         let factory = RecordingFactory::default();
-        let response = run(&client, true, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
             let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
             Ok(a.await? + b.await?)
@@ -6993,12 +6985,19 @@ mod withdrawal_tests {
         assert_eq!(factory.end(), (InvocationStatus::Pending, None));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn tokenless_latch_blocks_later_checkpoints() {
-        let client = WithdrawingClient::tokenless_at(1);
+        let client = WithdrawingClient::new(|n, _| {
+            if n == 1 {
+                (Answer::Tokenless, Duration::from_secs(1))
+            } else {
+                (Answer::Pass, Duration::ZERO)
+            }
+        });
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
+            tokio::time::sleep(Duration::from_millis(10)).await;
             let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
             Ok(a.await? + b.await?)
         })
@@ -7015,7 +7014,7 @@ mod withdrawal_tests {
         let (messages, _guard) = EventMessages::install();
         let client = WithdrawingClient::tokenless_at(1);
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             Ok(ctx
                 .step(|_| async { Ok(1_u32) })
                 .name("a")
@@ -7077,7 +7076,7 @@ mod withdrawal_tests {
         );
         let client = WithdrawingClient::tokenless_at(1);
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
             Ok(1)
         })
@@ -7120,7 +7119,7 @@ mod withdrawal_tests {
                 Duration::ZERO,
             )
         });
-        let ctx = direct_ctx(&client);
+        let ctx = root_ctx(&client);
         let write = ctx.submit_checkpoint_updates(vec![step_start("x")]);
         assert!(
             tokio::time::timeout(Duration::from_secs(5), write)
@@ -7171,58 +7170,45 @@ mod withdrawal_tests {
 
     /// The withdrawal drops the queued writes itself: a reserved write,
     /// which no writer would ever take while it is held, is dropped with
-    /// its permit, unbuffered and buffered alike. It is never sent, even
+    /// its permit. It is never sent, even
     /// after its reservation is released.
     #[tokio::test(start_paused = true)]
     async fn withdrawal_drops_queued_and_held_writes() {
-        for buffered in [false, true] {
-            let client = WithdrawingClient::new(|n, _| {
-                if n == 1 {
-                    (Answer::Tokenless, Duration::from_secs(1))
-                } else {
-                    (Answer::Pass, Duration::ZERO)
-                }
-            });
-            let ctx = if buffered {
-                DurableContext::new_root_with_client_and_coalescer(
-                    ARN.to_owned(),
-                    lambda_runtime::Context::default(),
-                    Arc::new(CheckpointLog::empty()),
-                    Arc::clone(&client) as Arc<dyn ExecutionClient>,
-                    "t0".to_owned(),
-                    crate::checkpoint_coalescer::CheckpointCoalescer::new(Duration::ZERO),
-                )
+        let client = WithdrawingClient::new(|n, _| {
+            if n == 1 {
+                (Answer::Tokenless, Duration::from_secs(1))
             } else {
-                direct_ctx(&client)
-            };
-            let first = ctx.submit_checkpoint_updates(vec![step_start("x")]);
-            while client.calls().is_empty() {
-                tokio::task::yield_now().await;
+                (Answer::Pass, Duration::ZERO)
             }
-            let held = ctx.reserve_checkpoint_updates(vec![step_start("y")]);
-            assert_eq!(ctx.coordinator().permits(PermitKind::Checkpoint), 2);
-            assert!(
-                tokio::time::timeout(Duration::from_secs(5), first)
-                    .await
-                    .is_err(),
-                "the in-flight caller never resolves"
-            );
-            assert!(ctx.coordinator().withdrawn());
-            assert_eq!(ctx.coordinator().phase(), Phase::Suspending);
-            assert_eq!(
-                ctx.coordinator().permits(PermitKind::Checkpoint),
-                0,
-                "buffered={buffered}: the held write was dropped with its permit"
-            );
-            let held = held.release();
-            assert!(
-                tokio::time::timeout(Duration::from_secs(5), held)
-                    .await
-                    .is_err(),
-                "the held caller never resolves"
-            );
-            assert_eq!(client.calls().len(), 1, "the held write is never sent");
+        });
+        let ctx = root_ctx(&client);
+        let first = ctx.submit_checkpoint_updates(vec![step_start("x")]);
+        while client.calls().is_empty() {
+            tokio::task::yield_now().await;
         }
+        let held = ctx.reserve_checkpoint_updates(vec![step_start("y")]);
+        assert_eq!(ctx.coordinator().permits(PermitKind::Checkpoint), 2);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), first)
+                .await
+                .is_err(),
+            "the in-flight caller never resolves"
+        );
+        assert!(ctx.coordinator().withdrawn());
+        assert_eq!(ctx.coordinator().phase(), Phase::Suspending);
+        assert_eq!(
+            ctx.coordinator().permits(PermitKind::Checkpoint),
+            0,
+            "the held write was dropped with its permit"
+        );
+        let held = held.release();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), held)
+                .await
+                .is_err(),
+            "the held caller never resolves"
+        );
+        assert_eq!(client.calls().len(), 1, "the held write is never sent");
     }
 
     /// Runs a handler that spawns steps `a` and `b` together, so both
@@ -7246,7 +7232,7 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run_result(&client, false, &factory, &[], |_event, ctx| async move {
+        let response = run_result(&client, &factory, &[], |_event, ctx| async move {
             let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
             let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
             Ok(a.await? + b.await?)
@@ -7290,7 +7276,7 @@ mod withdrawal_tests {
     async fn pending_wins_over_handler_ok() {
         let client = WithdrawingClient::tokenless_at(1);
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
             Ok(1)
         })
@@ -7310,7 +7296,7 @@ mod withdrawal_tests {
     async fn pending_wins_over_handler_err() {
         let client = WithdrawingClient::tokenless_at(1);
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
             Err::<u32, BoxError>("boom".into())
         })
@@ -7322,10 +7308,10 @@ mod withdrawal_tests {
     }
 
     /// Runs `handler_err` (or a handler that returns `Ok(1)`) after it
-    /// spawns steps `a` and `b` and drops both handles, without buffering.
-    /// `a`'s START fails with an invocation-scoped transport error after a
-    /// second, after the handler returned, and `b`'s START, queued behind
-    /// it, would be answered without a token.
+    /// spawns steps `a` and `b` and drops both handles. The request that
+    /// carries `a`'s START fails with an invocation-scoped transport error
+    /// after a second, after the handler returned, and a request that
+    /// carried only `b`'s START would be answered without a token.
     async fn failed_after_handler(
         handler_err: bool,
     ) -> (
@@ -7346,20 +7332,14 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run_result(
-            &client,
-            false,
-            &factory,
-            &[],
-            move |_event, ctx| async move {
-                drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
-                drop(ctx.step(|_| async { Ok(2_u32) }).name("b").spawn());
-                if handler_err {
-                    return Err::<u32, BoxError>("boom".into());
-                }
-                Ok(1)
-            },
-        )
+        let response = run_result(&client, &factory, &[], move |_event, ctx| async move {
+            drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
+            drop(ctx.step(|_| async { Ok(2_u32) }).name("b").spawn());
+            if handler_err {
+                return Err::<u32, BoxError>("boom".into());
+            }
+            Ok(1)
+        })
         .await;
         (client, response, factory)
     }
@@ -7396,7 +7376,7 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run_result(&client, false, &factory, &[], |_event, ctx| async move {
+        let response = run_result(&client, &factory, &[], |_event, ctx| async move {
             // The child's body returns while `a`'s START is in flight, so
             // its scope closes and stops `a` before the response.
             ctx.run_in_child_context(|child| async move {
@@ -7439,20 +7419,14 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run_result(
-            &client,
-            false,
-            &factory,
-            &[],
-            move |_event, ctx| async move {
-                drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-                if handler_err {
-                    return Err::<u32, BoxError>("boom".into());
-                }
-                Ok(1)
-            },
-        )
+        let response = run_result(&client, &factory, &[], move |_event, ctx| async move {
+            drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if handler_err {
+                return Err::<u32, BoxError>("boom".into());
+            }
+            Ok(1)
+        })
         .await;
         (client, response, factory)
     }
@@ -7494,7 +7468,7 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run_result(&client, false, &factory, &[], |_event, ctx| async move {
+        let response = run_result(&client, &factory, &[], |_event, ctx| async move {
             let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
             tokio::time::sleep(Duration::from_millis(500)).await;
             let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
@@ -7527,7 +7501,7 @@ mod withdrawal_tests {
     async fn pending_wins_over_context_validation_fatal() {
         let client = tokenless_start_of_a_after_a_second();
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             let cloned = ctx.clone();
             Ok(ctx
                 .step(move |_| async move {
@@ -7593,21 +7567,15 @@ mod withdrawal_tests {
             "Status": "SUCCEEDED",
             "StepDetails": { "Attempt": 1, "Result": "1" }
         });
-        let response = run_on(
-            &client,
-            false,
-            &factory,
-            &[replayed],
-            |_event, ctx| async move {
-                let replayed = ctx
-                    .step(|_| async { Ok(1_u32) })
-                    .name("r")
-                    .serdes(FailingSerdes)
-                    .future();
-                drop(ctx.step(|_| async { Ok(2_u32) }).name("a").spawn());
-                Ok(replayed.await?)
-            },
-        )
+        let response = run_on(&client, &factory, &[replayed], |_event, ctx| async move {
+            let replayed = ctx
+                .step(|_| async { Ok(1_u32) })
+                .name("r")
+                .serdes(FailingSerdes)
+                .future();
+            drop(ctx.step(|_| async { Ok(2_u32) }).name("a").spawn());
+            Ok(replayed.await?)
+        })
         .await;
         assert!(has(&client.updates(), "a", &OperationAction::Start));
         assert_eq!(response, pending());
@@ -7630,7 +7598,7 @@ mod withdrawal_tests {
     async fn pure_withdrawal_end_hook_has_no_error() {
         let client = WithdrawingClient::tokenless_at(1);
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             ctx.step(|_| async { Ok(1_u32) }).name("a").await?;
             std::future::pending::<()>().await;
             Ok(1)
@@ -7679,7 +7647,7 @@ mod withdrawal_tests {
                     Duration::ZERO,
                 )
             });
-            let ctx = direct_ctx(&client);
+            let ctx = root_ctx(&client);
             let output = tokio::time::timeout(
                 Duration::from_secs(5),
                 ctx.checkpoint_updates_direct(vec![execution_update(&action)]),
@@ -7714,7 +7682,7 @@ mod withdrawal_tests {
                 )
             });
             client.get_state_fails.store(true, Ordering::SeqCst);
-            let ctx = direct_ctx(&client);
+            let ctx = root_ctx(&client);
             let output = tokio::time::timeout(
                 Duration::from_secs(5),
                 ctx.checkpoint_updates_direct(vec![execution_update(&action)]),
@@ -7743,7 +7711,7 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run(&client, &factory, |_event, ctx| async move {
             let wait = ctx.wait(Duration::from_secs(1)).name("w").spawn();
             let step = ctx
                 .step(|_| async {

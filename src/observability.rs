@@ -80,11 +80,9 @@
 //! service records emits its event: the events fire the moment the service
 //! accepts the write, before any fallible follow-up work (such as fetching
 //! paginated execution state), so a failure *after* the write still leaves
-//! the persisted transitions' events emitted. The code path that performs
-//! the write owns the event, so under checkpoint buffering
-//! ([`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay) /
-//! [`checkpoint_batching`](crate::OptionsBuilder::checkpoint_batching)) a
-//! caller cancelled while awaiting a batched write (a dropped `race` or
+//! the persisted transitions' events emitted.
+//! The code path that performs the write owns the event, so a caller
+//! cancelled while awaiting a batched write (a dropped `race` or
 //! `select_ok` loser) does not suppress the events for updates the flush
 //! still persists, and when a large batch is split into several requests,
 //! each request's events are emitted as soon as that request succeeds:

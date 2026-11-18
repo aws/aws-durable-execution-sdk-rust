@@ -593,8 +593,8 @@ impl PluginFactory for HookLog {
     }
 }
 
-/// Runs `handler` once through `wrap` over `transport`, with checkpoint
-/// batching off and the hook log, and returns the response as JSON.
+/// Runs `handler` once through `wrap` over `transport`, with the hook
+/// log, and returns the response as JSON.
 async fn invoke<F, Fut>(transport: Transport, handler: F) -> serde_json::Value
 where
     F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
@@ -605,7 +605,6 @@ where
         handler,
         Options::builder()
             .execution_client(Arc::new(transport))
-            .checkpoint_batching(false)
             .plugin(HookLog(log))
             .build()
             .expect("valid options"),

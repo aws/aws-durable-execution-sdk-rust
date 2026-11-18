@@ -657,7 +657,7 @@ mod tests {
             log,
             Arc::new(InMemoryExecutionClient::new(Vec::new())),
             "token0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -695,7 +695,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -734,7 +734,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             Arc::new(InMemoryExecutionClient::new(Vec::new())),
             "token0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -845,7 +845,7 @@ mod coordinator_tests {
             Arc::new(crate::engine::CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );

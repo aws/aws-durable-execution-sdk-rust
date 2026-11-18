@@ -14,17 +14,7 @@ use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
 use durable::test_util::{CallbackReply, LocalRunner};
-use durable::{BoxError, DurableContext, Options, RetryDecision};
-
-/// A runner that sends each checkpoint in its own request.
-fn unbatched() -> LocalRunner {
-    LocalRunner::new().options(
-        Options::builder()
-            .checkpoint_batching(false)
-            .build()
-            .expect("valid options"),
-    )
-}
+use durable::{BoxError, DurableContext, RetryDecision};
 
 /// The shorter of two raced waits wins, and the longer wait stays pending.
 #[tokio::test]
@@ -71,7 +61,7 @@ async fn race_between_waits_returns_the_shorter_wait() {
 /// A step retried after 300 seconds loses a race against a 1 second wait.
 #[tokio::test]
 async fn retry_delay_is_ordered_against_a_wait() {
-    let result = unbatched()
+    let result = LocalRunner::new()
         .run(
             |(), ctx: DurableContext| async move {
                 let retried = ctx
@@ -146,21 +136,21 @@ async fn one_step((): (), ctx: DurableContext) -> Result<u32, BoxError> {
 }
 
 /// `checkpoint_latency` delays each checkpoint response in tokio time and
-/// changes nothing else. Unbatched, the step sends its START and its
+/// changes nothing else. The step sends its START and its
 /// SUCCEED in two requests, so the run takes at least twice the latency.
 #[tokio::test(start_paused = true)]
 async fn checkpoint_latency_delays_responses_and_changes_nothing_else() {
     let latency = Duration::from_millis(50);
 
     let started = tokio::time::Instant::now();
-    let delayed = unbatched()
+    let delayed = LocalRunner::new()
         .checkpoint_latency(latency)
         .run(one_step, ())
         .await
         .expect("runner");
     let elapsed = started.elapsed();
 
-    let baseline = unbatched().run(one_step, ()).await.expect("runner");
+    let baseline = LocalRunner::new().run(one_step, ()).await.expect("runner");
 
     assert!(delayed.is_success(), "{:?}", delayed.error_message());
     assert!(

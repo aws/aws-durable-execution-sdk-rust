@@ -189,9 +189,9 @@ with the supplied `Options`. Use `durable::wrap(handler, options)` to obtain
 the service function without starting the runtime, for example when you need
 to register it with `lambda_runtime` behind middleware.
 
-Checkpoint writes from concurrent operations batch into fewer requests by
-default, and `Options::builder().checkpoint_batching(false)` sends each one
-in its own request.
+By default, checkpoint writes go through one ordered writer, as in the
+JavaScript SDK: it sends a write as soon as no earlier request is in
+flight, and writes that wait for the same request share it.
 
 A handler failure does not fail the Lambda invocation. The SDK reports it
 inside a successful invocation response, as a `FAILED` envelope the durable

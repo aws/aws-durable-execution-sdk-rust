@@ -499,7 +499,7 @@ mod tests {
                 Arc::new(CheckpointLog::from_records(vec![(wire_key, record)])),
                 Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
                 "token0".to_owned(),
-                None,
+                std::time::Duration::ZERO,
                 0,
                 Some(hooks.plugins()),
             );
@@ -570,7 +570,7 @@ mod tests {
             Arc::new(CheckpointLog::from_records(vec![record])),
             Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
             "token0".to_owned(),
-            None,
+            std::time::Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -1582,7 +1582,7 @@ mod tests {
             Arc::new(log),
             Arc::clone(client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
-            None,
+            std::time::Duration::ZERO,
             0,
             plugins,
         )
@@ -1879,7 +1879,7 @@ mod refresh_tests {
             Arc::new(crate::engine::CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -1961,7 +1961,7 @@ mod refresh_tests {
                 Arc::new(crate::engine::CheckpointLog::empty()),
                 Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
                 "t0".to_owned(),
-                None,
+                Duration::ZERO,
                 0,
                 Some(hooks.plugins()),
             );

@@ -1468,7 +1468,7 @@ mod tests {
             Arc::new(CheckpointLog::from_records(records)),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -2431,7 +2431,7 @@ mod coordinator_tests {
             Arc::new(crate::engine::CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(hooks.plugins()),
         );
@@ -2653,7 +2653,7 @@ mod start_write_tests {
     #[tokio::test(start_paused = true)]
     async fn condition_check_starts_before_start_response() {
         let client = Arc::new(LatencyClient::new(Duration::from_millis(500)));
-        let ctx = latency_ctx(&client, None);
+        let ctx = latency_ctx(&client, Duration::ZERO);
         let started = Arc::new(Mutex::new(None));
         let check_started = Arc::clone(&started);
         let clock = Arc::clone(&client);

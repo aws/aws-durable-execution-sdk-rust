@@ -89,15 +89,8 @@ pub struct Options {
     /// transport for both service calls.
     pub(crate) execution_client: Option<Arc<dyn ExecutionClient>>,
     /// Coalescing window for checkpoint writes. `None` (the default) adds
-    /// no window: with batching on (the default), writes batch with a zero
-    /// window. Immediate writes need `checkpoint_batching(false)` without a
-    /// delay.
+    /// no window: writes batch behind the single writer with a zero window.
     pub(crate) checkpoint_delay: Option<Duration>,
-    /// Whether checkpoint writes batch behind the single-writer flush lock
-    /// even without a coalescing window. `true` (the default) batches with
-    /// a zero window. `false` without a delay writes each checkpoint
-    /// immediately.
-    pub(crate) checkpoint_batching: bool,
     /// The plugin factories, in registration order, each with the type
     /// name it was registered under. Empty by default.
     pub(crate) plugins: PluginFactories,
@@ -123,7 +116,6 @@ impl Default for Options {
             lambda_client: None,
             execution_client: None,
             checkpoint_delay: None,
-            checkpoint_batching: true,
             plugins: Vec::new(),
             plugin_child_operations_depth: 0,
         }
@@ -155,7 +147,6 @@ impl std::fmt::Debug for Options {
                 &ExecutionClientDebug(&self.execution_client),
             )
             .field("checkpoint_delay", &self.checkpoint_delay)
-            .field("checkpoint_batching", &self.checkpoint_batching)
             .field("plugins", &self.plugins.len())
             .field(
                 "plugin_child_operations_depth",
@@ -205,7 +196,6 @@ pub struct OptionsBuilder {
     lambda_client: Option<aws_sdk_lambda::Client>,
     execution_client: Option<Arc<dyn ExecutionClient>>,
     checkpoint_delay: Option<Duration>,
-    checkpoint_batching: Option<bool>,
     plugins: PluginFactories,
     plugin_child_operations_depth: u32,
 }
@@ -222,7 +212,6 @@ impl std::fmt::Debug for OptionsBuilder {
                 &ExecutionClientDebug(&self.execution_client),
             )
             .field("checkpoint_delay", &self.checkpoint_delay)
-            .field("checkpoint_batching", &self.checkpoint_batching)
             .field("plugins", &self.plugins.len())
             .field(
                 "plugin_child_operations_depth",
@@ -388,8 +377,11 @@ impl OptionsBuilder {
     ///   because the service assigns the callback ID in the checkpoint
     ///   response and the handler needs that ID right away.
     ///
-    /// When unset (the default), no window is added. Batching, which is on
-    /// by default, still never holds a write back.
+    /// When unset (the default), no window is added, and batching never
+    /// holds a write back: checkpoint writes go through a single ordered
+    /// writer, which sends a write as soon as no earlier request is in
+    /// flight, and writes that wait for the same request share it, as in
+    /// the JavaScript SDK.
     ///
     /// # Examples
     ///
@@ -405,60 +397,6 @@ impl OptionsBuilder {
     /// ```
     pub fn checkpoint_delay(mut self, delay: Duration) -> Self {
         self.checkpoint_delay = Some(delay);
-        self
-    }
-
-    /// Batches multiple checkpoint requests into fewer API calls, without
-    /// adding latency to any individual checkpoint.
-    ///
-    /// With batching enabled, checkpoint writes go through a single ordered
-    /// writer. A checkpoint that arrives while an earlier write is still in
-    /// flight joins a shared buffer, and the whole buffer is sent together
-    /// in the next `CheckpointDurableExecution` call once the writer is
-    /// free. Under high fan-out (large `map`/`parallel` batches) this
-    /// substantially reduces API calls; a sequential handler sees one call
-    /// per checkpoint exactly as today. Batches are split to respect the
-    /// service's per-request limits (operation count and payload size),
-    /// preserving write order across the splits, and every operation still
-    /// awaits its own checkpoint before proceeding, so ordering and replay
-    /// semantics are unchanged.
-    ///
-    /// Combine with [`checkpoint_delay`](Self::checkpoint_delay) to also
-    /// hold writes open for a coalescing window; batching alone never
-    /// delays a write.
-    ///
-    /// # Flush contract
-    ///
-    /// A checkpoint that must land before the execution can make progress
-    /// is never held back by batching. Pending checkpoints are flushed
-    /// unconditionally, and any in-flight batched write is awaited, at
-    /// these points:
-    ///
-    /// - **Suspension**: before an invocation reports `PENDING` to the
-    ///   service, every buffered checkpoint is written, so no recorded
-    ///   progress is lost across the suspend/resume boundary.
-    /// - **Execution completion**: before an invocation reports its
-    ///   terminal `SUCCEEDED`/`FAILED` envelope, the buffer is drained.
-    /// - **Callback creation**: creating a callback flushes immediately,
-    ///   because the service assigns the callback ID in the checkpoint
-    ///   response and the handler needs that ID right away.
-    ///
-    /// Batching is on by default. `false` sends each checkpoint in its own
-    /// request as soon as it is written.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use aws_durable_execution_sdk::Options;
-    ///
-    /// let opts = Options::builder()
-    ///     .checkpoint_batching(false)
-    ///     .build()
-    ///     .expect("valid config");
-    /// # drop(opts);
-    /// ```
-    pub fn checkpoint_batching(mut self, enabled: bool) -> Self {
-        self.checkpoint_batching = Some(enabled);
         self
     }
 
@@ -609,7 +547,6 @@ impl OptionsBuilder {
             lambda_client: self.lambda_client,
             execution_client: self.execution_client,
             checkpoint_delay: self.checkpoint_delay,
-            checkpoint_batching: self.checkpoint_batching.unwrap_or(true),
             plugins: self.plugins,
             plugin_child_operations_depth: self.plugin_child_operations_depth,
         })
@@ -734,7 +671,7 @@ mod tests {
         let opts = Options::builder().build().expect("valid");
         assert!(
             opts.checkpoint_delay.is_none(),
-            "unset checkpoint delay must stay None so checkpoints write immediately"
+            "unset checkpoint delay must stay None so batches flush at once"
         );
     }
 
@@ -745,51 +682,6 @@ mod tests {
             .build()
             .expect("valid");
         assert_eq!(opts.checkpoint_delay, Some(Duration::from_millis(20)));
-    }
-
-    #[test]
-    fn checkpoint_batching_enabled_builds_and_is_stored() {
-        let opts = Options::builder()
-            .checkpoint_batching(true)
-            .build()
-            .expect("checkpoint_batching(true) is a valid configuration");
-        assert!(
-            opts.checkpoint_batching,
-            "the enabled batching knob must be preserved, not dropped"
-        );
-    }
-
-    #[test]
-    fn checkpoint_batching_disabled_is_valid() {
-        let opts = Options::builder()
-            .checkpoint_batching(false)
-            .build()
-            .expect("explicitly-disabled batching is valid");
-        assert!(!opts.checkpoint_batching, "disabled batching stays off");
-    }
-
-    #[test]
-    fn checkpoint_batching_defaults_on() {
-        assert!(
-            Options::default().checkpoint_batching,
-            "Options::default() must batch checkpoints"
-        );
-        let opts = Options::builder().build().expect("valid");
-        assert!(
-            opts.checkpoint_batching,
-            "unset batching must default to on in build()"
-        );
-    }
-
-    #[test]
-    fn checkpoint_batching_combines_with_delay() {
-        let opts = Options::builder()
-            .checkpoint_delay(Duration::from_millis(10))
-            .checkpoint_batching(true)
-            .build()
-            .expect("delay and batching combine");
-        assert_eq!(opts.checkpoint_delay, Some(Duration::from_millis(10)));
-        assert!(opts.checkpoint_batching);
     }
 
     /// A transport that implements no `Debug`, as a caller's may not.

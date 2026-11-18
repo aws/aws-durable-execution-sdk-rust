@@ -54,11 +54,10 @@ struct ChangeSet {
 /// result.
 ///
 /// [`DurableContext::submit_checkpoint_updates`] starts the write before it
-/// returns: the updates are admitted to the buffer, or enter the
-/// [`DirectWriteQueue`]. Awaiting the value only waits for the result. Dropping it
-/// does not cancel the write, because the batch flusher and the direct
-/// write task do not depend on the caller. An at-least-once step uses this
-/// to run its body while its `START` write is in flight.
+/// returns: the updates are admitted to the buffer. Awaiting the value only
+/// waits for the result. Dropping it does not cancel the write, because the
+/// batch flusher does not depend on the caller. An at-least-once step uses
+/// this to run its body while its `START` write is in flight.
 pub(crate) struct SubmittedWrite {
     result: std::pin::Pin<
         Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send>,
@@ -177,11 +176,11 @@ impl Future for SubmittedWrite {
 /// that is not sent yet.
 ///
 /// [`DurableContext::reserve_checkpoint_updates`] puts the updates into the
-/// coalescer's open batch, or into the [`DirectWriteQueue`], before it
-/// returns. A batch that holds a reserved write is not flushed, and later
-/// entries of the queue wait behind it. So a later submission cannot reach
-/// the service first. [`Self::release`] makes the write eligible to be
-/// sent and returns its result future. Dropping the value releases it too.
+/// coalescer's open batch before it returns. A batch that holds a reserved
+/// write is not flushed, and a later submission joins that batch, so it
+/// cannot reach the service first. [`Self::release`] makes the write
+/// eligible to be sent and returns its result future. Dropping the value
+/// releases it too.
 ///
 /// The start step of an operation whose JS order is "queue START, then
 /// fire `on_operation_start`" reserves START, fires the hook, then
@@ -189,29 +188,9 @@ impl Future for SubmittedWrite {
 /// on any runtime, as in JS.
 pub(crate) struct ReservedWrite {
     write: SubmittedWrite,
-    /// What keeps the write from being sent. `None` once released, and for
-    /// a rejected write.
-    hold: Option<WriteHold>,
-}
-
-/// What [`ReservedWrite`] holds back.
-enum WriteHold {
-    /// A hold on the coalescer's open batch.
-    Batch(Arc<CheckpointCoalescer>),
-    /// A held entry of the direct write queue.
-    Direct {
-        queue: Arc<DirectWriteQueue>,
-        id: u64,
-    },
-}
-
-impl WriteHold {
-    fn release(self) {
-        match self {
-            Self::Batch(coalescer) => coalescer.release_hold(),
-            Self::Direct { queue, id } => queue.release(id),
-        }
-    }
+    /// The coalescer whose open batch the write holds. `None` once
+    /// released, and for a rejected write.
+    hold: Option<Arc<CheckpointCoalescer>>,
 }
 
 impl ReservedWrite {
@@ -238,23 +217,22 @@ impl Drop for ReservedWrite {
     /// are not blocked forever.
     fn drop(&mut self) {
         if let Some(hold) = self.hold.take() {
-            hold.release();
+            hold.release_hold();
         }
     }
 }
 
-/// The test hook of the direct writer: for an entry's updates it returns
-/// the `Notify` the writer awaits before it takes the checkpoint token, or
-/// `None` to write at once.
+/// The test hook of the checkpoint writer: for a request's updates it
+/// returns the `Notify` the writer awaits before it takes the checkpoint
+/// token, or `None` to write at once.
 #[cfg(test)]
 pub(crate) type PreLockGate =
     Arc<dyn Fn(&[OperationUpdate]) -> Option<Arc<tokio::sync::Notify>> + Send + Sync>;
 
 /// The test hook that sees every admitted submission: its updates and the
 /// first-poll flag of its [`SubmittedWrite`]. It runs before the write can
-/// be sent: an ordinary write calls it before it joins the coalescer or
-/// enters the [`DirectWriteQueue`], and a reservation calls it while its
-/// entry is held.
+/// be sent: an ordinary write calls it before it joins the coalescer, and a
+/// reservation calls it while its batch is held.
 #[cfg(test)]
 pub(crate) type SubmissionRecorder =
     Arc<dyn Fn(&[OperationUpdate], &Arc<std::sync::atomic::AtomicBool>) + Send + Sync>;
@@ -265,137 +243,13 @@ pub(crate) type SubmissionRecorder =
 #[cfg(test)]
 pub(crate) type SettlerEntryRecorder = Arc<dyn Fn(&str, OperationAction) + Send + Sync>;
 
-/// The test hooks a [`DirectWriteQueue`] carries for every context of the
-/// invocation.
+/// The test hooks shared by every context of the invocation.
 #[cfg(test)]
 #[derive(Default)]
-struct TestHooks {
+pub(crate) struct TestHooks {
     gate: Option<PreLockGate>,
     submissions: Option<SubmissionRecorder>,
     settler_entries: Option<SettlerEntryRecorder>,
-}
-
-/// The FIFO of the invocation's unbuffered checkpoint writes.
-///
-/// Without a coalescer, every write enters this queue under a synchronous
-/// lock before the call that submits it returns. One detached task, the
-/// direct writer, takes the entries in order, writes each one under the
-/// `checkpoint_token` lock, and sends its result to the entry's
-/// [`SubmittedWrite`]. So writes reach the service in submission order,
-/// whichever task Tokio runs first. The root context and every child share
-/// one queue, as they share `checkpoint_token`.
-///
-/// The writer runs while the queue has entries and ends when it is empty.
-/// The next write starts a new one. A held entry (see [`ReservedWrite`])
-/// stops the writer until it is released.
-#[derive(Default)]
-pub(crate) struct DirectWriteQueue {
-    state: std::sync::Mutex<DirectQueueState>,
-    /// Wakes the writer when a held entry is released.
-    released: tokio::sync::Notify,
-    /// The hooks tests install (see [`PreLockGate`],
-    /// [`SubmissionRecorder`] and [`SettlerEntryRecorder`]).
-    #[cfg(test)]
-    hooks: std::sync::Mutex<TestHooks>,
-}
-
-#[derive(Default)]
-struct DirectQueueState {
-    entries: std::collections::VecDeque<DirectEntry>,
-    /// Whether a writer task is running. Set by the push that starts one,
-    /// cleared by the writer when it finds the queue empty.
-    writer_running: bool,
-    next_id: u64,
-}
-
-/// The result channel of a direct write. `None` means the write sent
-/// nothing or failed: the admission check rejected it, the checkpoint
-/// token was withdrawn, or this write or an earlier one failed. The
-/// caller then never resolves.
-type DirectResult = Option<Result<CheckpointOutput, ExecutionClientError>>;
-
-/// One write of the [`DirectWriteQueue`].
-struct DirectEntry {
-    id: u64,
-    /// Whether a [`ReservedWrite`] still holds the entry.
-    held: bool,
-    /// The context that submitted the write: its owners are admitted, and
-    /// its checkpoint log takes the response.
-    ctx: DurableContext,
-    updates: Vec<OperationUpdate>,
-    events: Vec<crate::tracing_layer::PendingTransitionEvent>,
-    /// The write's checkpoint permit, released after the result is sent.
-    permit: Option<crate::coordinator::Permit>,
-    /// The wire ID a refresh passes: a request with no update records its
-    /// failure for it (see [`DurableContext::checkpoint_refresh`]).
-    refresh_id: Option<String>,
-    sender: tokio::sync::oneshot::Sender<DirectResult>,
-}
-
-impl DirectWriteQueue {
-    fn lock(&self) -> std::sync::MutexGuard<'_, DirectQueueState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Releases the held entry `id`, and wakes the writer.
-    fn release(&self, id: u64) {
-        if let Some(entry) = self.lock().entries.iter_mut().find(|entry| entry.id == id) {
-            entry.held = false;
-        }
-        self.released.notify_waiters();
-    }
-
-    /// Takes the next entry once it is not held. Returns `None`, and marks
-    /// the writer stopped, when the queue is empty.
-    async fn next(&self) -> Option<DirectEntry> {
-        loop {
-            // `enable()` registers the waiter before the check, so a
-            // release between the check and the await still wakes it.
-            let mut released = std::pin::pin!(self.released.notified());
-            released.as_mut().enable();
-            {
-                let mut state = self.lock();
-                if state.entries.is_empty() {
-                    state.writer_running = false;
-                    return None;
-                }
-                if let Some(entry) = state.entries.pop_front_if(|entry| !entry.held) {
-                    return Some(entry);
-                }
-            }
-            released.await;
-        }
-    }
-
-    /// Takes every queued entry, held ones included, so the caller drops
-    /// them without resolving their callers. The withdrawal of the
-    /// checkpoint token and a failed write call it (see
-    /// [`InvocationCoordinator::withdraw`] and
-    /// [`InvocationCoordinator::fail_write`]).
-    /// The writer finds the queue empty and stops. A released reservation
-    /// finds no entry and does nothing.
-    fn abandon_queued(&self) -> std::collections::VecDeque<DirectEntry> {
-        std::mem::take(&mut self.lock().entries)
-    }
-
-    /// Waits on the pre-lock gate for `updates`, when one is installed and
-    /// returns a `Notify` for them.
-    #[cfg(test)]
-    fn hooks(&self) -> std::sync::MutexGuard<'_, TestHooks> {
-        self.hooks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    #[cfg(test)]
-    async fn pass_gate(&self, updates: &[OperationUpdate]) {
-        let gate = self.hooks().gate.clone();
-        if let Some(notify) = gate.and_then(|gate| gate(updates)) {
-            notify.notified().await;
-        }
-    }
 }
 
 /// The result future of a write that joined `batch`: it resolves when the
@@ -414,58 +268,6 @@ fn batch_result(batch: Arc<CheckpointBatch>) -> SubmittedWrite {
             notified.await;
         }
     })
-}
-
-/// Marks the direct writer stopped when its task unwinds, so the next
-/// write starts a new writer, which writes the entries still queued.
-struct WriterUnwind(Arc<DirectWriteQueue>);
-
-impl Drop for WriterUnwind {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.0.lock().writer_running = false;
-        }
-    }
-}
-
-/// The direct writer: writes the queue's entries in order until it is
-/// empty (see [`DirectWriteQueue`]).
-async fn run_direct_writer(queue: Arc<DirectWriteQueue>) {
-    let _unwind = WriterUnwind(Arc::clone(&queue));
-    while let Some(entry) = queue.next().await {
-        #[cfg(test)]
-        queue.pass_gate(&entry.updates).await;
-        let DirectEntry {
-            ctx,
-            updates,
-            events,
-            permit,
-            refresh_id,
-            sender,
-            ..
-        } = entry;
-        // A write that sent nothing or failed sends `None`, so the caller
-        // never resolves. A failure is recorded where the response arrives
-        // (see `DurableContext::write_locked`).
-        let written = match ctx
-            .checkpoint_direct_with_events(
-                updates,
-                &events,
-                Some(ctx.owners()),
-                refresh_id.as_deref(),
-            )
-            .await
-        {
-            Some(Ok(output)) => Some(Ok(output)),
-            None | Some(Err(_)) => None,
-        };
-        // A dropped receiver means the caller was cancelled, or the driver
-        // dropped the refresh scheduler when the drive ended: the write
-        // already happened, and its result has no reader. The caller's wake
-        // takes its own permit before the write's permit is released.
-        let _ = sender.send(written);
-        drop(permit);
-    }
 }
 
 /// The fatal error a failed checkpoint write records: a retryable failure
@@ -634,18 +436,17 @@ struct Inner {
     /// must be held across `await` points in [`DurableContext::checkpoint_updates`],
     /// serializing all concurrent checkpoint callers through one critical section.
     checkpoint_token: Arc<Mutex<String>>,
-    /// Checkpoint-write coalescer, present only when
-    /// [`Options`](crate::Options) configured a `checkpoint_delay` and/or
-    /// `checkpoint_batching`. Shared with every child context so updates
-    /// from all namespaces coalesce into the same batches. A zero-window
-    /// batching coalescer is the default. `None` means every checkpoint
-    /// writes immediately, which needs `checkpoint_batching(false)` without
-    /// a `checkpoint_delay`.
-    coalescer: Option<Arc<CheckpointCoalescer>>,
-    /// The FIFO of unbuffered writes and its writer, shared by the root and
-    /// every child context, as `checkpoint_token` is (see
-    /// [`DirectWriteQueue`]).
-    direct: Arc<DirectWriteQueue>,
+    /// Checkpoint-write coalescer. Every checkpoint write goes through its
+    /// writer: a write made while the drive runs joins its buffer, and the
+    /// write after the drive takes its writer lock. Shared with every child
+    /// context so updates from all namespaces coalesce into the same
+    /// batches. Its window is zero unless [`Options`](crate::Options)
+    /// configured a `checkpoint_delay`.
+    coalescer: Arc<CheckpointCoalescer>,
+    /// The test hooks, shared by the root and every child context (see
+    /// [`TestHooks`]).
+    #[cfg(test)]
+    hooks: Arc<std::sync::Mutex<TestHooks>>,
     /// Cached parent wire ID: the SHA-256 hash of this context's prefix
     /// (positional ID of the parent operation). `None` for root contexts.
     parent_wire_id: Option<String>,
@@ -787,8 +588,9 @@ impl DurableContext {
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
-                coalescer: None,
-                direct: Arc::new(DirectWriteQueue::default()),
+                coalescer: Arc::new(CheckpointCoalescer::new(Duration::ZERO)),
+                #[cfg(test)]
+                hooks: Arc::default(),
                 parent_wire_id: None,
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
@@ -827,8 +629,9 @@ impl DurableContext {
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
-                coalescer: None,
-                direct: Arc::new(DirectWriteQueue::default()),
+                coalescer: Arc::new(CheckpointCoalescer::new(Duration::ZERO)),
+                #[cfg(test)]
+                hooks: Arc::default(),
                 parent_wire_id: None,
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
@@ -867,8 +670,9 @@ impl DurableContext {
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
-                coalescer: None,
-                direct: Arc::new(DirectWriteQueue::default()),
+                coalescer: Arc::new(CheckpointCoalescer::new(Duration::ZERO)),
+                #[cfg(test)]
+                hooks: Arc::default(),
                 parent_wire_id: None,
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
@@ -884,11 +688,9 @@ impl DurableContext {
     /// Creates a root context with a client, token, and checkpoint
     /// buffering window threaded in from
     /// [`Options`](crate::Options) (internal). `checkpoint_buffer_window`
-    /// is `Some(Duration::ZERO)` for pure `checkpoint_batching` (the
-    /// default: no added delay; writes batch behind the single-writer
-    /// lock), `Some(window)` for a `checkpoint_delay` coalescing window,
-    /// and `None` for immediate writes, which need
-    /// `checkpoint_batching(false)` without a delay.
+    /// is `Duration::ZERO` by default (no added delay; writes batch behind
+    /// the single-writer lock), and the `checkpoint_delay` coalescing window
+    /// when one is configured.
     /// `preserve_child_depth` is the
     /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth)
     /// of the invocation.
@@ -899,7 +701,7 @@ impl DurableContext {
         checkpoint_log: Arc<CheckpointLog>,
         client: Arc<dyn ExecutionClient>,
         checkpoint_token: String,
-        checkpoint_buffer_window: Option<Duration>,
+        checkpoint_buffer_window: Duration,
         preserve_child_depth: u32,
         plugins: Option<Arc<crate::plugin::InvocationPlugins>>,
     ) -> Self {
@@ -919,8 +721,9 @@ impl DurableContext {
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
-                coalescer: checkpoint_buffer_window.map(|d| Arc::new(CheckpointCoalescer::new(d))),
-                direct: Arc::new(DirectWriteQueue::default()),
+                coalescer: Arc::new(CheckpointCoalescer::new(checkpoint_buffer_window)),
+                #[cfg(test)]
+                hooks: Arc::default(),
                 parent_wire_id: None,
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
@@ -961,7 +764,7 @@ impl DurableContext {
             Arc::new(CheckpointLog::empty()),
             client,
             "token0".to_owned(),
-            None,
+            Duration::ZERO,
             depth,
             None,
         )
@@ -995,8 +798,9 @@ impl DurableContext {
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
-                coalescer: Some(Arc::new(coalescer)),
-                direct: Arc::new(DirectWriteQueue::default()),
+                coalescer: Arc::new(coalescer),
+                #[cfg(test)]
+                hooks: Arc::default(),
                 parent_wire_id: None,
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
@@ -1045,8 +849,9 @@ impl DurableContext {
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
-                coalescer: self.inner.coalescer.clone(),
-                direct: Arc::clone(&self.inner.direct),
+                coalescer: Arc::clone(&self.inner.coalescer),
+                #[cfg(test)]
+                hooks: Arc::clone(&self.inner.hooks),
                 parent_wire_id: Some(wire_id),
                 admission: Arc::clone(&self.inner.admission),
                 owners: self.owners_with(parent_positional_id),
@@ -1095,8 +900,9 @@ impl DurableContext {
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
-                coalescer: self.inner.coalescer.clone(),
-                direct: Arc::clone(&self.inner.direct),
+                coalescer: Arc::clone(&self.inner.coalescer),
+                #[cfg(test)]
+                hooks: Arc::clone(&self.inner.hooks),
                 parent_wire_id: self.inner.parent_wire_id.clone(),
                 admission: Arc::clone(&self.inner.admission),
                 owners: Arc::clone(&self.inner.owners),
@@ -1332,8 +1138,9 @@ impl DurableContext {
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
-                coalescer: self.inner.coalescer.clone(),
-                direct: Arc::clone(&self.inner.direct),
+                coalescer: Arc::clone(&self.inner.coalescer),
+                #[cfg(test)]
+                hooks: Arc::clone(&self.inner.hooks),
                 parent_wire_id: Some(parent_wire_id_override.to_owned()),
                 admission: Arc::clone(&self.inner.admission),
                 owners: self.owners_with(child_positional_id),
@@ -1380,32 +1187,51 @@ impl DurableContext {
             .collect()
     }
 
-    /// Installs the direct writer's pre-lock gate (see [`PreLockGate`]).
+    /// Installs the checkpoint writer's pre-lock gate (see [`PreLockGate`]).
     /// The root context and every child share it.
     #[cfg(test)]
     pub(crate) fn set_pre_lock_gate(&self, gate: PreLockGate) {
-        self.inner.direct.hooks().gate = Some(gate);
+        self.hooks().gate = Some(gate);
     }
 
     /// Installs the submission recorder (see [`SubmissionRecorder`]). The
     /// root context and every child share it.
     #[cfg(test)]
     pub(crate) fn set_submission_recorder(&self, recorder: SubmissionRecorder) {
-        self.inner.direct.hooks().submissions = Some(recorder);
+        self.hooks().submissions = Some(recorder);
     }
 
     /// Installs the settler-entry recorder (see [`SettlerEntryRecorder`]).
     /// The root context and every child share it.
     #[cfg(test)]
     pub(crate) fn set_settler_entry_recorder(&self, recorder: SettlerEntryRecorder) {
-        self.inner.direct.hooks().settler_entries = Some(recorder);
+        self.hooks().settler_entries = Some(recorder);
+    }
+
+    /// The test hooks shared by every context of the invocation.
+    #[cfg(test)]
+    fn hooks(&self) -> std::sync::MutexGuard<'_, TestHooks> {
+        self.inner
+            .hooks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Waits on the pre-lock gate for `updates`, when one is installed and
+    /// returns a `Notify` for them.
+    #[cfg(test)]
+    async fn pass_gate(&self, updates: &[OperationUpdate]) {
+        let gate = self.hooks().gate.clone();
+        if let Some(notify) = gate.and_then(|gate| gate(updates)) {
+            notify.notified().await;
+        }
     }
 
     /// Passes `updates` and `write`'s first-poll flag to the submission
     /// recorder, when one is installed.
     #[cfg(test)]
     fn record_submission(&self, updates: &[OperationUpdate], write: &SubmittedWrite) {
-        let recorder = self.inner.direct.hooks().submissions.clone();
+        let recorder = self.hooks().submissions.clone();
         if let Some(recorder) = recorder
             && !updates.is_empty()
         {
@@ -1427,7 +1253,7 @@ impl DurableContext {
     ) -> Result<(), OperationError> {
         #[cfg(test)]
         {
-            let recorder = self.inner.direct.hooks().settler_entries.clone();
+            let recorder = self.hooks().settler_entries.clone();
             if let Some(recorder) = recorder {
                 recorder(wire_id, action.clone());
             }
@@ -1443,33 +1269,21 @@ impl DurableContext {
     }
 
     /// Buffers `updates` in the coalescer's open batch without starting a
-    /// flusher, so only a flush point writes them. Panics without
-    /// buffering.
+    /// flusher, so only a flush point writes them.
     #[cfg(test)]
     pub(crate) fn buffer_unflushed(&self, updates: Vec<OperationUpdate>) {
-        let coalescer = self.inner.coalescer.as_ref().expect("a buffered context");
         let tracked = self.track_updates(updates);
-        coalescer
+        self.inner
+            .coalescer
             .join(self.admission(), self.coordinator(), self.owners(), tracked)
             .expect("the join is admitted");
     }
 
-    /// The IDs of the updates that wait to be sent: those of the direct
-    /// write queue, then those of the coalescer's open batch.
+    /// The IDs of the updates that wait to be sent: those of the
+    /// coalescer's open batch.
     #[cfg(test)]
     pub(crate) fn queued_update_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .inner
-            .direct
-            .lock()
-            .entries
-            .iter()
-            .flat_map(|entry| entry.updates.iter().map(|u| u.id().to_owned()))
-            .collect();
-        if let Some(coalescer) = &self.inner.coalescer {
-            ids.extend(coalescer.pending_ids());
-        }
-        ids
+        self.inner.coalescer.pending_ids()
     }
 
     /// The checkpoint token mutex, which a checkpoint call holds.
@@ -1968,7 +1782,7 @@ impl DurableContext {
     /// [`InvocationCoordinator::fail_write`]), and its caller never
     /// resolves. So the only error a write returns to its caller is the
     /// one of a write that found no Tokio runtime and sent nothing (see
-    /// [`Self::write_direct_detached`]). The operation then returns the
+    /// [`Self::spawn_batch_flush`]). The operation then returns the
     /// error `.spawn()` returns without a runtime, at once, and nothing is
     /// recorded. Any other error leaves the operation pending: the
     /// recorded failure ends the drive, and the operation writes no
@@ -2075,12 +1889,11 @@ impl DurableContext {
 
     /// Checkpoints operation updates via the execution client.
     ///
-    /// When [`Options`](crate::Options) configured a `checkpoint_delay`
-    /// and/or `checkpoint_batching`, the updates join the shared coalescing
-    /// batch and this call resolves with the batch's result once it flushes
-    /// (after at most the configured delay, or earlier if a flush point
-    /// drains the buffer). Without either knob, the write happens
-    /// immediately via [`Self::checkpoint_updates_direct`].
+    /// The updates join the shared coalescing batch, and this call resolves
+    /// with the batch's result once the batch is written. Without a
+    /// `checkpoint_delay` the flush is requested at once; with one, after
+    /// at most the configured delay, or earlier if a flush point drains the
+    /// buffer.
     pub(crate) async fn checkpoint_updates(
         &self,
         updates: Vec<OperationUpdate>,
@@ -2091,11 +1904,9 @@ impl DurableContext {
     /// Starts the checkpoint write of [`Self::checkpoint_updates`] before
     /// it returns, and returns the future of its result.
     ///
-    /// With buffering, the updates join the batch and take their checkpoint
-    /// permit under the buffer lock. Without it, they enter the
-    /// [`DirectWriteQueue`], whose writer sends them in submission order.
-    /// So the write keeps its place in the write order, and continues when
-    /// the returned value is dropped.
+    /// The updates join the batch and take their checkpoint permit under
+    /// the buffer lock. So the write keeps its place in the write order,
+    /// and continues when the returned value is dropped.
     pub(crate) fn submit_checkpoint_updates(
         &self,
         updates: Vec<OperationUpdate>,
@@ -2114,8 +1925,8 @@ impl DurableContext {
     /// written now. Identical to [`Self::submit_checkpoint_updates`] when
     /// no delay is configured.
     ///
-    /// The updates join the batch, or the direct write queue, before this
-    /// returns, as with [`Self::submit_checkpoint_updates`].
+    /// The updates join the batch before this returns, as with
+    /// [`Self::submit_checkpoint_updates`].
     pub(crate) fn submit_checkpoint_updates_urgent(
         &self,
         updates: Vec<OperationUpdate>,
@@ -2127,11 +1938,9 @@ impl DurableContext {
     /// [`Self::submit_checkpoint_updates`] does, but holds them back until
     /// the returned [`ReservedWrite`] is released or dropped.
     ///
-    /// With buffering, the updates join the open batch, and the batch is
-    /// not flushed while the reservation holds it. Without buffering, they
-    /// enter the [`DirectWriteQueue`], and the writer waits at them. So no
-    /// request carries them, and no response is merged for them, before the
-    /// release.
+    /// The updates join the open batch, and the batch is not flushed while
+    /// the reservation holds it. So no request carries them, and no response
+    /// is merged for them, before the release.
     pub(crate) fn reserve_checkpoint_updates(
         &self,
         updates: Vec<OperationUpdate>,
@@ -2139,26 +1948,7 @@ impl DurableContext {
         #[cfg(test)]
         let recorded = updates.clone();
         let tracked = self.track_updates(updates);
-        let Some(coalescer) = self.inner.coalescer.clone() else {
-            let (updates, events): (Vec<_>, Vec<_>) =
-                tracked.into_iter().map(|t| (t.update, t.event)).unzip();
-            let Some(permit) = self.inner.coordinator.acquire(PermitKind::Checkpoint) else {
-                return ReservedWrite::rejected();
-            };
-            let (write, id) = self.enqueue_direct(updates, events, Some(permit), None, true);
-            let write = write.reported_by(self);
-            #[cfg(test)]
-            if id.is_some() {
-                self.record_submission(&recorded, &write);
-            }
-            return ReservedWrite {
-                write,
-                hold: id.map(|id| WriteHold::Direct {
-                    queue: Arc::clone(&self.inner.direct),
-                    id,
-                }),
-            };
-        };
+        let coalescer = Arc::clone(&self.inner.coalescer);
         let Some(batch) = self.join_batch(&coalescer, tracked, false, None, true) else {
             return ReservedWrite::rejected();
         };
@@ -2167,7 +1957,7 @@ impl DurableContext {
         self.record_submission(&recorded, &write);
         ReservedWrite {
             write,
-            hold: Some(WriteHold::Batch(coalescer)),
+            hold: Some(coalescer),
         }
     }
 
@@ -2176,19 +1966,11 @@ impl DurableContext {
     /// `first_wire_id` travels with the request: a failure of a request
     /// with no update is recorded for it (see [`Self::record_write_failure`]).
     /// The failure is recorded where the response arrives, on the detached
-    /// writer or flusher, so it decides the invocation's outcome even when
+    /// flusher, so it decides the invocation's outcome even when
     /// the driver dropped the scheduler, and so this future. A failed
     /// refresh never resolves.
     pub(crate) async fn checkpoint_refresh(&self, first_wire_id: &str) {
-        let write = if self.inner.coalescer.is_some() {
-            self.write_with_urgency(Vec::new(), true, Some(first_wire_id))
-        } else {
-            // No checkpoint permit: the scheduler's permit keeps the
-            // invocation open until the response is merged and the readied
-            // operations are woken. The write task is counted, so the
-            // drive's cleanup waits for it after the scheduler is dropped.
-            self.write_direct_detached(Vec::new(), Vec::new(), None, Some(first_wire_id.to_owned()))
-        };
+        let write = self.write_with_urgency(Vec::new(), true, Some(first_wire_id));
         // The task that sends the refresh delivers the change sets queued
         // so far once the call returns. The scheduler runs inside a Tokio
         // runtime, so the write never returns the error of a write that
@@ -2245,38 +2027,37 @@ impl DurableContext {
             .collect()
     }
 
-    /// Dispatches a checkpoint write: joins the coalescing batch when one
-    /// is configured, otherwise writes directly. Under a non-zero delay, the
-    /// non-urgent join that opens a batch starts a detached flush that
-    /// waits out the window; an urgent contributor, or any contributor
-    /// under a zero-delay coalescer (pure `checkpoint_batching` mode),
-    /// requests the flush right away. Either way the flush task claims and
-    /// writes the batch under the coalescer's writer lock, so batching still
-    /// emerges while an earlier write is in flight.
+    /// Dispatches a checkpoint write: joins the coalescing batch. Under a
+    /// non-zero delay, the non-urgent join that opens a batch starts a
+    /// detached flush that waits out the window; an urgent contributor, or
+    /// any contributor under a zero-delay coalescer (the default), requests
+    /// the flush right away. Either way the flush task claims and writes the
+    /// batch under the coalescer's writer lock, so batching still emerges
+    /// while an earlier write is in flight.
     ///
     /// Joining the batch transfers ownership of each update's lifecycle
     /// event to the coalescer: the flush task that persists the update
     /// emits it, so this future can be dropped mid-await without losing
     /// telemetry for a transition the flush still records.
     ///
-    /// `refresh_id` applies only with buffering: the joined batch passes it
-    /// with its write (see [`Self::checkpoint_refresh`]).
+    /// The joined batch passes `refresh_id` with its write (see
+    /// [`Self::checkpoint_refresh`]).
     ///
-    /// The join or the direct write happens before this returns, so the
-    /// returned [`SubmittedWrite`] only waits for the result.
+    /// The join happens before this returns, so the returned
+    /// [`SubmittedWrite`] only waits for the result.
     fn write_with_urgency(
         &self,
         updates: Vec<TrackedUpdate>,
         urgent: bool,
         refresh_id: Option<&str>,
     ) -> SubmittedWrite {
-        // The recorder sees the submission before it joins the coalescer
-        // or enters the queue, so before the writer can send it. The write
+        // The recorder sees the submission before it joins the coalescer,
+        // so before the flusher can send it. The write
         // built below takes the flag the recorder saw.
         #[cfg(test)]
         let flag = {
             let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let recorder = self.inner.direct.hooks().submissions.clone();
+            let recorder = self.hooks().submissions.clone();
             if let Some(recorder) = recorder
                 && !updates.is_empty()
                 && self.admission().admits(self.owners())
@@ -2303,19 +2084,7 @@ impl DurableContext {
         urgent: bool,
         refresh_id: Option<&str>,
     ) -> SubmittedWrite {
-        let Some(coalescer) = self.inner.coalescer.clone() else {
-            let (updates, events): (Vec<_>, Vec<_>) =
-                updates.into_iter().map(|t| (t.update, t.event)).unzip();
-            let Some(permit) = self.inner.coordinator.acquire(PermitKind::Checkpoint) else {
-                // The phase left `Running`, the checkpoint token was
-                // withdrawn, or a fatal error is recorded (a failed write
-                // records one): the write is rejected, as a write from an
-                // abandoned owner is.
-                return SubmittedWrite::rejected();
-            };
-            return self.write_direct_detached(updates, events, Some(permit), None);
-        };
-
+        let coalescer = Arc::clone(&self.inner.coalescer);
         match self.join_batch(&coalescer, updates, urgent, refresh_id, false) {
             Some(batch) => batch_result(batch),
             None => SubmittedWrite::rejected(),
@@ -2367,199 +2136,42 @@ impl DurableContext {
     /// and only if, the checkpoint call that persists them succeeds, emits
     /// each update's lifecycle event (inside the span captured with it).
     /// This is the single site that pairs "the transition was persisted"
-    /// with "its telemetry was emitted": both the unbuffered path and every
-    /// chunk of a batched write funnel through it. The emission happens
+    /// with "its telemetry was emitted": every chunk of a batched write
+    /// funnels through it. The emission happens
     /// inside [`Self::checkpoint_direct_with_events`], immediately after
     /// the service accepts the write, before the fallible pagination
     /// hydration that follows it, so a transition the service recorded
     /// always emits its event even when hydrating the paginated state
     /// fails afterwards.
     ///
-    /// Only the batch flusher calls this. Its updates were admitted when
-    /// they joined the buffer, so it skips the admission check.
+    /// The batch flusher and the write after the drive call it, and it runs
+    /// no admission check: a flushed batch's updates were admitted when they
+    /// joined the buffer, and the write after the drive comes from the root
+    /// context. An update without an event emits none.
     async fn write_tracked_direct(
         &self,
         tracked: Vec<TrackedUpdate>,
     ) -> Result<CheckpointOutput, WriteError> {
-        let (updates, events): (Vec<_>, Vec<_>) =
-            tracked.into_iter().map(|t| (t.update, t.event)).unzip();
+        let mut updates = Vec::with_capacity(tracked.len());
+        let mut events = Vec::with_capacity(tracked.len());
+        for TrackedUpdate { update, event } in tracked {
+            updates.push(update);
+            events.extend(event);
+        }
         self.write_unchecked(updates, &events, None).await
     }
 
-    /// Writes updates that skip the admission check: the batch flusher's.
-    /// `refresh_id` is the batch's (see [`Self::checkpoint_refresh`]).
+    /// Writes updates that skip the admission check: those of a flushed
+    /// batch and of the write after the drive. `refresh_id` is the batch's
+    /// (see [`Self::checkpoint_refresh`]).
     async fn write_unchecked(
         &self,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
         refresh_id: Option<&str>,
     ) -> Result<CheckpointOutput, WriteError> {
-        #[expect(clippy::expect_used)]
-        // reason: with no owners to check, `checkpoint_direct_with_events`
-        // never rejects the write, so it always returns a result.
-        self.checkpoint_direct_with_events(updates, events, None, refresh_id)
+        self.checkpoint_direct_with_events(updates, events, refresh_id)
             .await
-            .expect("a write without an admission check is never rejected")
-    }
-
-    /// Writes updates directly, through the [`DirectWriteQueue`] and its
-    /// detached writer, after the admission check, and returns the result
-    /// to the caller.
-    ///
-    /// `permit` is the write's checkpoint permit, held until the response is
-    /// merged, the operations it readied are woken, and the result is
-    /// handed to the caller. `None` is passed in two cases: after the drive
-    /// ended, and for an unbatched refresh, whose scheduler permit holds the
-    /// invocation open instead (see [`Self::checkpoint_refresh`]). In both
-    /// cases the cleanup's `wait_idle` waits for the counted writer.
-    ///
-    /// The write runs on the writer's task because a cancelled caller must not
-    /// cancel an admitted request. A batch abandons its running items at
-    /// early completion and aborts their tasks. If an aborted item
-    /// cancelled a request the service had accepted, the checkpoint token
-    /// would not rotate, and the parent's next write would use a stale
-    /// token. The task is counted, so the invocation waits for it.
-    ///
-    /// The outcomes are:
-    ///
-    /// - No Tokio runtime is running: nothing is sent, and the caller gets
-    ///   an invocation-scope error whose source is
-    ///   [`NoRuntime`](crate::task::NoRuntime). An operation that receives
-    ///   it returns the error `.spawn()` returns without a runtime (see
-    ///   [`Self::checkpoint_failure_unrecoverable`]).
-    /// - The admission check rejects the write, the checkpoint token was
-    ///   withdrawn, a fatal error was recorded before the caller took the
-    ///   write's checkpoint permit, or a write failed, this one or an
-    ///   earlier one: nothing more is sent, and the returned future never
-    ///   resolves (see [`Admission`], [`InvocationCoordinator::acquire`]
-    ///   and [`Self::record_write_failure`]).
-    /// - The checkpoint client panics: the task gateway records the panic on
-    ///   the coordinator, which ends the drive. The channel carries no
-    ///   payload, so the caller stays pending until the drive's cleanup
-    ///   cancels it.
-    /// - Otherwise: the caller gets the write's output.
-    ///
-    /// A refresh passes `refresh_id` (see [`Self::checkpoint_refresh`]).
-    ///
-    /// The write enters the queue before this returns, so its position in
-    /// the write order is fixed, and the returned [`SubmittedWrite`] only
-    /// waits for the result.
-    fn write_direct_detached(
-        &self,
-        updates: Vec<OperationUpdate>,
-        events: Vec<crate::tracing_layer::PendingTransitionEvent>,
-        permit: Option<crate::coordinator::Permit>,
-        refresh_id: Option<String>,
-    ) -> SubmittedWrite {
-        self.enqueue_direct(updates, events, permit, refresh_id, false)
-            .0
-    }
-
-    /// Appends a write to the [`DirectWriteQueue`] and starts the direct
-    /// writer when none runs. Returns the write's result future and, while
-    /// the entry is queued, its ID. A `held` entry is not written until
-    /// [`DirectWriteQueue::release`] releases it.
-    ///
-    /// When no Tokio runtime is running, the writer cannot start: every
-    /// queued entry gets an invocation-scope error whose source is
-    /// [`NoRuntime`](crate::task::NoRuntime), and no ID is returned.
-    ///
-    /// After a failed write nothing more is sent: the write is rejected
-    /// before it enters the queue, and no ID is returned.
-    fn enqueue_direct(
-        &self,
-        updates: Vec<OperationUpdate>,
-        events: Vec<crate::tracing_layer::PendingTransitionEvent>,
-        permit: Option<crate::coordinator::Permit>,
-        refresh_id: Option<String>,
-        held: bool,
-    ) -> (SubmittedWrite, Option<u64>) {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let queue = &self.inner.direct;
-        let (id, start_writer) = {
-            #[cfg(test)]
-            crate::coordinator::race_points::reach(
-                crate::coordinator::race_points::RacePoint::DirectQueueLock,
-            );
-            let mut state = queue.lock();
-            // The latch is checked under the queue lock, and a failed
-            // write sets it before it drops the queue under the same lock.
-            // So an entry either is queued first and dropped, or is
-            // rejected here.
-            if self.inner.coordinator.write_failed() {
-                return (SubmittedWrite::rejected(), None);
-            }
-            let id = state.next_id;
-            state.next_id = state.next_id.wrapping_add(1);
-            state.entries.push_back(DirectEntry {
-                id,
-                held,
-                ctx: self.clone(),
-                updates,
-                events,
-                permit,
-                refresh_id,
-                sender,
-            });
-            let start_writer = !state.writer_running;
-            state.writer_running = true;
-            (id, start_writer)
-        };
-        let mut queued = Some(id);
-        if start_writer
-            && let Err(no_runtime) = crate::task::spawn_detached(
-                self.coordinator(),
-                run_direct_writer(Arc::clone(queue)),
-            )
-        {
-            // The source marks the error, so that
-            // `checkpoint_failure_unrecoverable` returns the operation error
-            // `.spawn()` returns instead of failing the invocation.
-            let err = ExecutionClientError::with_source(
-                ExecutionClientErrorScope::Invocation,
-                no_runtime.to_string(),
-                no_runtime,
-            );
-            #[cfg(test)]
-            crate::coordinator::race_points::reach(
-                crate::coordinator::race_points::RacePoint::DirectNoRuntimeDrain,
-            );
-            // The latch is read under the queue lock, as at the entry
-            // above. A failed write sets it before it drops the queue under
-            // the same lock, so either the failure comes first and the
-            // drained entries are dropped unresolved, as the failure would
-            // drop them, or the drain comes first and the failure finds an
-            // empty queue.
-            let (drained, write_failed) = {
-                let mut state = queue.lock();
-                state.writer_running = false;
-                (
-                    std::mem::take(&mut state.entries),
-                    self.inner.coordinator.write_failed(),
-                )
-            };
-            if !write_failed {
-                for entry in drained {
-                    // The receivers are this call's and those of callers
-                    // that queued behind it on a thread without a runtime.
-                    let _ = entry.sender.send(Some(Err(err.clone())));
-                }
-            }
-            queued = None;
-        }
-        // The writer is never aborted, so the sender is dropped unsent only
-        // when the checkpoint client panicked, or when a withdrawn
-        // checkpoint token or a failed write dropped the queued entry. The
-        // gateway recorded the panic, a withdrawal suspends the
-        // invocation, and a failed write ends the drive, so the caller
-        // stays pending until the cleanup cancels it.
-        let write = SubmittedWrite::new(async move {
-            match receiver.await {
-                Ok(Some(result)) => result,
-                Ok(None) | Err(_) => std::future::pending().await,
-            }
-        });
-        (write, queued)
     }
 
     /// Spawns a task that claims `batch` (if it is still the open batch)
@@ -2693,16 +2305,15 @@ impl DurableContext {
     /// finish before returning.
     ///
     /// This is the "suspension" and "execution completion" flush point of
-    /// the [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay) /
-    /// [`checkpoint_batching`](crate::OptionsBuilder::checkpoint_batching)
+    /// the [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay)
     /// contract: the invocation wrapper calls it after the driver settles,
     /// before reporting `PENDING`, `SUCCEEDED`, or `FAILED` to the service,
     /// so a checkpoint that must land before the invocation ends is never
     /// held back by the buffer. Because every claimed batch is written while
     /// holding the coalescer's writer lock, acquiring that lock here makes
     /// this a true barrier: a batch a delay timer already claimed cannot
-    /// still be in flight when this returns. A no-op when no buffering is
-    /// configured or the buffer is idle.
+    /// still be in flight when this returns. A no-op when the buffer is
+    /// idle.
     ///
     /// A write that sends nothing or fails stops the drain: the checkpoint
     /// token was withdrawn, or this write or an earlier one failed, and
@@ -2711,9 +2322,7 @@ impl DurableContext {
     /// resolve, and the rest of the buffer was dropped with the queued
     /// writes.
     pub(crate) async fn flush_pending_checkpoints(&self) {
-        let Some(coalescer) = self.inner.coalescer.clone() else {
-            return;
-        };
+        let coalescer = &self.inner.coalescer;
         // Acquiring the writer lock waits out any in-flight batch write
         // (batches are only claimed and written under it), then holding it
         // across the drain keeps this flush ordered after those writes.
@@ -2730,58 +2339,42 @@ impl DurableContext {
         }
     }
 
-    /// Writes operation updates through the execution client immediately.
-    ///
-    /// Serializes all concurrent callers through a single critical section:
-    /// the lock is held across the full read-token → API-call →
-    /// rotate-token sequence, and, when the response carries a pagination
-    /// marker, through the follow-up `get_state` fetch as well, so no
-    /// concurrent branch can rotate the token out from under the paginated
-    /// state read.
-    ///
-    /// The write is admitted (see [`Admission`]) and runs on a detached
-    /// task (see [`Self::write_direct_detached`]).
+    /// Writes operation updates through the coalescer as an urgent write,
+    /// and delivers the change sets on the caller's task once the flush task
+    /// returned the result.
     #[cfg(test)]
     pub(crate) async fn checkpoint_updates_direct(
         &self,
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
-        let Some(permit) = self.inner.coordinator.acquire(PermitKind::Checkpoint) else {
-            // The phase left `Running`, the checkpoint token was withdrawn,
-            // or a fatal error is recorded: the write is rejected, as a
-            // write from an abandoned owner is.
-            return std::future::pending().await;
-        };
-        let result = self
-            .write_direct_detached(updates, Vec::new(), Some(permit), None)
-            .await;
-        // The detached write task merged the response and dropped the
-        // token guard, so the caller's task delivers the change sets.
+        let result = self.submit_checkpoint_updates_urgent(updates).await;
         self.report_operation_changes().await;
         result
     }
 
-    /// A direct write after the drive ended, when no permit can be taken.
+    /// A write after the drive ended, when no checkpoint permit can be
+    /// taken: the execution's own update for an oversized result.
     ///
     /// The drive's cleanup waited for every SDK task, so the write runs on
-    /// the caller's task, under the checkpoint-token lock. It returns its
-    /// result to the caller at once: [`WriteError::Stopped`] when the token
-    /// is or becomes withdrawn, or when a write failed before, and
-    /// [`WriteError::Failed`] when it fails itself.
+    /// the caller's task. It takes the coalescer's writer lock and writes
+    /// its updates as a drained batch is written, in requests cut to the
+    /// coalescer's limits, and its updates emit no lifecycle event. It
+    /// returns its result to the caller at once: [`WriteError::Stopped`]
+    /// when the token is or becomes withdrawn, or when a write failed
+    /// before, and [`WriteError::Failed`] when it fails itself.
     pub(crate) async fn checkpoint_updates_after_drive(
         &self,
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, WriteError> {
-        #[expect(clippy::expect_used)]
-        // reason: the root context's owners are empty, so the admission
-        // check never rejects the write, and it always returns a result.
-        self.checkpoint_direct_with_events(updates, &[], Some(self.owners()), None)
+        let coalescer = &self.inner.coalescer;
+        let _writer = coalescer.writer_lock().lock().await;
+        let tracked = updates.into_iter().map(TrackedUpdate::untracked).collect();
+        self.write_batched_updates(tracked, coalescer.limits(), None)
             .await
-            .expect("a write from the root context is never rejected")
     }
 
-    /// Body of [`Self::checkpoint_updates_direct`] that additionally owns
-    /// the lifecycle events paired with the updates. Each event is emitted
+    /// Writes one request-sized chunk of a batch and owns the lifecycle
+    /// events paired with its updates. Each event is emitted
     /// the moment `client.checkpoint` returns success, the point at which
     /// the service has durably recorded the transitions, and **before**
     /// the pagination hydration below, which can fail after the write
@@ -2789,11 +2382,9 @@ impl DurableContext {
     /// was recorded: a rejected write emits nothing, and a persisted write
     /// emits everything even when the follow-up `get_state` fetch fails.
     ///
-    /// With `Some(owners)`, the write is admitted while this call holds the
-    /// checkpoint-token lock. A rejected write sends nothing, emits no
-    /// event, does not rotate the token, and returns `None`. `None` skips
-    /// the check: the batch flusher passes it, because its updates were
-    /// admitted when they joined the buffer.
+    /// It runs no admission check. The batch flusher's updates were
+    /// admitted when they joined the buffer, and a write after the drive
+    /// comes from the root context, which no scope encloses.
     ///
     /// After the checkpoint token was withdrawn (see
     /// [`InvocationCoordinator::withdraw`]), or after a failed write, the
@@ -2809,9 +2400,10 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
-        owners: Option<&[String]>,
         refresh_id: Option<&str>,
-    ) -> Option<Result<CheckpointOutput, WriteError>> {
+    ) -> Result<CheckpointOutput, WriteError> {
+        #[cfg(test)]
+        self.pass_gate(&updates).await;
         let failure_id = updates
             .first()
             .map(|update| update.id().to_owned())
@@ -2822,13 +2414,10 @@ impl DurableContext {
         // equivalent of Go's sync.Mutex held across the blocking API call
         // in checkpointer.checkpoint().
         let token_guard = self.inner.checkpoint_token.lock().await;
-        if owners.is_some_and(|owners| !self.admission().admits(owners)) {
-            return None;
-        }
         // Both latches are set under this lock, so a request that waited
         // for the lock behind the withdrawn or failed one sees them here.
         if self.inner.coordinator.withdrawn() || self.inner.coordinator.write_failed() {
-            return Some(Err(WriteError::Stopped));
+            return Err(WriteError::Stopped);
         }
         let Some(client) = self.inner.execution_client.as_ref() else {
             // Recorded under the checkpoint-token lock, as a failed call
@@ -2836,12 +2425,10 @@ impl DurableContext {
             let err = ExecutionClientError::new_non_retryable("no execution client configured");
             self.record_write_failure(&failure_id, &err);
             drop(token_guard);
-            return Some(Err(WriteError::Failed(err)));
+            return Err(WriteError::Failed(err));
         };
-        Some(
-            self.write_locked(client, token_guard, updates, events, &failure_id)
-                .await,
-        )
+        self.write_locked(client, token_guard, updates, events, &failure_id)
+            .await
     }
 
     /// The write of [`Self::checkpoint_direct_with_events`], with the
@@ -2986,20 +2573,12 @@ impl DurableContext {
     }
 
     /// Drops every queued checkpoint write without resolving its caller:
-    /// the entries of the [`DirectWriteQueue`] and the coalescer's open
-    /// batch. Their permits are released after the queue locks are
-    /// released. The withdrawal of the checkpoint token and a failed write
-    /// call it (see [`InvocationCoordinator::withdraw`] and
+    /// the coalescer's open batch. Its permits are released after the
+    /// buffer lock is released. The withdrawal of the checkpoint token and
+    /// a failed write call it (see [`InvocationCoordinator::withdraw`] and
     /// [`InvocationCoordinator::fail_write`]).
     fn abandon_queued_writes(&self) {
-        let direct = self.inner.direct.abandon_queued();
-        let batch = self
-            .inner
-            .coalescer
-            .as_ref()
-            .map(|coalescer| coalescer.abandon_pending());
-        drop(direct);
-        drop(batch);
+        drop(self.inner.coalescer.abandon_pending());
     }
 
     /// Adds the changes of one merge to `change_set`: the wire IDs in
@@ -4450,7 +4029,7 @@ fn format_op_identity(op_type: &str, sub_type: Option<&str>, name: Option<&str>)
     s
 }
 
-/// The value an operation returns when its direct checkpoint write found
+/// The value an operation returns when its checkpoint write found
 /// no Tokio runtime (see `DurableContext::checkpoint_failure_unrecoverable`).
 pub(crate) trait NoRuntimeOutcome {
     /// The outcome for `no_runtime`.
@@ -4979,14 +4558,16 @@ mod tests {
             "token-0".to_owned(),
         );
 
-        // Race several concurrent checkpoint_updates calls, each of which
-        // paginates. Every one must succeed (no stale checkpoint token) and
-        // every get_state must observe the then-current token.
+        // Race several concurrent writes, each of which paginates. Every
+        // one must succeed (no stale checkpoint token) and every get_state
+        // must observe the then-current token. The batch writer sends one
+        // request at a time, so the race calls `write_unchecked`, which
+        // takes the token lock directly.
         let (r1, r2, r3, r4) = tokio::join!(
-            ctx.checkpoint_updates(Vec::new()),
-            ctx.checkpoint_updates(Vec::new()),
-            ctx.checkpoint_updates(Vec::new()),
-            ctx.checkpoint_updates(Vec::new()),
+            ctx.write_unchecked(Vec::new(), &[], None),
+            ctx.write_unchecked(Vec::new(), &[], None),
+            ctx.write_unchecked(Vec::new(), &[], None),
+            ctx.write_unchecked(Vec::new(), &[], None),
         );
         assert!(r1.is_ok(), "checkpoint 1 failed: {r1:?}");
         assert!(r2.is_ok(), "checkpoint 2 failed: {r2:?}");
@@ -5015,6 +4596,32 @@ mod tests {
             "the marker-triggered get_state must run with the current token \
              (token lock held through the paginated fetch)"
         );
+    }
+
+    /// The write after the drive goes through the batch writer: 251 updates
+    /// go out in two requests, in their order.
+    #[tokio::test]
+    async fn checkpoint_updates_after_drive_uses_batch_limits() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+        );
+        let ids: Vec<String> = (0..251).map(|n| format!("op-{n}")).collect();
+        let updates = ids.iter().map(|id| make_update(id)).collect();
+        ctx.checkpoint_updates_after_drive(updates)
+            .await
+            .expect("the write succeeds");
+        assert_eq!(*client.checkpoint_call_count.lock().unwrap(), 2);
+        let sent: Vec<String> = client
+            .recorded_updates()
+            .iter()
+            .map(|update| update.id().to_owned())
+            .collect();
+        assert_eq!(sent, ids);
     }
 
     /// Tests that `checkpoint_updates` does NOT call `get_state` when there
@@ -6078,7 +5685,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             Arc::new(InMemoryExecutionClient::new(Vec::new())),
             "token-0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             Some(Arc::clone(&plugins)),
         );
@@ -6114,7 +5721,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             client,
             "token-0".to_owned(),
-            Some(delay),
+            delay,
             0,
             None,
         )
@@ -6159,7 +5766,7 @@ mod tests {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let ctx = coalescing_ctx(client.clone(), Duration::from_secs(60));
         let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
-            let coalescer = Arc::clone(ctx.inner.coalescer.as_ref().expect("buffered"));
+            let coalescer = Arc::clone(&ctx.inner.coalescer);
             let (batch, _) = coalescer
                 .join(
                     ctx.admission(),
@@ -6264,7 +5871,7 @@ mod tests {
     }
 
     /// Without a configured delay, `checkpoint_updates` writes immediately:
-    /// one call per checkpoint, exactly the pre-knob behavior.
+    /// one call per checkpoint when each write is awaited before the next.
     #[tokio::test(start_paused = true)]
     async fn no_delay_checkpoints_write_immediately() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
@@ -6630,7 +6237,7 @@ mod tests {
         );
     }
 
-    /// Pure batching mode (zero window): checkpoints arriving while an
+    /// The default zero window: checkpoints arriving while an
     /// earlier write is in flight batch into ONE follow-up call, and no
     /// artificial delay is added anywhere.
     #[tokio::test(start_paused = true)]
@@ -7109,12 +6716,8 @@ mod tests {
     /// never resolves, so these awaits time out.
     const ADMISSION_BOUND: Duration = Duration::from_secs(1);
 
-    /// A root context with batching on (`Some(Duration::ZERO)`), a
-    /// coalescing delay, or no buffering (`None`).
-    fn admission_root(
-        client: &Arc<InMemoryExecutionClient>,
-        window: Option<Duration>,
-    ) -> DurableContext {
+    /// A root context with the coalescing window `window`.
+    fn admission_root(client: &Arc<InMemoryExecutionClient>, window: Duration) -> DurableContext {
         DurableContext::new_root_with_client_and_defaults(
             "arn:test".to_owned(),
             lambda_runtime::Context::default(),
@@ -7136,11 +6739,12 @@ mod tests {
             .collect()
     }
 
-    /// Writes `id` from `item` after abandoning it, and asserts that the
-    /// write never resolves and that nothing is recorded.
-    async fn assert_abandoned_write_not_sent(window: Option<Duration>) {
+    /// A write from an abandoned item never resolves, and nothing is
+    /// recorded.
+    #[tokio::test]
+    async fn abandoned_owner_update_is_not_sent() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let root = admission_root(&client, window);
+        let root = admission_root(&client, Duration::ZERO);
         let item = root.new_child("1", None);
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
@@ -7154,37 +6758,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abandoned_owner_update_is_not_sent_buffered() {
-        assert_abandoned_write_not_sent(Some(Duration::ZERO)).await;
-    }
-
-    #[tokio::test]
-    async fn abandoned_owner_update_is_not_sent_direct() {
-        assert_abandoned_write_not_sent(None).await;
-    }
-
-    #[tokio::test]
-    async fn abandoned_owner_direct_write_is_rejected() {
-        // Batching is on, but `checkpoint_updates_direct` skips the buffer.
-        // So this rejection comes from the check under the token lock.
-        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let root = admission_root(&client, Some(Duration::ZERO));
-        let item = root.new_child("1", None);
-        root.admission()
-            .abandon(item.owners().iter().map(String::as_str));
-        let written = tokio::time::timeout(
-            ADMISSION_BOUND,
-            item.checkpoint_updates_direct(vec![make_update("u")]),
-        )
-        .await;
-        assert!(written.is_err(), "a rejected direct write never resolves");
-        assert!(client.recorded_updates().is_empty(), "nothing is sent");
-    }
-
-    #[tokio::test]
     async fn nested_owner_follows_its_outer_item() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let root = admission_root(&client, Some(Duration::ZERO));
+        let root = admission_root(&client, Duration::ZERO);
         let item = root.new_child("1", None);
         let inner = item.new_child("1-1", None);
         assert_eq!(
@@ -7209,7 +6785,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn admitted_update_precedes_parent_final_update() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let root = admission_root(&client, Some(Duration::from_millis(50)));
+        let root = admission_root(&client, Duration::from_millis(50));
         let item = root.new_child("1", None);
         let writer = tokio::spawn({
             let item = item.clone();
@@ -7217,7 +6793,7 @@ mod tests {
         });
         // Yield until `a` is buffered. The delay window holds it there, so
         // it is admitted but not yet sent when the item is abandoned.
-        let coalescer = Arc::clone(root.inner.coalescer.as_ref().expect("buffering is on"));
+        let coalescer = Arc::clone(&root.inner.coalescer);
         let mut yields = 0;
         while coalescer.pending_len() == 0 {
             assert!(yields < 1_000, "the item update was never buffered");
@@ -7310,7 +6886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_direct_write_survives_cancelled_caller() {
+    async fn admitted_write_survives_cancelled_caller() {
         let client = Arc::new(TokenGateClient::default());
         let root = DurableContext::new_root_with_client_and_defaults(
             "arn:test".to_owned(),
@@ -7318,7 +6894,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             None,
         );
@@ -7360,7 +6936,7 @@ mod tests {
     #[tokio::test]
     async fn abandoned_owner_starts_no_operation() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let root = admission_root(&client, Some(Duration::ZERO));
+        let root = admission_root(&client, Duration::ZERO);
         let item = root.new_child("1", None);
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
@@ -7423,7 +6999,7 @@ mod tests {
             Arc::new(log),
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
-            Some(Duration::ZERO),
+            Duration::ZERO,
             0,
             None,
         );
@@ -7486,7 +7062,7 @@ mod tests {
                 Arc::new(log),
                 Arc::clone(&client) as Arc<dyn ExecutionClient>,
                 "token-0".to_owned(),
-                Some(Duration::ZERO),
+                Duration::ZERO,
                 0,
                 None,
             );
@@ -7568,7 +7144,7 @@ mod tests {
             Arc::clone(&log),
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
-            Some(Duration::ZERO),
+            Duration::ZERO,
             0,
             None,
         );
@@ -7600,27 +7176,25 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_owner_writes_as_before() {
-        for window in [Some(Duration::ZERO), None] {
-            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-            let root = admission_root(&client, window);
-            let item = root.new_child("1", None);
-            tokio::time::timeout(
-                ADMISSION_BOUND,
-                item.checkpoint_updates(vec![make_update("u")]),
-            )
-            .await
-            .expect("the write resolves")
-            .expect("the write succeeds");
-            assert_eq!(recorded_ids(&client), ["u"], "window {window:?}");
-        }
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let root = admission_root(&client, Duration::ZERO);
+        let item = root.new_child("1", None);
+        tokio::time::timeout(
+            ADMISSION_BOUND,
+            item.checkpoint_updates(vec![make_update("u")]),
+        )
+        .await
+        .expect("the write resolves")
+        .expect("the write succeeds");
+        assert_eq!(recorded_ids(&client), ["u"]);
     }
 
-    /// Without a Tokio runtime a direct write cannot start its task. The
+    /// Without a Tokio runtime a write cannot start its task. The
     /// caller gets the no-runtime error at once, and nothing is sent.
     #[test]
-    fn direct_write_without_runtime_returns_invocation_error() {
+    fn write_without_runtime_returns_invocation_error() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let ctx = admission_root(&client, None);
+        let ctx = admission_root(&client, Duration::ZERO);
         let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
             ctx.checkpoint_updates(vec![make_update("u")]).await
         });
@@ -7640,7 +7214,7 @@ mod tests {
         assert!(client.recorded_updates().is_empty(), "nothing is sent");
     }
 
-    /// An operation whose direct write finds no Tokio runtime returns the
+    /// An operation whose write finds no Tokio runtime returns the
     /// error `.spawn()` returns without a runtime, at once. Nothing is
     /// sent, and no invocation fault is recorded.
     #[test]
@@ -7649,7 +7223,7 @@ mod tests {
         let thread_client = Arc::clone(&client);
         // The context is built on the polling thread, so that thread owns it.
         let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
-            let ctx = admission_root(&thread_client, None);
+            let ctx = admission_root(&thread_client, Duration::ZERO);
             let signal = Arc::clone(ctx.coordinator());
             (
                 ctx.step(|_| async { Ok(1_u32) }).into_future().await,
@@ -7675,7 +7249,7 @@ mod tests {
         let thread_client = Arc::clone(&client);
         // The context is built on the polling thread, so that thread owns it.
         let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
-            let ctx = admission_root(&thread_client, Some(Duration::ZERO));
+            let ctx = admission_root(&thread_client, Duration::ZERO);
             (ctx.step(|_| async { Ok(1_u32) }).into_future().await, ctx)
         });
         let std::task::Poll::Ready((Err(err), ctx)) = polled else {
@@ -7703,79 +7277,71 @@ mod tests {
         assert!(ctx.coordinator().fatal_error().is_none());
     }
 
-    /// After a failed write, a write on a thread without a Tokio runtime,
-    /// direct or buffered, is rejected before its writer is spawned: it
-    /// never resolves, and nothing is sent.
+    /// After a failed write, a write on a thread without a Tokio runtime is
+    /// rejected before its flusher is spawned: it never resolves, and
+    /// nothing is sent.
     #[test]
     fn write_after_failure_without_runtime_never_resolves() {
-        for window in [None, Some(Duration::ZERO)] {
-            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-            let thread_client = Arc::clone(&client);
-            let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
-                let ctx = admission_root(&thread_client, window);
-                ctx.coordinator().fail_write(
-                    FatalError {
-                        error_type: "Failed".to_owned(),
-                        error_message: "failed".to_owned(),
-                        severity: FatalSeverity::FailExecution,
-                    },
-                    || {},
-                );
-                ctx.checkpoint_updates(vec![make_update("u")]).await
-            });
-            assert!(polled.is_pending(), "window {window:?}: {polled:?}");
-            assert!(client.recorded_updates().is_empty(), "window {window:?}");
-        }
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let thread_client = Arc::clone(&client);
+        let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
+            let ctx = admission_root(&thread_client, Duration::ZERO);
+            ctx.coordinator().fail_write(
+                FatalError {
+                    error_type: "Failed".to_owned(),
+                    error_message: "failed".to_owned(),
+                    severity: FatalSeverity::FailExecution,
+                },
+                || {},
+            );
+            ctx.checkpoint_updates(vec![make_update("u")]).await
+        });
+        assert!(polled.is_pending(), "{polled:?}");
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
     }
 
-    /// A write on a thread without a Tokio runtime, direct or buffered,
-    /// whose writer cannot be spawned, meets a failed write after it
-    /// entered its queue and before it hands out the `NoRuntime` error: the
-    /// thread sets the latch when it reaches that point, and the failure
-    /// does not drop the queue. The failure came first, so the write is
+    /// A write on a thread without a Tokio runtime, whose flusher cannot be
+    /// spawned, meets a failed write after it joined the batch and before
+    /// it hands out the `NoRuntime` error: the thread sets the latch when it
+    /// reaches that point, and the failure does not drop the batch. The failure came first, so the write is
     /// dropped unresolved, as the failure drops every queued write, and
     /// nothing is sent.
     #[test]
     fn no_runtime_error_after_a_failed_write_is_not_published() {
         use crate::coordinator::race_points::{self, RacePoint};
-        for (window, point) in [
-            (None, RacePoint::DirectNoRuntimeDrain),
-            (Some(Duration::ZERO), RacePoint::BatchNoRuntimeClaim),
-        ] {
-            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-            let thread_client = Arc::clone(&client);
-            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let thread_fired = Arc::clone(&fired);
-            let polled = crate::task::test_support::poll_once_without_runtime(move || {
-                let ctx = admission_root(&thread_client, window);
-                let failing = ctx.clone();
-                race_points::set(move |reached| {
-                    if reached == point {
-                        thread_fired.store(true, std::sync::atomic::Ordering::SeqCst);
-                        failing.coordinator().fail_write(
-                            FatalError {
-                                error_type: "Failed".to_owned(),
-                                error_message: "failed".to_owned(),
-                                severity: FatalSeverity::FailExecution,
-                            },
-                            || {},
-                        );
-                    }
-                });
-                async move { ctx.checkpoint_updates(vec![make_update("u")]).await }
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let thread_client = Arc::clone(&client);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_fired = Arc::clone(&fired);
+        let polled = crate::task::test_support::poll_once_without_runtime(move || {
+            let ctx = admission_root(&thread_client, Duration::ZERO);
+            let failing = ctx.clone();
+            race_points::set(move |reached| {
+                if reached == RacePoint::BatchNoRuntimeClaim {
+                    thread_fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    failing.coordinator().fail_write(
+                        FatalError {
+                            error_type: "Failed".to_owned(),
+                            error_message: "failed".to_owned(),
+                            severity: FatalSeverity::FailExecution,
+                        },
+                        || {},
+                    );
+                }
             });
-            assert!(
-                fired.load(std::sync::atomic::Ordering::SeqCst),
-                "window {window:?}: the point is reached"
-            );
-            assert!(polled.is_pending(), "window {window:?}: {polled:?}");
-            assert!(client.recorded_updates().is_empty(), "window {window:?}");
-        }
+            async move { ctx.checkpoint_updates(vec![make_update("u")]).await }
+        });
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the point is reached"
+        );
+        assert!(polled.is_pending(), "{polled:?}");
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
     }
 
     /// A replayed `Started` child skips its START write, so its body runs
-    /// and its first write is the terminal `FAIL`. When that direct write
-    /// finds no Tokio runtime, the child returns the error `.spawn()`
+    /// and its first write is the terminal `FAIL`. When that write finds
+    /// no Tokio runtime, the child returns the error `.spawn()`
     /// returns without a runtime. Nothing is sent, and no invocation fault
     /// is recorded.
     #[test]
@@ -7815,7 +7381,7 @@ mod tests {
                 Arc::new(CheckpointLog::from_records(vec![(wire, record)])),
                 thread_client as Arc<dyn ExecutionClient>,
                 "token-0".to_owned(),
-                None,
+                Duration::ZERO,
                 0,
                 None,
             );
@@ -7869,10 +7435,10 @@ mod tests {
         }
     }
 
-    /// Writes one update directly through `client`, and returns the
-    /// coordinator's kept panic after the write task stopped. The caller
-    /// must stay pending: the write channel carries no panic payload.
-    async fn direct_write_kept_panic(
+    /// Writes one update through `client`, and returns the coordinator's
+    /// kept panic after the flush task stopped. The caller must stay
+    /// pending: the batch is never published.
+    async fn write_kept_panic(
         client: Arc<dyn ExecutionClient>,
     ) -> Box<dyn std::any::Any + Send + 'static> {
         let root = DurableContext::new_root_with_client_and_defaults(
@@ -7881,7 +7447,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             client,
             "token-0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             None,
         );
@@ -7972,12 +7538,12 @@ mod tests {
         }
     }
 
-    /// The caller of a direct write is dropped before the write returns,
+    /// The caller of a write is dropped before the write returns,
     /// and the write fails. The write task drops the client's error, and
     /// the task gateway records the panic of its destructor on the
     /// coordinator.
     #[tokio::test]
-    async fn unread_direct_write_result_drop_panic_is_recorded() {
+    async fn unread_write_result_drop_panic_is_recorded() {
         let client = Arc::new(GatedFailingClient {
             release: tokio::sync::Notify::new(),
         });
@@ -7987,7 +7553,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
-            None,
+            Duration::ZERO,
             0,
             None,
         );
@@ -8010,12 +7576,12 @@ mod tests {
         );
     }
 
-    /// A panic of the checkpoint client in a direct write's task is kept
+    /// A panic of the checkpoint client in a write's task is kept
     /// by the coordinator with its original payload, and the caller stays
     /// pending.
     #[tokio::test]
-    async fn direct_write_panic_is_recorded_and_caller_stays_pending() {
-        let payload = direct_write_kept_panic(Arc::new(PanickingClient)).await;
+    async fn write_panic_is_recorded_and_caller_stays_pending() {
+        let payload = write_kept_panic(Arc::new(PanickingClient)).await;
         assert_eq!(
             crate::task::test_support::str_payload(payload.as_ref()),
             Some("boom in checkpoint")
@@ -8083,10 +7649,10 @@ mod tests {
 
     /// A panic from the destructor of a checkpoint future that returned
     /// `Ready` is kept by the coordinator with its original payload, and the
-    /// caller of the direct write stays pending.
+    /// caller of the write stays pending.
     #[tokio::test]
-    async fn direct_write_drop_panic_is_recorded_and_caller_stays_pending() {
-        let payload = direct_write_kept_panic(Arc::new(DropPanickingClient)).await;
+    async fn write_drop_panic_is_recorded_and_caller_stays_pending() {
+        let payload = write_kept_panic(Arc::new(DropPanickingClient)).await;
         assert_eq!(
             crate::task::test_support::str_payload(payload.as_ref()),
             Some("boom in checkpoint drop")
@@ -8096,7 +7662,7 @@ mod tests {
     #[tokio::test]
     async fn child_context_owner_covers_its_descendants() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let root = admission_root(&client, Some(Duration::ZERO));
+        let root = admission_root(&client, Duration::ZERO);
         let child = root.new_child("1", None);
         root.admission()
             .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
@@ -8121,7 +7687,7 @@ mod tests {
         use aws_sdk_lambda::types::OperationAction;
 
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let root = admission_root(&client, Some(Duration::ZERO));
+        let root = admission_root(&client, Duration::ZERO);
         let slot: Arc<std::sync::Mutex<Option<DurableFuture<u32>>>> =
             Arc::new(std::sync::Mutex::new(None));
         let release = Arc::new(tokio::sync::Notify::new());
@@ -8421,7 +7987,7 @@ mod coordinator_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn direct_write_holds_token_lock_through_response_merge() {
+    async fn write_holds_token_lock_through_response_merge() {
         let gate = Arc::new(tokio::sync::Notify::new());
         let ctx_slot: Arc<std::sync::OnceLock<DurableContext>> =
             Arc::new(std::sync::OnceLock::new());
@@ -8509,7 +8075,7 @@ mod coordinator_tests {
     }
 
     #[tokio::test]
-    async fn direct_write_after_suspension_is_rejected() {
+    async fn write_after_suspension_is_rejected() {
         let client = Arc::new(ScriptedClient::empty());
         let ctx = ctx_with(Arc::new(CheckpointLog::empty()), &client);
         ctx.coordinator().finish();
@@ -8666,7 +8232,7 @@ mod coordinator_tests {
     }
 }
 
-/// The write order of unbuffered submissions and of reserved writes.
+/// The write order of submissions and of reserved writes.
 #[cfg(test)]
 // The tests submit from a task on a runtime worker, which needs a spawn.
 #[expect(clippy::disallowed_methods)]
@@ -8692,9 +8258,8 @@ mod write_order_tests {
             .expect("all required OperationUpdate fields set")
     }
 
-    /// A root context over `client`, with the coalescer `window` (`None`:
-    /// no coalescer, so every write is direct).
-    fn context(client: &Arc<InMemoryExecutionClient>, window: Option<Duration>) -> DurableContext {
+    /// A root context over `client`, with the coalescer `window`.
+    fn context(client: &Arc<InMemoryExecutionClient>, window: Duration) -> DurableContext {
         DurableContext::new_root_with_client_and_defaults(
             "arn:test".to_owned(),
             lambda_runtime::Context::default(),
@@ -8716,9 +8281,9 @@ mod write_order_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn unbuffered_submissions_reach_client_in_submission_order() {
+    async fn submissions_reach_client_in_submission_order() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let ctx = context(&client, None);
+        let ctx = context(&client, Duration::ZERO);
         tokio::spawn(async move {
             let a = ctx.submit_checkpoint_updates(vec![start("A")]);
             let b = ctx.submit_checkpoint_updates(vec![start("B")]);
@@ -8731,9 +8296,9 @@ mod write_order_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn child_and_root_unbuffered_submissions_share_fifo() {
+    async fn child_and_root_submissions_share_write_order() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let root = context(&client, None);
+        let root = context(&client, Duration::ZERO);
         let hold_a = Arc::new(tokio::sync::Notify::new());
         let gate_notify = Arc::clone(&hold_a);
         root.set_pre_lock_gate(Arc::new(move |updates: &[OperationUpdate]| {
@@ -8762,49 +8327,45 @@ mod write_order_tests {
 
     #[tokio::test]
     async fn dropping_reserved_write_releases_in_order() {
-        for window in [None, Some(Duration::ZERO)] {
-            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-            let ctx = context(&client, window);
-            let a = ctx.reserve_checkpoint_updates(vec![start("A")]);
-            let b = ctx.submit_checkpoint_updates(vec![start("B")]);
-            drop(a);
-            tokio::time::timeout(Duration::from_secs(2), b)
-                .await
-                .map_err(|_| format!("B is blocked behind the dropped A ({window:?})"))
-                .unwrap()
-                .expect("B is written");
-            assert_eq!(ids(&client), ["A", "B"], "{window:?}");
-        }
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = context(&client, Duration::ZERO);
+        let a = ctx.reserve_checkpoint_updates(vec![start("A")]);
+        let b = ctx.submit_checkpoint_updates(vec![start("B")]);
+        drop(a);
+        tokio::time::timeout(Duration::from_secs(2), b)
+            .await
+            .map_err(|_| "B is blocked behind the dropped A")
+            .unwrap()
+            .expect("B is written");
+        assert_eq!(ids(&client), ["A", "B"]);
     }
 
     /// A released reservation is written in its place: before a write
     /// submitted after it, and only once released.
     #[tokio::test]
     async fn released_reservation_is_written_before_later_submissions() {
-        for window in [None, Some(Duration::ZERO)] {
-            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-            let ctx = context(&client, window);
-            let a = ctx.reserve_checkpoint_updates(vec![start("A")]);
-            let b = ctx.submit_checkpoint_updates(vec![start("B")]);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert!(
-                client.recorded_updates().is_empty(),
-                "nothing is sent while A is held ({window:?})"
-            );
-            let a = a.release();
-            a.await.expect("A is written");
-            b.await.expect("B is written");
-            assert_eq!(ids(&client), ["A", "B"], "{window:?}");
-        }
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = context(&client, Duration::ZERO);
+        let a = ctx.reserve_checkpoint_updates(vec![start("A")]);
+        let b = ctx.submit_checkpoint_updates(vec![start("B")]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            client.recorded_updates().is_empty(),
+            "nothing is sent while A is held"
+        );
+        let a = a.release();
+        a.await.expect("A is written");
+        b.await.expect("B is written");
+        assert_eq!(ids(&client), ["A", "B"]);
     }
 
     /// A fatal record refuses a later update, and does not drop one that
-    /// was admitted before it: with no coalescer, a zero window and a 60 s
-    /// window, `A` is written and resolves, and `B` is never written and
+    /// was admitted before it: with a zero window and a 60 s window, `A`
+    /// is written and resolves, and `B` is never written and
     /// never resolves.
     #[tokio::test]
     async fn fatal_record_keeps_admitted_writes() {
-        for window in [None, Some(Duration::ZERO), Some(Duration::from_secs(60))] {
+        for window in [Duration::ZERO, Duration::from_secs(60)] {
             let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
             let ctx = context(&client, window);
             let a = ctx.submit_checkpoint_updates(vec![start("A")]);
@@ -8832,23 +8393,21 @@ mod write_order_tests {
     /// nothing, sends nothing, and never resolves.
     #[tokio::test]
     async fn rejected_reservation_sends_nothing() {
-        for window in [None, Some(Duration::ZERO)] {
-            // The phase left `Running`: the coordinator refuses the permit.
-            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-            let ctx = context(&client, window);
-            ctx.coordinator().finish();
-            let write = ctx.reserve_checkpoint_updates(vec![start("A")]).release();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), write)
-                    .await
-                    .is_err(),
-                "a refused reservation never resolves ({window:?})"
-            );
-            assert!(client.recorded_updates().is_empty(), "{window:?}");
-        }
+        // The phase left `Running`: the coordinator refuses the permit.
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = context(&client, Duration::ZERO);
+        ctx.coordinator().finish();
+        let write = ctx.reserve_checkpoint_updates(vec![start("A")]).release();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), write)
+                .await
+                .is_err(),
+            "a refused reservation never resolves"
+        );
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
         // An abandoned owner: the batch join is rejected.
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let root = context(&client, Some(Duration::ZERO));
+        let root = context(&client, Duration::ZERO);
         let child = root.new_child("1", None);
         root.admission()
             .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
@@ -8903,10 +8462,10 @@ mod write_order_tests {
         }
     }
 
-    /// A checkpoint client panic unwinds the direct writer. The next write
-    /// starts a new writer, so it is still sent.
+    /// A checkpoint client panic unwinds the batch flusher. The next write
+    /// starts a new flusher, so it is still sent.
     #[tokio::test]
-    async fn write_after_writer_panic_starts_a_new_writer() {
+    async fn write_after_flusher_panic_is_sent() {
         let client = Arc::new(PanicsOnA::default());
         let ctx = DurableContext::new_root_with_client(
             "arn:test".to_owned(),
@@ -8968,7 +8527,7 @@ mod change_hook_tests {
     fn ctx_on(
         client: Arc<dyn ExecutionClient>,
         log: Arc<CheckpointLog>,
-        window: Option<Duration>,
+        window: Duration,
         plugins: Arc<InvocationPlugins>,
     ) -> DurableContext {
         DurableContext::new_root_with_client_and_defaults(
@@ -9024,108 +8583,101 @@ mod change_hook_tests {
     }
 
     /// The change hook runs with the token mutex and the coalescer's writer
-    /// lock free, with and without batching.
+    /// lock free.
     #[tokio::test]
     async fn change_hook_runs_outside_locks() {
-        type Locks = (
-            Arc<tokio::sync::Mutex<String>>,
-            Option<Arc<CheckpointCoalescer>>,
-        );
-        for window in [None, Some(Duration::ZERO)] {
-            let locks: Arc<OnceLock<Locks>> = Arc::default();
-            let free: Arc<Mutex<Vec<(bool, bool)>>> = Arc::default();
-            let mut recorder = Changes::default();
-            {
-                let locks = Arc::clone(&locks);
-                let free = Arc::clone(&free);
-                recorder.on_change = Some(Arc::new(move |_info| {
-                    let (token, coalescer) = locks.get().expect("set before the run");
-                    let token_free = token.try_lock().is_ok();
-                    let writer_free = coalescer
-                        .as_ref()
-                        .is_none_or(|c| c.writer_lock().try_lock().is_ok());
-                    free.lock().unwrap().push((token_free, writer_free));
-                }));
-            }
-            let ctx = ctx_on(
-                echo_client(),
-                Arc::new(CheckpointLog::empty()),
-                window,
-                recorder.plugins(),
-            );
-            locks
-                .set((ctx.checkpoint_token_mutex(), ctx.inner.coalescer.clone()))
-                .map_err(|_| "set twice")
-                .expect("set once");
-            drive_handler(ctx, None, |ctx| async move {
-                ctx.step(|_| async { Ok(1_u32) })
-                    .name("s")
-                    .await
-                    .map(|v| v.to_string())
-                    .map_err(|e| crate::error::WireError::new(None::<String>, Some(e.to_string())))
-            })
-            .await
-            .expect("no panic");
-            let free = free.lock().unwrap().clone();
-            assert!(!free.is_empty(), "window {window:?}: at least one call");
-            assert!(
-                free.iter().all(|&(token, writer)| token && writer),
-                "window {window:?}: {free:?}"
-            );
+        type Locks = (Arc<tokio::sync::Mutex<String>>, Arc<CheckpointCoalescer>);
+        let locks: Arc<OnceLock<Locks>> = Arc::default();
+        let free: Arc<Mutex<Vec<(bool, bool)>>> = Arc::default();
+        let mut recorder = Changes::default();
+        {
+            let locks = Arc::clone(&locks);
+            let free = Arc::clone(&free);
+            recorder.on_change = Some(Arc::new(move |_info| {
+                let (token, coalescer) = locks.get().expect("set before the run");
+                let token_free = token.try_lock().is_ok();
+                let writer_free = coalescer.writer_lock().try_lock().is_ok();
+                free.lock().unwrap().push((token_free, writer_free));
+            }));
         }
+        let ctx = ctx_on(
+            echo_client(),
+            Arc::new(CheckpointLog::empty()),
+            Duration::ZERO,
+            recorder.plugins(),
+        );
+        locks
+            .set((
+                ctx.checkpoint_token_mutex(),
+                Arc::clone(&ctx.inner.coalescer),
+            ))
+            .map_err(|_| "set twice")
+            .expect("set once");
+        drive_handler(ctx, None, |ctx| async move {
+            ctx.step(|_| async { Ok(1_u32) })
+                .name("s")
+                .await
+                .map(|v| v.to_string())
+                .map_err(|e| crate::error::WireError::new(None::<String>, Some(e.to_string())))
+        })
+        .await
+        .expect("no panic");
+        let free = free.lock().unwrap().clone();
+        assert!(!free.is_empty(), "at least one call");
+        assert!(
+            free.iter().all(|&(token, writer)| token && writer),
+            "{free:?}"
+        );
     }
 
     /// The retained `START` write of a default step, which its start step
     /// reserved, delivers the `STARTED` change when the step awaits it: the
-    /// change is reported before the step sends its `SUCCEED`, with and
-    /// without batching.
+    /// change is reported before the step sends its `SUCCEED`.
     #[tokio::test]
     async fn retained_start_write_reports_its_change() {
-        for window in [None, Some(Duration::ZERO)] {
-            let recorder = Changes::default();
-            let seen: Arc<Mutex<Vec<(OperationAction, usize)>>> = Arc::default();
-            let client = {
-                let calls = Arc::clone(&recorder.calls);
-                let seen = Arc::clone(&seen);
-                Arc::new(ScriptedClient::new(move |updates, _history| {
-                    let delivered = calls.lock().unwrap().len();
-                    updates
-                        .iter()
-                        .map(|u| {
-                            seen.lock().unwrap().push((u.action().clone(), delivered));
-                            let status = if u.action() == &OperationAction::Succeed {
-                                WireStatus::Succeeded
-                            } else {
-                                WireStatus::Started
-                            };
-                            operation_like(u, status).build().expect("all fields set")
-                        })
-                        .collect()
-                }))
-            };
-            let ctx = ctx_on(
-                client,
-                Arc::new(CheckpointLog::empty()),
-                window,
-                recorder.plugins(),
-            );
-            drive_handler(ctx, None, |ctx| async move {
-                ctx.step(|_| async { Ok(1_u32) })
-                    .name("s")
-                    .await
-                    .map(|v| v.to_string())
-                    .map_err(|e| crate::error::WireError::new(None::<String>, Some(e.to_string())))
-            })
-            .await
-            .expect("no panic");
-            let seen = seen.lock().unwrap().clone();
-            assert_eq!(
-                seen,
-                [(OperationAction::Start, 0), (OperationAction::Succeed, 1)],
-                "window {window:?}: {:?}",
-                recorder.timeline()
-            );
-        }
+        let recorder = Changes::default();
+        let seen: Arc<Mutex<Vec<(OperationAction, usize)>>> = Arc::default();
+        let client = {
+            let calls = Arc::clone(&recorder.calls);
+            let seen = Arc::clone(&seen);
+            Arc::new(ScriptedClient::new(move |updates, _history| {
+                let delivered = calls.lock().unwrap().len();
+                updates
+                    .iter()
+                    .map(|u| {
+                        seen.lock().unwrap().push((u.action().clone(), delivered));
+                        let status = if u.action() == &OperationAction::Succeed {
+                            WireStatus::Succeeded
+                        } else {
+                            WireStatus::Started
+                        };
+                        operation_like(u, status).build().expect("all fields set")
+                    })
+                    .collect()
+            }))
+        };
+        let ctx = ctx_on(
+            client,
+            Arc::new(CheckpointLog::empty()),
+            Duration::ZERO,
+            recorder.plugins(),
+        );
+        drive_handler(ctx, None, |ctx| async move {
+            ctx.step(|_| async { Ok(1_u32) })
+                .name("s")
+                .await
+                .map(|v| v.to_string())
+                .map_err(|e| crate::error::WireError::new(None::<String>, Some(e.to_string())))
+        })
+        .await
+        .expect("no panic");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [(OperationAction::Start, 0), (OperationAction::Succeed, 1)],
+            "{:?}",
+            recorder.timeline()
+        );
     }
 
     /// A context whose plugin's first change hook, for change set
@@ -9168,7 +8720,7 @@ mod change_hook_tests {
             let ctx = ctx_on(
                 Arc::new(InMemoryExecutionClient::new(Vec::new())),
                 Arc::new(CheckpointLog::empty()),
-                None,
+                Duration::ZERO,
                 recorder.plugins(),
             );
             let entry = |id: &str| {
@@ -9279,7 +8831,7 @@ mod change_hook_tests {
             Arc::new(CheckpointLog::empty()),
             echo_client(),
             "t0".to_owned(),
-            Some(Duration::ZERO),
+            Duration::ZERO,
             0,
             plugins,
         );
@@ -9314,12 +8866,12 @@ mod change_hook_tests {
         assert!(infos > 0, "a plugin's run builds infos");
     }
 
-    /// A direct write delivers its change on the caller's task once the
-    /// detached write task returned the result. A write whose state read
+    /// A write delivers its change on the caller's task once the
+    /// detached flush task returned the result. A write whose state read
     /// failed never resolves, and records the failure: a drain point
     /// delivers its change.
     #[tokio::test]
-    async fn direct_write_reports_change_on_caller() {
+    async fn write_reports_change_on_caller() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         client.enqueue_checkpoint_response(TestResponse::Success(vec![step_op(
             "d",
@@ -9334,7 +8886,7 @@ mod change_hook_tests {
         let ctx = ctx_on(
             client,
             Arc::new(CheckpointLog::empty()),
-            Some(Duration::ZERO),
+            Duration::ZERO,
             recorder.plugins(),
         );
         ctx.checkpoint_updates_direct(vec![start("d")])
@@ -9367,7 +8919,7 @@ mod change_hook_tests {
             "s".to_owned(),
             CheckpointRecord::with_status("s", CheckpointStatus::Started),
         )]));
-        let ctx = ctx_on(client, log, None, recorder.plugins());
+        let ctx = ctx_on(client, log, Duration::ZERO, recorder.plugins());
         ctx.checkpoint_updates(vec![start("s")])
             .await
             .expect("the write succeeds");
@@ -9398,7 +8950,7 @@ mod change_hook_tests {
         let ctx = ctx_on(
             client,
             Arc::new(CheckpointLog::empty()),
-            None,
+            Duration::ZERO,
             recorder.plugins(),
         );
         ctx.checkpoint_updates(Vec::new())
@@ -9429,7 +8981,7 @@ mod change_hook_tests {
         let ctx = ctx_on(
             client,
             Arc::new(CheckpointLog::empty()),
-            None,
+            Duration::ZERO,
             recorder.plugins(),
         );
         let write = ctx.checkpoint_updates(vec![start("op-hydration")]);
@@ -9465,7 +9017,7 @@ mod change_hook_tests {
         let ctx = ctx_on(
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             Arc::new(CheckpointLog::empty()),
-            None,
+            Duration::ZERO,
             recorder.plugins(),
         );
         let outcome = drive_handler(ctx, None, |ctx| async move {
@@ -9538,7 +9090,7 @@ mod change_hook_tests {
         let ctx = ctx_on(
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             Arc::new(CheckpointLog::empty()),
-            None,
+            Duration::ZERO,
             recorder.plugins(),
         );
         drive_handler(ctx, None, |ctx| async move {
@@ -9587,7 +9139,7 @@ mod change_hook_tests {
         let ctx = ctx_on(
             echo_client(),
             Arc::new(CheckpointLog::from_records(records)),
-            None,
+            Duration::ZERO,
             plugins,
         );
         let before = crate::engine::projections();
@@ -9652,7 +9204,7 @@ mod change_hook_tests {
             crate::plugin::create_plugins(&factories, slot, crate::plugin::tests_support_info)
                 .expect("one factory");
         let log = Arc::new(CheckpointLog::empty());
-        let ctx = ctx_on(client, Arc::clone(&log), None, plugins);
+        let ctx = ctx_on(client, Arc::clone(&log), Duration::ZERO, plugins);
         ctx.checkpoint_updates(vec![start("s")])
             .await
             .expect("the write succeeds");
@@ -9688,7 +9240,7 @@ mod change_hook_tests {
         let ctx = ctx_on(
             client,
             Arc::new(CheckpointLog::empty()),
-            None,
+            Duration::ZERO,
             recorder.plugins(),
         );
         ctx.checkpoint_updates(Vec::new())
@@ -9759,7 +9311,7 @@ mod withdrawal_write_tests {
             .unwrap()
     }
 
-    /// An unbuffered root context over `client`.
+    /// A root context over `client`.
     fn ctx_with(client: Arc<dyn ExecutionClient>) -> DurableContext {
         DurableContext::new_root_with_client(
             "arn:test".to_owned(),
@@ -9854,7 +9406,7 @@ mod withdrawal_write_tests {
         }
     }
 
-    /// Yields until `done` holds, so the direct writer runs.
+    /// Yields until `done` holds, so the batch flusher runs.
     async fn until(done: impl Fn() -> bool) {
         for _ in 0..1000 {
             if done() {
@@ -9865,17 +9417,12 @@ mod withdrawal_write_tests {
         assert!(done(), "the condition never held");
     }
 
-    /// An unbuffered context over [`FailFirst`] whose first write, `a`'s
-    /// START, failed. Returns the failed write's unresolved future.
+    /// A context over [`FailFirst`] whose first write, `a`'s START,
+    /// failed. Returns the failed write's unresolved future.
     async fn failed_first_write() -> (DurableContext, Arc<FailFirst>, super::SubmittedWrite) {
         let client = Arc::new(FailFirst::default());
         let ctx = ctx_with(Arc::clone(&client) as Arc<dyn ExecutionClient>);
-        let write = ctx.write_direct_detached(
-            vec![update("a", OperationAction::Start)],
-            Vec::new(),
-            None,
-            None,
-        );
+        let write = ctx.submit_checkpoint_updates(vec![update("a", OperationAction::Start)]);
         until(|| ctx.coordinator().write_failed()).await;
         (ctx, client, write)
     }
@@ -9941,12 +9488,7 @@ mod withdrawal_write_tests {
     #[tokio::test(start_paused = true)]
     async fn write_without_client_records_the_failure() {
         let ctx = DurableContext::test_context();
-        let write = ctx.write_direct_detached(
-            vec![update("a", OperationAction::Start)],
-            Vec::new(),
-            None,
-            None,
-        );
+        let write = ctx.submit_checkpoint_updates(vec![update("a", OperationAction::Start)]);
         assert!(
             tokio::time::timeout(Duration::from_secs(60), write)
                 .await
@@ -9973,12 +9515,7 @@ mod withdrawal_write_tests {
     async fn write_without_client_records_under_the_token_lock() {
         let ctx = DurableContext::test_context();
         let held = ctx.inner.checkpoint_token.lock().await;
-        let write = ctx.write_direct_detached(
-            vec![update("a", OperationAction::Start)],
-            Vec::new(),
-            None,
-            None,
-        );
+        let write = ctx.submit_checkpoint_updates(vec![update("a", OperationAction::Start)]);
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert!(
             !ctx.coordinator().write_failed(),
@@ -9998,48 +9535,14 @@ mod withdrawal_write_tests {
         let ctx = DurableContext::test_context();
         ctx.coordinator().withdraw("arn:test", "req", || {});
         let written = ctx
-            .checkpoint_direct_with_events(
-                vec![update("a", OperationAction::Start)],
-                &[],
-                None,
-                None,
-            )
+            .checkpoint_direct_with_events(vec![update("a", OperationAction::Start)], &[], None)
             .await;
-        assert!(
-            matches!(written, Some(Err(WriteError::Stopped))),
-            "{written:?}"
-        );
+        assert!(matches!(written, Err(WriteError::Stopped)), "{written:?}");
         assert!(!ctx.coordinator().write_failed());
         assert!(ctx.coordinator().fatal_error().is_none());
     }
 
-    /// A failed write drops the entries queued behind it, a held one
-    /// included, and none of them is sent or resolves.
-    #[tokio::test(start_paused = true)]
-    async fn failed_write_drops_the_queued_writes() {
-        let client = Arc::new(FailFirst::default());
-        let ctx = ctx_with(Arc::clone(&client) as Arc<dyn ExecutionClient>);
-        let first = ctx.write_direct_detached(
-            vec![update("a", OperationAction::Start)],
-            Vec::new(),
-            None,
-            None,
-        );
-        let held = ctx.reserve_checkpoint_updates(vec![update("b", OperationAction::Start)]);
-        until(|| ctx.coordinator().write_failed()).await;
-        assert!(ctx.queued_update_ids().is_empty(), "the queue is dropped");
-        let second = held.release();
-        let both = async { tokio::join!(first, second) };
-        assert!(
-            tokio::time::timeout(Duration::from_secs(60), both)
-                .await
-                .is_err(),
-            "neither write resolves"
-        );
-        assert_eq!(client.0.load(Ordering::SeqCst), 1, "`b` is not sent");
-    }
-
-    /// A failed direct write drops the coalescer's open batch, and a later
+    /// A failed write drops the coalescer's open batch, and a later
     /// join is rejected: no contributor resolves, and the end-of-invocation
     /// flush sends nothing.
     #[tokio::test(start_paused = true)]
@@ -10054,13 +9557,11 @@ mod withdrawal_write_tests {
             CheckpointCoalescer::new(Duration::from_secs(60)),
         );
         let buffered = ctx.submit_checkpoint_updates(vec![update("b", OperationAction::Start)]);
-        let failed = ctx.write_direct_detached(
-            vec![update("a", OperationAction::Start)],
-            Vec::new(),
-            None,
-            None,
-        );
-        until(|| ctx.coordinator().write_failed()).await;
+        let failed = ctx
+            .checkpoint_updates_after_drive(vec![update("a", OperationAction::Start)])
+            .await;
+        assert!(matches!(failed, Err(WriteError::Failed(_))), "{failed:?}");
+        assert!(ctx.coordinator().write_failed());
         assert!(
             ctx.queued_update_ids().is_empty(),
             "the open batch is dropped"
@@ -10071,7 +9572,7 @@ mod withdrawal_write_tests {
             "the later join is rejected"
         );
         ctx.flush_pending_checkpoints().await;
-        let all = async { tokio::join!(buffered, failed, later) };
+        let all = async { tokio::join!(buffered, later) };
         assert!(
             tokio::time::timeout(Duration::from_secs(120), all)
                 .await
@@ -10085,16 +9586,16 @@ mod withdrawal_write_tests {
     trait Held {}
     impl<T> Held for T {}
 
-    /// Submits `b`'s START on one thread while the test holds the queue
+    /// Submits `b`'s START on one thread while the test holds the buffer
     /// lock `lock_queue` takes. The submitting thread signals when it
     /// reaches `point`, just before it takes that lock, so it has passed
     /// every check made before the lock. A write failure then sets the
     /// latch, and the lock is released. The submission must see the latch
     /// under the lock: nothing waits to be sent, and nothing is sent. A
     /// failed write drops a submission queued before the latch (see
-    /// `failed_write_drops_the_queued_writes`).
+    /// `failed_write_drops_the_open_batch_and_rejects_later_joins`).
     fn submission_racing_a_failed_write(
-        coalescer: Option<CheckpointCoalescer>,
+        coalescer: CheckpointCoalescer,
         point: crate::coordinator::race_points::RacePoint,
         lock_queue: fn(&DurableContext) -> Box<dyn Held + '_>,
     ) {
@@ -10106,17 +9607,14 @@ mod withdrawal_write_tests {
         let ctx = {
             let _entered = runtime.enter();
             let client = Arc::clone(&client) as Arc<dyn ExecutionClient>;
-            match coalescer {
-                Some(coalescer) => DurableContext::new_root_with_client_and_coalescer(
-                    "arn:test".to_owned(),
-                    lambda_runtime::Context::default(),
-                    Arc::new(CheckpointLog::empty()),
-                    client,
-                    "t0".to_owned(),
-                    coalescer,
-                ),
-                None => ctx_with(client),
-            }
+            DurableContext::new_root_with_client_and_coalescer(
+                "arn:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(CheckpointLog::empty()),
+                client,
+                "t0".to_owned(),
+                coalescer,
+            )
         };
         let held = lock_queue(&ctx);
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
@@ -10153,33 +9651,14 @@ mod withdrawal_write_tests {
         assert_eq!(client.0.load(Ordering::SeqCst), 0, "nothing is sent");
     }
 
-    /// A direct submission that waits at the direct queue's lock while a
-    /// write fails is rejected: the latch is checked under that lock.
-    #[test]
-    fn direct_submission_waiting_at_the_queue_lock_sees_the_latch() {
-        submission_racing_a_failed_write(
-            None,
-            crate::coordinator::race_points::RacePoint::DirectQueueLock,
-            |ctx| Box::new(ctx.inner.direct.lock()),
-        );
-    }
-
     /// A buffered submission that waits at the buffer lock while a write
     /// fails is rejected: its checkpoint permit is refused under that lock.
     #[test]
     fn buffered_submission_waiting_at_the_buffer_lock_sees_the_latch() {
         submission_racing_a_failed_write(
-            Some(CheckpointCoalescer::new(Duration::from_secs(60))),
+            CheckpointCoalescer::new(Duration::from_secs(60)),
             crate::coordinator::race_points::RacePoint::BufferLock,
-            |ctx| {
-                Box::new(
-                    ctx.inner
-                        .coalescer
-                        .as_ref()
-                        .expect("buffered")
-                        .hold_buffer_lock(),
-                )
-            },
+            |ctx| Box::new(ctx.inner.coalescer.hold_buffer_lock()),
         );
     }
 

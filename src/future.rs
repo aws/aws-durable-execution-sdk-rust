@@ -1696,7 +1696,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
             "token0".to_owned(),
-            None,
+            std::time::Duration::ZERO,
             0,
             Some(Arc::clone(&plugins)),
         );
