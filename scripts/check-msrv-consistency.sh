@@ -15,7 +15,7 @@
 #   3. README.md does not mention that same version.
 #
 # Wired into `make check`. See CONTRIBUTING.md, "MSRV" for the bump policy
-# (pre-1.0 MSRV bumps ship as minor releases, never patches).
+# (MSRV bumps ship as minor releases, never patches).
 #
 # POSIX sh, no bashisms.
 

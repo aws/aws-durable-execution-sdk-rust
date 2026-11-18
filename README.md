@@ -9,17 +9,12 @@ minutes or a month therefore fits in one ordinary async Rust function, and
 once the service records a step's result, replay returns that result
 without re-running the body.
 
-> [!WARNING]
-> This is an experimental preview, not intended for production use. The API
-> may change without notice, and the final version may look different from
-> what you see today.
-
 The SDK requires Rust 1.94.1 or newer. The SDK crate uses edition 2024, but
 a crate that depends on it can use edition 2018 or later.
 
 ```toml
 [dependencies]
-aws-durable-execution-sdk = "0.2"
+aws-durable-execution-sdk = "1"
 lambda_runtime = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros"] }
