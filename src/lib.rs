@@ -41,12 +41,8 @@
 //! call site, in the order the handler creates operations, and replay hands
 //! each recorded result to the operation that claims the same ID. Two kinds
 //! of operation are exceptions. A [`DurableContext::with_retry`] builder
-//! claims no ID at the call: a block with its own record claims its ID
-//! when the builder becomes its future (`.await`, `.future()` or
-//! `.spawn()`), and a block with
-//! [`without_child_context`](crate::builders::WithRetryBuilder::without_child_context)
-//! claims none, so its first attempt claims the caller's next ID when it
-//! starts. A
+//! claims no ID at the call: the block claims its ID when the builder
+//! becomes its future (`.await`, `.future()` or `.spawn()`). A
 //! combinator ([`DurableContext::try_join_all`],
 //! [`DurableContext::join_all`], [`DurableContext::select_ok`],
 //! [`DurableContext::race`]) claims its ID when it is

@@ -229,9 +229,9 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### `with_retry` structure
 
 - **JavaScript:** Runs every attempt directly in the one child context of the `withRetry` operation, and names the waits `{name}-backoff-{attempt}` when the block is named, and leaves them unnamed otherwise. `wrapWithRunInChildContext: false` runs the attempts in the caller's context, and `virtualContext` writes no block record.
-- **Rust:** Runs each attempt in its own child context `attempt-N` inside the `with_retry` child context; `without_child_context()` runs the attempts in the caller's context, `virtual_context()` writes no block record, and both name a named block's attempt children `{name}-attempt-N`. In every mode a named block's waits are `{name}-backoff-N`, where `N` is the failed attempt, and an unnamed block's waits are unnamed, as in JavaScript.
+- **Rust:** Runs each attempt in its own child context `attempt-N` inside the `with_retry` child context; `virtual_context()` writes no block record and names a named block's attempt children `{name}-attempt-N`. In both modes a named block's waits are `{name}-backoff-N`, where `N` is the failed attempt, and an unnamed block's waits are unnamed, as in JavaScript.
 - **Why:** Replay returns a failed attempt's recorded failure without calling its closure, so the strategy sees the same error on every invocation, and the next attempt's operation IDs do not depend on what a failed attempt created. Each attempt costs one record.
-- **Decision:** Decision (2026-10-28 and 2026-10-31): one child context per attempt, and a named unwrapped or virtual block prefixes its attempt children's names.
+- **Decision:** Decision (2026-10-28 and 2026-10-31): one child context per attempt, and a named virtual block prefixes its attempt children's names.
 - **Where:** `src/with_retry.rs`, `retry_loop`; `src/builders/with_retry.rs`, `WithRetryBuilder`.
 
 ### Step closure per attempt
@@ -293,7 +293,7 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### Unpolled `.future()`
 
 - **JavaScript:** An ordinary operation starts at its call, so a step that nothing awaits still runs and records its result. A combinator is lazy.
-- **Rust:** `.await` and `.spawn()` start an operation at once, and an ordinary `.future()` starts at its first poll, so one that nothing polls records nothing but has claimed its ID, and later IDs match JavaScript. A `with_retry` block with `.without_child_context()` claims no ID until its first attempt starts. A combinator is lazy, as in JavaScript, and claims no ID until its first poll or `.spawn()`.
+- **Rust:** `.await` and `.spawn()` start an operation at once, and an ordinary `.future()` starts at its first poll, so one that nothing polls records nothing but has claimed its ID, and later IDs match JavaScript. A combinator is lazy, as in JavaScript, and claims no ID until its first poll or `.spawn()`.
 - **Why:** A combinator starts the `.future()` inputs it is given, so it can stop the ones it does not use. A replay that returns its recorded result starts none of them.
 - **Decision:** Decision (2026-11-03, [Rust SDK #151: Keep dropped spawned operations running, and stop work when its scope closes](https://github.com/aws/aws-durable-execution-sdk-rust/issues/151)): start a `.future()` at its first poll.
 - **Where:** `src/future.rs`, `DurableFuture::for_start_step` and `DurableFuture::deferred`.
@@ -546,11 +546,11 @@ This page lists every place where the Rust SDK behaves differently from the Java
 
 ### `with_retry` without the outer child
 
-- **JavaScript:** `wrapWithRunInChildContext: false` runs the attempts in the caller's context, with no wrapping child.
-- **Rust:** `WithRetryBuilder::without_child_context()` runs the `attempt-N` child contexts and the retry waits in the caller's context, with no block record. The block is no user-function site, and its `attempt-N` children fire no user-function hooks.
-- **Why:** The option groups or ungroups the attempts in the history, as in JavaScript. The row "`with_retry` structure" gives the history shape.
-- **Decision:** Same capability in Rust form.
-- **Where:** `src/builders/with_retry.rs`, `WithRetryBuilder::without_child_context` and `WithRetryBuilder::build_unwrapped`.
+- **JavaScript:** `wrapWithRunInChildContext: false` runs the attempts and the waits between them in the caller's context, with no wrapping child, and rethrows the last attempt's error unchanged.
+- **Rust:** Has no such option. `WithRetryBuilder::virtual_context()` writes no record for the block, so its attempts and waits name the caller's parent as their parent, and it runs them in an operation namespace of the block's own.
+- **Why:** Attempts in the caller's context take the caller's next operation IDs while the block runs, so those IDs depend on when other code in that context creates operations. In JavaScript, two such blocks in one `Promise.all` whose first attempts each run a step, one slower than the other, replay their waits in another order: named waits fail with `NonDeterministicExecutionError`, and unnamed waits swap records. Rust runs each attempt in its own `attempt-N` child context, so the option could not return the attempt body's own error either.
+- **Decision:** JavaScript defect.
+- **Where:** `src/builders/with_retry.rs`, `WithRetryBuilder::virtual_context`.
 
 ### Asynchronous plugin work around user code
 

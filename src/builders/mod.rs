@@ -48,9 +48,8 @@ use crate::StepError;
 ///
 /// Every builder except a combinator and `with_retry` claims its ID when it
 /// is created, and its `into_future` runs this FIRST. A `with_retry` block
-/// with its own record claims and validates its ID when the builder
-/// becomes its future; an unwrapped block has no ID of its own, and each
-/// attempt child validates its own. `.future()`, `.spawn()`, and `.await`
+/// claims and validates its ID when the builder becomes its future.
+/// `.future()`, `.spawn()`, and `.await`
 /// all funnel through `into_future`, so a replay identity mismatch is
 /// recorded on the execution-fatal slot synchronously at finalization,
 /// before the operation future is ever polled.

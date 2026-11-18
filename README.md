@@ -279,10 +279,10 @@ outer context of a `with_retry` block with its own record queue their
 `START`, fire `on_operation_start`, and start their body without waiting for
 the `START` response, as JS does. Their outcome write waits for that
 response, and when the `START` write fails, the invocation ends without an
-outcome for the operation. An item or branch with `NestingMode::Flat`, and a
-`with_retry` block with `.without_child_context()`, write no record of their
-own, so they queue no `START` of their own; the attempts of the block queue
-theirs.
+outcome for the operation. An item or branch with `NestingMode::Flat`, a
+virtual child context and a virtual `with_retry` block write no record of
+their own, so they queue no `START` of their own; the attempts of a virtual
+`with_retry` block queue theirs.
 
 Dropping the handle that `.spawn()` returns loses only the result. The
 operation keeps running until it settles, its scope closes or the
@@ -335,14 +335,10 @@ claimed its ID: start the inner combinator with `.spawn()` and pass the
 returned handle. A still-unclaimed one fails the execution with a context
 usage error.
 
-A `with_retry` builder claims no ID at the call, because its mode is known
-only when the builder becomes its future. A block with its own record
-claims its ID at `.await`, `.future()` or `.spawn()`. A block with
-`.without_child_context()` claims no ID of its own: its first attempt
-claims the caller's next ID when it starts, at its first poll, at
-`.spawn()` or when a combinator starts it, and each later attempt and wait
-claims the caller's next ID when it starts. These points are in the
-handler's own control flow too, so they are deterministic as long as the
+A `with_retry` builder claims no ID at the call. A block with its own
+record, and a virtual block, claim their ID when the builder becomes its
+future, at `.await`, `.future()` or `.spawn()`. That point is in the
+handler's own control flow too, so it is deterministic as long as the
 handler converts and awaits the block where it did on the first run.
 
 ```rust ignore
@@ -921,12 +917,6 @@ are unnamed.
 `attempt-N` child context keeps `RunInChildContext`, and each wait between
 attempts keeps `Wait`.
 
-`.without_child_context()` runs the attempts in the caller's context
-without a record for the block, as JS `wrapWithRunInChildContext: false`:
-the block claims no operation ID, a block named `b` names its attempts
-`b-attempt-N` and its waits `b-backoff-N`, `sub_type` has no recorded
-effect, and no plugin hook runs for the block itself.
-
 `.virtual_context()` makes the block a virtual child context, as on
 `run_in_child_context`: the block claims an ID and runs its attempts in its
 own namespace, but writes no record, so its attempts and waits name the
@@ -934,8 +924,7 @@ caller's parent as their parent. A block named `b` names its attempts
 `b-attempt-N` and its waits `b-backoff-N`; an unnamed block names its
 attempts `attempt-N` and leaves its waits unnamed. The block's summary is
 never called, its subtype appears only in errors and plugin hook infos,
-and its operation hooks report `is_virtual` true. The later call of
-`.virtual_context()` and `.without_child_context()` wins.
+and its operation hooks report `is_virtual` true.
 
 A `with_retry` builder claims no ID at the call. A block with its own
 record, and a virtual block, claim their ID when the builder becomes its
@@ -943,8 +932,7 @@ future, at `.await`, `.future()` or `.spawn()`.
 
 When retries exhaust, the operation fails with a `ChildContextError` of
 kind `ChildFailed` whose source is the last attempt's error, also for a
-virtual block. With `.without_child_context()`, it returns the last
-`attempt-N` child's error unchanged.
+virtual block.
 
 ### map and parallel
 
@@ -1664,8 +1652,7 @@ that runs an operation, of the end-of-invocation flush and of the drain of
 hook work. `wrap_user_function` brackets each poll and each drop of a user
 function: a live step attempt or condition check, a child body (including
 the outer block of a `with_retry` with its own record, but not the
-`attempt-N` contexts of either mode; a block with `.without_child_context()`
-has no outer block and so no user function of its own), the body of a
+`attempt-N` contexts of either mode), the body of a
 virtual child context or a virtual `with_retry` block, a user function with
 `is_virtual()` true whose hooks fire and whose wraps run in every
 invocation, the `wait_for_callback` body, each map item, parallel branch and
@@ -1704,9 +1691,8 @@ is active during an invocation, on the SDK's stack or on a hook task, and
 the error names plugin code, as the error for a claim in a step body does.
 For that rule, the outcome counts as decided at the driver's arbitration. A
 builder claims its ID at the call, a deferred combinator at its first poll
-or `.spawn()`, a `with_retry` block with its own record when the builder
-becomes its future, and the first attempt of an unwrapped `with_retry`
-block when that attempt starts. The plugin guard itself refuses nothing; admission and
+or `.spawn()`, and a `with_retry` block when the builder becomes its future.
+The plugin guard itself refuses nothing; admission and
 task-ownership checks still apply, and the guard does not follow a builder
 or future that the handler created, claimed and handed to the plugin. A
 claim after the drive, in `on_invocation_end` or after `wrap_invocation`'s
@@ -1869,9 +1855,7 @@ because the batch completed early fires no end hook, nor do the unfinished
 operations inside it. Each `NestingMode::Flat` map item, parallel branch or
 `parallel_mixed` branch fires start and end hooks with `is_virtual` true and
 the container as parent. It writes no record, and after abandonment, drop
-or panic it fires no end hook. A `with_retry` block with
-`.without_child_context()` has no record, so it fires no hook for itself;
-its `attempt-N` children and waits fire theirs. The inner callback and step
+or panic it fires no end hook. The inner callback and step
 of a named `wait_for_callback` report the names `<name>-callback` and
 `<name>-submitter`.
 

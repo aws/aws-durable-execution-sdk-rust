@@ -10,8 +10,10 @@
 //!   and re-invokes later);
 //! - retry exhaustion surfaces the last attempt's error as the source of
 //!   the block's child context error;
-//! - the closure receives the attempt number, and `without_child_context`
-//!   runs the attempts in the caller's context.
+//! - the closure receives the attempt number;
+//! - a virtual block (`virtual_context`) takes one operation ID in the
+//!   caller's context, so the operations around it replay in their own
+//!   positions when it runs in a combinator or beside other operations.
 
 #![cfg(feature = "test-util")]
 #![expect(clippy::expect_used, clippy::indexing_slicing)] // reason: test assertions
@@ -366,11 +368,11 @@ struct ReplayRun {
 
 /// Runs the handler of test 3: attempt 1 runs steps `a` and `b` (or no
 /// step when `steps_in_first` is false) and fails with `first`; attempt 2
-/// runs step `c`, waits 1 s and returns `done`. With `unwrapped`, the
-/// block runs without its own child context.
+/// runs step `c`, waits 1 s and returns `done`. With `virtual_block`, the
+/// block uses a virtual context.
 async fn replay_handler_run(
     steps_in_first: bool,
-    unwrapped: bool,
+    virtual_block: bool,
 ) -> (Arc<ReplayRun>, durable::test_util::TestResult<String>) {
     let run = Arc::new(ReplayRun::default());
     let run_h = Arc::clone(&run);
@@ -427,8 +429,8 @@ async fn replay_handler_run(
                                 RetryDecision::retry(Duration::from_secs(1))
                             }
                         });
-                    let block = if unwrapped {
-                        block.without_child_context()
+                    let block = if virtual_block {
+                        block.virtual_context()
                     } else {
                         block
                     };
@@ -518,80 +520,7 @@ async fn zero_delay_records_one_second_wait() {
     );
 }
 
-/// Fails attempt 1 and succeeds on attempt 2, as a block named `block`,
-/// unwrapped or not, inside a child `outer` between steps `before` and
-/// `after`.
-async fn outer_block_run(unwrapped: bool) -> durable::test_util::TestResult<u32> {
-    LocalRunner::new()
-        .run(
-            move |_: serde_json::Value, ctx: DurableContext| async move {
-                let out = ctx
-                    .run_in_child_context(move |outer| async move {
-                        outer.step(|_| async { Ok(1_u32) }).name("before").await?;
-                        let block = outer
-                            .with_retry(|_child, attempt| async move {
-                                if attempt == 1 {
-                                    Err::<u32, durable::BoxError>("transient".into())
-                                } else {
-                                    Ok(attempt)
-                                }
-                            })
-                            .name("block")
-                            .retry_strategy(retry_until(2));
-                        let value = if unwrapped {
-                            block.without_child_context().await?
-                        } else {
-                            block.await?
-                        };
-                        outer.step(|_| async { Ok(3_u32) }).name("after").await?;
-                        Ok(value)
-                    })
-                    .name("outer")
-                    .await?;
-                Ok::<_, durable::BoxError>(out)
-            },
-            serde_json::Value::Null,
-        )
-        .await
-        .expect("runner")
-}
-
-/// An unwrapped block writes no record and claims no ID: its attempts and
-/// waits record the caller's parent, and `block-attempt-1` takes the ID the
-/// wrapped block's own record has.
-#[tokio::test]
-async fn unwrapped_attempts_record_caller_parent() {
-    let unwrapped = outer_block_run(true).await;
-    assert!(unwrapped.is_success(), "{:?}", unwrapped.error_message());
-    assert_eq!(unwrapped.output(), Some(&2));
-    assert!(unwrapped.operation("block").is_none(), "{unwrapped}");
-    let outer = unwrapped.operation("outer").expect("outer recorded");
-    let attempt_1 = unwrapped
-        .operation("block-attempt-1")
-        .expect("attempt 1 recorded");
-    assert_eq!(attempt_1.parent_id(), Some(outer.id()));
-    let backoff = unwrapped
-        .operation("block-backoff-1")
-        .expect("wait recorded");
-    assert_eq!(backoff.parent_id(), Some(outer.id()));
-    assert_eq!(
-        unwrapped
-            .operation("block-attempt-2")
-            .expect("attempt 2 recorded")
-            .parent_id(),
-        Some(outer.id())
-    );
-
-    let wrapped = outer_block_run(false).await;
-    assert!(wrapped.is_success(), "{:?}", wrapped.error_message());
-    assert_eq!(
-        attempt_1.id(),
-        wrapped.operation("block").expect("block recorded").id(),
-        "attempt 1 takes the ID after `before`"
-    );
-}
-
-/// What one invocation saw of an unwrapped block's exhaustion error.
+/// What one invocation saw of a virtual block's exhaustion error.
 #[derive(Debug, Clone)]
 struct SeenError {
     child_failed: bool,
@@ -599,10 +528,10 @@ struct SeenError {
     text: String,
 }
 
-/// An unwrapped block's exhaustion returns the last `attempt-N` error
-/// unchanged, live and on replay.
+/// A virtual block's exhaustion returns the block's `ChildFailed` error
+/// without an operation ID, live and on replay.
 #[tokio::test]
-async fn unwrapped_exhaustion_returns_attempt_error() {
+async fn virtual_exhaustion_error_replays() {
     let seen: Arc<Mutex<Vec<SeenError>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_h = Arc::clone(&seen);
     let result = LocalRunner::new()
@@ -618,7 +547,7 @@ async fn unwrapped_exhaustion_returns_attempt_error() {
                             })
                             .name("block")
                             .retry_strategy(retry_until(2))
-                            .without_child_context()
+                            .virtual_context()
                             .await;
                         let e = outcome.expect_err("exhausted retries fail");
                         seen.lock().expect("lock").push(SeenError {
@@ -645,26 +574,23 @@ async fn unwrapped_exhaustion_returns_attempt_error() {
         .await
         .expect("runner");
     assert!(result.is_success(), "{:?}", result.error_message());
-    let attempt_2 = result
-        .operation("block-attempt-2")
-        .expect("attempt 2 recorded");
+    assert!(
+        result.operation("block-attempt-2").is_some(),
+        "attempt 2 recorded: {result}"
+    );
     let seen = seen.lock().expect("lock").clone();
     assert!(seen.len() >= 2, "live and replayed: {seen:?}");
     for error in &seen {
         assert!(error.child_failed, "{error:?}");
-        assert_eq!(
-            error.operation_id.as_deref(),
-            Some(attempt_2.id()),
-            "{error:?}"
-        );
+        assert_eq!(error.operation_id, None, "{error:?}");
         assert!(error.text.contains("boom on attempt 2"), "{error:?}");
     }
 }
 
-/// Test 3's first handler, unwrapped: attempt 1's closure ran once over
-/// all invocations.
+/// Test 3's first handler, with a virtual block: attempt 1's closure ran
+/// once over all invocations.
 #[tokio::test]
-async fn unwrapped_failed_attempt_replays_from_record() {
+async fn virtual_failed_attempt_replays_from_record() {
     let (run, result) = replay_handler_run(true, true).await;
     assert!(result.is_success(), "{:?}", result.error_message());
     assert!(result.invocation_count() >= 3, "{result}");
@@ -673,12 +599,12 @@ async fn unwrapped_failed_attempt_replays_from_record() {
     assert!(result.operation("block-attempt-1").is_some(), "{result}");
 }
 
-/// An unnamed block's retry wait has no name, with or without its own
-/// child context. An unwrapped block named `""` names its attempts
-/// `attempt-N`, as an unnamed one does.
+/// An unnamed block's retry wait has no name in the default and virtual
+/// modes. A virtual block named `""` names its attempts `attempt-N`, as an
+/// unnamed one does.
 #[tokio::test]
 async fn unnamed_waits_are_unnamed_in_both_wrap_modes() {
-    for (unwrapped, name) in [(false, None), (true, None), (true, Some(""))] {
+    for (virtual_block, name) in [(false, None), (true, None), (true, Some(""))] {
         let result = LocalRunner::new()
             .run(
                 move |_: serde_json::Value, ctx: DurableContext| async move {
@@ -695,8 +621,8 @@ async fn unnamed_waits_are_unnamed_in_both_wrap_modes() {
                         Some(name) => block.name(name),
                         None => block,
                     };
-                    let value = if unwrapped {
-                        block.without_child_context().await?
+                    let value = if virtual_block {
+                        block.virtual_context().await?
                     } else {
                         block.await?
                     };
@@ -708,7 +634,7 @@ async fn unnamed_waits_are_unnamed_in_both_wrap_modes() {
             .expect("runner");
         assert!(
             result.is_success(),
-            "{unwrapped} {name:?}: {:?}",
+            "{virtual_block} {name:?}: {:?}",
             result.error_message()
         );
         let waits: Vec<Option<&str>> = result
@@ -717,61 +643,166 @@ async fn unnamed_waits_are_unnamed_in_both_wrap_modes() {
             .filter(|op| op.kind() == durable::OperationKind::Wait)
             .map(|op| op.name())
             .collect();
-        assert_eq!(waits, [None], "{unwrapped} {name:?}");
+        assert_eq!(waits, [None], "{virtual_block} {name:?}");
         assert!(
             result.operation("attempt-1").is_some(),
-            "{unwrapped} {name:?}: {result}"
+            "{virtual_block} {name:?}: {result}"
         );
     }
 }
 
-/// An unwrapped block whose wait between attempts fails returns the wait's
-/// error unchanged. The second invocation's strategy retries where the
-/// first stopped, so the wait meets the step recorded at its ID.
+/// The `.future()` of a virtual block with the optional `name`, whose
+/// closure returns `value` and whose strategy stops at attempt 1.
+fn virtual_block(
+    ctx: &DurableContext,
+    name: Option<&str>,
+    value: u32,
+) -> durable::DurableFuture<u32> {
+    let block = ctx
+        .with_retry(move |_child, _attempt| async move { Ok(value) })
+        .retry_strategy(retry_until(1))
+        .virtual_context();
+    match name {
+        Some(name) => block.name(name).future(),
+        None => block.future(),
+    }
+}
+
+/// A virtual block that is an input of a combinator keeps the IDs of the
+/// operations after the combinator when the combinator replays its final
+/// record: the block claims its ID at `.future()`, not when it starts.
 #[tokio::test]
-async fn unwrapped_failed_wait_returns_wait_error() {
-    let invocations = Arc::new(AtomicU32::new(0));
-    let wait_errors: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
-    let (invocations_h, wait_errors_h) = (Arc::clone(&invocations), Arc::clone(&wait_errors));
+async fn virtual_block_in_failed_combinator_replays() {
     let result = LocalRunner::new()
         .run(
-            move |_: serde_json::Value, ctx: DurableContext| {
-                let invocation = invocations_h.fetch_add(1, Ordering::SeqCst) + 1;
-                let wait_errors = Arc::clone(&wait_errors_h);
-                async move {
-                    let outcome: Result<u32, durable::OperationError> = ctx
-                        .with_retry(|_child, _attempt| async {
-                            Err::<u32, durable::BoxError>("transient".into())
-                        })
-                        .name("block")
-                        .retry_strategy(move |_err, _attempt| {
-                            if invocation == 1 {
-                                RetryDecision::Stop
-                            } else {
-                                RetryDecision::retry(Duration::from_secs(1))
-                            }
-                        })
-                        .without_child_context()
-                        .await;
-                    let e = outcome.expect_err("the block fails");
-                    if invocation > 1 {
-                        wait_errors.lock().expect("lock").push(matches!(
-                            e.kind(),
-                            OperationErrorKind::NonDeterministicExecution(_)
-                        ));
-                        return Err::<(), durable::BoxError>(Box::new(e));
-                    }
-                    ctx.step(|_| async { Ok(1_u32) }).name("step").await?;
-                    ctx.wait(Duration::from_secs(1)).name("suspend").await?;
-                    Ok(())
-                }
+            |_: serde_json::Value, ctx: DurableContext| async move {
+                let s = ctx
+                    .step(|_| async { Err::<u32, durable::BoxError>("s failed".into()) })
+                    .name("s")
+                    .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                    .future();
+                let a = virtual_block(&ctx, Some("a"), 1);
+                let failed = ctx.try_join_all([s, a]).name("all").await.is_err();
+                ctx.wait(Duration::from_secs(1)).name("tail").await?;
+                ctx.step(|_| async { Ok(0_u32) }).name("after").await?;
+                Ok::<_, durable::BoxError>(failed)
             },
             serde_json::Value::Null,
         )
         .await
         .expect("runner");
-    assert!(result.is_failure(), "{result}");
-    assert_eq!(*wait_errors.lock().expect("lock"), [true], "{result}");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.invocation_count(), 2, "{result}");
+    assert_eq!(result.output(), Some(&true));
+}
+
+/// Unnamed virtual blocks after a `race` keep their IDs on replay: the
+/// second block reads its own result, not the first block's.
+#[tokio::test]
+async fn unnamed_virtual_blocks_after_race_keep_ids() {
+    let result = LocalRunner::new()
+        .run(
+            |_: serde_json::Value, ctx: DurableContext| async move {
+                let first = ctx.race([virtual_block(&ctx, None, 1)]).await?;
+                let second = virtual_block(&ctx, None, 2).await?;
+                ctx.wait(Duration::from_secs(1)).await?;
+                Ok::<_, durable::BoxError>((first, second))
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.invocation_count(), 2, "{result}");
+    assert_eq!(result.output(), Some(&(1, 2)));
+}
+
+/// The `.future()` of a virtual block named `name`: attempt 1 runs a step
+/// `{name}-slow` that sleeps `delay` and then fails, attempt 2 returns
+/// `name`, and the strategy retries once after 1 s.
+fn virtual_block_failing_once(
+    ctx: &DurableContext,
+    name: &'static str,
+    delay: Duration,
+) -> durable::DurableFuture<String> {
+    ctx.with_retry(move |child, attempt| async move {
+        if attempt == 1 {
+            child
+                .step(move |_| async move {
+                    tokio::time::sleep(delay).await;
+                    Err::<(), durable::BoxError>(format!("{name} failed").into())
+                })
+                .name(format!("{name}-slow"))
+                .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                .await?;
+        }
+        Ok(name.to_owned())
+    })
+    .name(name)
+    .retry_strategy(retry_until(2))
+    .virtual_context()
+    .future()
+}
+
+/// Two retrying virtual blocks in one combinator replay to success,
+/// whatever order their attempts fail in.
+#[tokio::test]
+async fn two_retrying_virtual_blocks_in_one_combinator() {
+    let result = LocalRunner::new()
+        .run(
+            |_: serde_json::Value, ctx: DurableContext| async move {
+                let a = virtual_block_failing_once(&ctx, "a", Duration::from_millis(300));
+                let b = virtual_block_failing_once(&ctx, "b", Duration::ZERO);
+                let out = ctx.try_join_all([a, b]).name("all").await?;
+                Ok::<_, durable::BoxError>(out)
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert!(result.invocation_count() >= 2, "{result}");
+    assert_eq!(result.output(), Some(&vec!["a".to_owned(), "b".to_owned()]));
+}
+
+/// A retrying virtual block started with `.spawn()` beside the caller's
+/// steps replays to success: its wait and second attempt take IDs in its
+/// own namespace, not the caller's.
+#[tokio::test(start_paused = true)]
+async fn spawned_retrying_virtual_block_beside_caller_steps() {
+    let result = LocalRunner::new()
+        .run(
+            |_: serde_json::Value, ctx: DurableContext| async move {
+                let block = ctx
+                    .with_retry(|_child, attempt| async move {
+                        if attempt == 1 {
+                            Err::<u32, durable::BoxError>("transient".into())
+                        } else {
+                            Ok(1)
+                        }
+                    })
+                    .name("b")
+                    .retry_strategy(retry_until(2))
+                    .virtual_context()
+                    .spawn();
+                ctx.step(|_| async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok(())
+                })
+                .name("s")
+                .await?;
+                ctx.step(|_| async { Ok(()) }).name("t").await?;
+                let value = block.await?;
+                ctx.wait(Duration::from_secs(5)).name("end").await?;
+                Ok::<_, durable::BoxError>(value)
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert!(result.invocation_count() >= 2, "{result}");
+    assert_eq!(result.output(), Some(&1));
 }
 
 /// A `RetryStrategyConfig` (issue #12) drives block retries the same way a
@@ -1004,10 +1035,10 @@ async fn wrapped_block_claims_id_when_awaited() {
     }
 }
 
-/// With `without_child_context`, `sub_type` has no recorded effect: no
-/// operation records the subtype.
+/// With `virtual_context`, `sub_type` has no recorded effect: no operation
+/// records the subtype.
 #[tokio::test]
-async fn unwrapped_sub_type_has_no_recorded_effect() {
+async fn virtual_sub_type_has_no_recorded_effect() {
     let result = LocalRunner::new()
         .run(
             |_: serde_json::Value, ctx: DurableContext| async move {
@@ -1015,7 +1046,7 @@ async fn unwrapped_sub_type_has_no_recorded_effect() {
                     .with_retry(|_child, attempt| async move { Ok(attempt) })
                     .name("block")
                     .sub_type(durable::OperationSubType::new("Checkout")?)
-                    .without_child_context()
+                    .virtual_context()
                     .await?;
                 Ok::<_, durable::BoxError>(out)
             },
@@ -1039,11 +1070,11 @@ async fn unwrapped_sub_type_has_no_recorded_effect() {
     );
 }
 
-/// `serdes` rebuilds the builder and keeps the unwrapped mode: the block
-/// still writes no record, and its attempts are named after the block in
-/// the caller's context.
+/// `serdes` rebuilds the builder and keeps the virtual mode: the block
+/// still writes no record, and its attempts and wait are named after the
+/// block and name the caller's parent as theirs.
 #[tokio::test]
-async fn unwrapped_mode_survives_serdes() {
+async fn virtual_mode_survives_serdes() {
     let result = LocalRunner::new()
         .run(
             |_: serde_json::Value, ctx: DurableContext| async move {
@@ -1057,7 +1088,7 @@ async fn unwrapped_mode_survives_serdes() {
                     })
                     .name("block")
                     .retry_strategy(retry_until(2))
-                    .without_child_context()
+                    .virtual_context()
                     .serdes(durable::JsonSerdes)
                     .await?;
                 Ok::<_, durable::BoxError>(out)

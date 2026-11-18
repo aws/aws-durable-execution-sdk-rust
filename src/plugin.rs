@@ -757,10 +757,8 @@ pub trait Plugin: Send + Sync {
     /// - a step attempt, including the submitter step of a
     ///   `wait_for_callback` named `<name>-submitter`;
     /// - a `wait_for_condition` check;
-    /// - a `run_in_child_context` body, the block of a `with_retry` with its
-    ///   own record, and the body of a `wait_for_callback`. A `with_retry`
-    ///   block with `without_child_context` has no record and is not a user
-    ///   function;
+    /// - a `run_in_child_context` body, the block of a `with_retry`, and the
+    ///   body of a `wait_for_callback`;
     /// - each item of a `map` and each branch of a `parallel` or
     ///   `parallel_mixed`, and the container of each of those three, whose
     ///   user function produces the batch from the items;
@@ -899,11 +897,9 @@ pub trait Plugin: Send + Sync {
     ///   which the SDK records as failed;
     /// - a step waiting for its retry delay;
     /// - the `attempt-N` child contexts of a `with_retry` block, in either
-    ///   mode. A block with its own record is the user function, and its
-    ///   attempts run inside its wraps. A block with `without_child_context`
-    ///   has no user function, wrap or scope of its own, so its attempts run
-    ///   inside the caller's wraps. The attempts still fire their operation
-    ///   hooks;
+    ///   mode. The block, with its own record or virtual, is the user
+    ///   function, and its attempts run inside its wraps. The attempts still
+    ///   fire their operation hooks;
     /// - the join of a combinator that fails because an input was not
     ///   claimed, after its own `START` and `on_operation_start`.
     ///
@@ -921,14 +917,12 @@ pub trait Plugin: Send + Sync {
     /// a `tracing` subscriber that the SDK calls for a warning about a
     /// plugin. Like the step-body check, the check runs where an operation
     /// takes its ID. Most builders take it when the operation is created; a
-    /// combinator takes it when it is first polled or spawned; a `with_retry`
-    /// block with its own record takes it when the builder becomes its
-    /// future; and a block with `without_child_context` takes none, while
-    /// each of its attempts and waits takes the caller's next ID when it
-    /// starts. The check does
-    /// not follow a builder or future that other code created and that took
-    /// its ID, a later poll of it, a handle returned by `.spawn()`, or code
-    /// on a task or thread that the plugin starts itself.
+    /// combinator takes it when it is first polled or spawned; and a
+    /// `with_retry` block takes it when the builder becomes its future. The
+    /// check does not follow a builder or future that other code created
+    /// and that took its ID, a later poll of it, a handle returned by
+    /// `.spawn()`, or code on a task or thread that the plugin starts
+    /// itself.
     ///
     /// A context usage error recorded before the SDK decides the
     /// invocation's outcome fails the execution. One recorded later, by a
@@ -1302,7 +1296,7 @@ pub trait Plugin: Send + Sync {
     /// | step attempt, `wait_for_callback` submitter step | the step's error, with the type `Error` unless the error names one, as a `TypedError` does |
     /// | `wait_for_condition` check | the check's error, with the type `Error` unless the error names one, as a `TypedError` does |
     /// | `run_in_child_context` body, map item, parallel or `parallel_mixed` branch | the body's error, as the child context records it |
-    /// | `with_retry` block with its own record | the error that ends the retries; a block with `without_child_context` is not a user function |
+    /// | `with_retry` block | the error that ends the retries |
     /// | `wait_for_callback` body | the error the operation records, such as `Callback.ExternalFailure` |
     /// | `map`, `parallel` or `parallel_mixed` container | never: the batch holds the item failures |
     /// | `try_join_all` | `CombinatorError.JoinFailed.<i>` for input `i` |

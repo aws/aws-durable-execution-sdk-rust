@@ -10,9 +10,6 @@
 //!   (`OperationType::Context`) whose body is the retry loop. Its sub-type
 //!   is the one the caller sets with `WithRetryBuilder::sub_type`, and
 //!   `RunInChildContext` when the caller sets none. With
-//!   `WithRetryBuilder::without_child_context`, the block writes no record
-//!   of its own: the loop runs in the caller's context, and a block named
-//!   `b` names its attempts `b-attempt-N`. With
 //!   `WithRetryBuilder::virtual_context`, the block is a virtual child
 //!   context: the loop runs in its own namespace but the block writes no
 //!   record, and a block named `b` names its attempts `b-attempt-N`.
@@ -54,9 +51,6 @@ pub(crate) enum RetryWrap {
     /// children inside it.
     #[default]
     Child,
-    /// The block writes no record: its attempts and waits are created in
-    /// the caller's context, as JS `wrapWithRunInChildContext: false`.
-    None,
     /// The block is a virtual child context: it claims an ID and its
     /// attempts and waits are created in its own namespace, but it writes
     /// no record, so they name the caller's parent as their parent.
@@ -85,21 +79,13 @@ impl LoopFailure {
             )),
         }
     }
-
-    /// The error an unwrapped block returns: the attempt's or the wait's
-    /// error, unchanged.
-    pub(crate) fn into_operation_error(self) -> OperationError {
-        match self {
-            Self::Exhausted(err) | Self::Wait(err) => err,
-        }
-    }
 }
 
-/// The name of attempt `attempt`: `{block}-attempt-N` for an unwrapped or
-/// virtual block with a non-empty name, `attempt-N` otherwise.
+/// The name of attempt `attempt`: `{block}-attempt-N` for a virtual block
+/// with a non-empty name, `attempt-N` otherwise.
 pub(crate) fn attempt_name(block: Option<&str>, wrap: RetryWrap, attempt: u32) -> String {
     match (wrap, block) {
-        (RetryWrap::None | RetryWrap::Virtual, Some(block)) if !block.is_empty() => {
+        (RetryWrap::Virtual, Some(block)) if !block.is_empty() => {
             format!("{block}-attempt-{attempt}")
         }
         _ => format!("attempt-{attempt}"),
@@ -107,8 +93,7 @@ pub(crate) fn attempt_name(block: Option<&str>, wrap: RetryWrap, attempt: u32) -
 }
 
 /// Creates the future of attempt `attempt` as a nested child context of
-/// `outer`, which claims its operation ID now. With `started`, the
-/// attempt's start step runs now, on the caller's task.
+/// `outer`, which claims its operation ID now.
 ///
 /// The closure is shared as `Arc<F>`, because the block runs it once per
 /// attempt, and receives the attempt number with the attempt's context.
@@ -120,7 +105,6 @@ pub(crate) fn start_attempt<O, F, Fut, S>(
     attempt: u32,
     closure: &Arc<F>,
     serdes: &Arc<S>,
-    started: bool,
 ) -> DurableFuture<O>
 where
     O: Send + 'static,
@@ -130,37 +114,30 @@ where
 {
     let f = Arc::clone(closure);
     let n = attempt;
-    let builder = outer
+    outer
         .run_in_child_context(move |attempt_ctx| f(attempt_ctx, n))
         .without_user_function()
         .name(name)
-        .serdes(Arc::clone(serdes));
-    if started {
-        builder.started_future()
-    } else {
-        builder.into_future()
-    }
+        .serdes(Arc::clone(serdes))
+        .into_future()
 }
 
 /// Runs the retry loop in `outer`.
 ///
-/// `outer` is the block's own child context, or the caller's context for
-/// an unwrapped block. The loop creates one nested child context per
-/// attempt plus one wait per retry delay in it. `first` is attempt 1's
-/// future when the caller already created it; otherwise the loop creates
-/// it. Returns the first successful attempt's value, or the
+/// `outer` is the block's own child context, virtual for a virtual block.
+/// The loop creates one nested child context per attempt plus one wait per
+/// retry delay in it. Returns the first successful attempt's value, or the
 /// [`LoopFailure`] that ended the loop.
 ///
 /// The closure is generic (`Arc<F>` rather than a boxed `dyn Fn`): each
 /// attempt produces a concrete future without its own box, so the single
 /// erasure point stays at the enclosing builder's
 /// [`DurableFuture`](crate::DurableFuture). `name` is the block's name; it
-/// names the waits between attempts, and an unwrapped block's attempts.
+/// names the waits between attempts, and a virtual block's attempts.
 pub(crate) async fn retry_loop<O, F, Fut, S>(
     outer: DurableContext,
     name: Option<String>,
     wrap: RetryWrap,
-    first: Option<DurableFuture<O>>,
     closure: Arc<F>,
     strategy: Arc<RetryStrategy>,
     serdes: Arc<S>,
@@ -172,23 +149,18 @@ where
     S: Serdes<O>,
 {
     let mut attempt: u32 = 1;
-    let mut first = first;
     loop {
         // One nested child context per attempt: a fresh operation
         // namespace, so nothing recorded by a previous (failed) attempt
         // replays into this one. On replay, a finished attempt returns its
         // frozen outcome without calling the closure.
-        let future = match first.take() {
-            Some(future) => future,
-            None => start_attempt(
-                &outer,
-                attempt_name(name.as_deref(), wrap, attempt),
-                attempt,
-                &closure,
-                &serdes,
-                false,
-            ),
-        };
+        let future = start_attempt(
+            &outer,
+            attempt_name(name.as_deref(), wrap, attempt),
+            attempt,
+            &closure,
+            &serdes,
+        );
         let err = match future.await {
             Ok(value) => return Ok(value),
             Err(err) => err,
@@ -248,9 +220,9 @@ mod tests {
 
     /// Exhaustion makes the last attempt's error the child failure's
     /// direct source; a failed wait goes under `with_retry delay wait
-    /// failed`. An unwrapped block returns either error unchanged.
+    /// failed`.
     #[test]
-    fn loop_failure_maps_to_child_and_operation_errors() {
+    fn loop_failure_maps_to_child_error() {
         let exhausted = LoopFailure::Exhausted(op_error(ChildContextErrorKind::ChildFailed))
             .into_child_error()
             .into_source();
@@ -268,21 +240,6 @@ mod tests {
                 .and_then(|s| s.downcast_ref::<OperationError>())
                 .is_some()
         );
-
-        let err = LoopFailure::Exhausted(op_error(ChildContextErrorKind::ChildFailed))
-            .into_operation_error();
-        assert!(matches!(
-            err.kind(),
-            OperationErrorKind::ChildContext(child)
-                if matches!(child.kind(), ChildContextErrorKind::ChildFailed)
-        ));
-        let err =
-            LoopFailure::Wait(op_error(ChildContextErrorKind::Internal)).into_operation_error();
-        assert!(matches!(
-            err.kind(),
-            OperationErrorKind::ChildContext(child)
-                if matches!(child.kind(), ChildContextErrorKind::Internal)
-        ));
     }
 
     /// A failed attempt reaches the strategy as
@@ -342,13 +299,9 @@ mod tests {
         );
     }
 
-    /// Only an unwrapped or virtual block with a non-empty name prefixes its
-    /// attempts.
+    /// Only a virtual block with a non-empty name prefixes its attempts.
     #[test]
     fn attempt_names() {
-        assert_eq!(attempt_name(Some("b"), RetryWrap::None, 2), "b-attempt-2");
-        assert_eq!(attempt_name(Some(""), RetryWrap::None, 2), "attempt-2");
-        assert_eq!(attempt_name(None, RetryWrap::None, 2), "attempt-2");
         assert_eq!(attempt_name(Some("b"), RetryWrap::Child, 2), "attempt-2");
         assert_eq!(
             attempt_name(Some("b"), RetryWrap::Virtual, 2),

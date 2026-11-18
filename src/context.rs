@@ -707,12 +707,8 @@ impl std::fmt::Debug for Inner {
 /// freely to share across async boundaries. Every durable operation method
 /// except [`with_retry`](Self::with_retry) and the four combinators claims
 /// its operation ID synchronously at the call site: polling order never
-/// affects identity. A `with_retry` block with its own record claims its ID
-/// when its builder becomes its future (`.await`, `.future()` or
-/// `.spawn()`); a block with
-/// [`without_child_context`](crate::builders::WithRetryBuilder::without_child_context)
-/// claims none, and its first attempt claims the caller's next ID when it
-/// starts. A combinator
+/// affects identity. A `with_retry` block claims its ID when its builder
+/// becomes its future (`.await`, `.future()` or `.spawn()`). A combinator
 /// ([`try_join_all`](Self::try_join_all), [`join_all`](Self::join_all),
 /// [`select_ok`](Self::select_ok) and [`race`](Self::race)) claims its ID
 /// when it is first awaited or polled, or when it is spawned. A combinator
@@ -3371,15 +3367,12 @@ impl DurableContext {
     /// [`retry_strategy`](WithRetryBuilder::retry_strategy) or
     /// [`retry_strategy_config`](WithRetryBuilder::retry_strategy_config);
     /// without one, the step default applies (6 total attempts with
-    /// exponential backoff). When retries exhaust, a block with its own
-    /// record fails with a [`ChildContextError`](crate::ChildContextError)
-    /// of kind `ChildFailed` whose source is the last attempt's
+    /// exponential backoff).
+    ///
+    /// When retries exhaust, the block fails with a
+    /// [`ChildContextError`](crate::ChildContextError) of kind
+    /// `ChildFailed` whose source is the last attempt's
     /// [`OperationError`](crate::OperationError).
-    /// [`without_child_context`](WithRetryBuilder::without_child_context)
-    /// runs the attempts in this context, without a record for the block;
-    /// on exhaustion such a block returns the last attempt's
-    /// `OperationError` unchanged, a `ChildContextError` of kind
-    /// `ChildFailed` whose source is the attempt body's error.
     ///
     /// # Examples
     ///

@@ -724,26 +724,6 @@ async fn spawned_with_retry_start_precedes_next_operation() {
     assert_eq!(order(&result, "wr"), ["wr", "s1"]);
 }
 
-/// An unwrapped block's `.spawn()` queues attempt 1's `START` before it
-/// returns, as the block's own `START` is queued for a wrapped block.
-#[tokio::test]
-async fn spawned_unwrapped_with_retry_attempt_start_precedes_next_operation() {
-    let result = run_local(Options::default(), |_, ctx| async move {
-        let wr = ctx
-            .with_retry(|child, _attempt| async move {
-                Ok(child.step(|_| async { Ok(1_u32) }).name("in").await?)
-            })
-            .name("wr")
-            .without_child_context()
-            .spawn();
-        s1(&ctx).await?;
-        wr.await?;
-        Ok(())
-    })
-    .await;
-    assert_eq!(order(&result, "wr-attempt-1"), ["wr-attempt-1", "s1"]);
-}
-
 #[tokio::test]
 async fn spawned_step_start_hook_precedes_next_operation_hook() {
     let log = Log::default();

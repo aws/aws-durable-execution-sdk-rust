@@ -348,10 +348,8 @@ event and on results the service already recorded. Combinators and
 `with_retry` blocks are the exceptions. A combinator claims its ID when it is
 first awaited or polled, or when it is spawned, and an outer combinator
 rejects an inner combinator that has not claimed yet. A `with_retry` block
-with its own record claims its ID when the builder becomes its future, at
-`.await`, `.future()` or `.spawn()`. A block with `.without_child_context()`
-claims no ID of its own; each of its attempts and waits claims the caller's
-next ID when it starts. A new error path returns an
+claims its ID when the builder becomes its future, at `.await`, `.future()`
+or `.spawn()`. A new error path returns an
 error rather than panicking, and a new operation follows the builder shape the
 existing operations use so the API stays predictable. The reviewer also asks
 whether the change belongs in the SDK at all, or whether an example teaches it

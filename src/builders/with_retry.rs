@@ -41,13 +41,9 @@ use crate::with_retry::{LoopFailure, RetryWrap};
 /// uses: 6 total attempts with exponential backoff (5s initial delay, 60s
 /// cap, factor 2).
 ///
-/// When retries exhaust, a block with its own record fails with a
+/// When retries exhaust, the block fails with a
 /// [`ChildContextError`](crate::ChildContextError) of kind `ChildFailed`
-/// whose source is the last attempt's [`OperationError`]. A block with
-/// [`without_child_context`](WithRetryBuilder::without_child_context)
-/// returns the last attempt's [`OperationError`] unchanged instead: a
-/// `ChildContextError` of kind `ChildFailed` whose source is the attempt
-/// body's error.
+/// whose source is the last attempt's [`OperationError`].
 ///
 /// The builder is generic over the block closure `F` and its future
 /// `Fut`; both parameters are inferred at the call site and never written
@@ -113,9 +109,8 @@ where
     /// Creates a new builder (internal). Taking the closure here keeps the
     /// field non-optional: a builder without a body is unrepresentable.
     ///
-    /// The builder claims no operation ID: a block with its own child
-    /// context claims its ID when the builder becomes its future, because
-    /// only then is its mode known.
+    /// The builder claims no operation ID: the block claims its ID when the
+    /// builder becomes its future.
     pub(crate) fn new_internal(ctx: DurableContext, closure: F) -> Self {
         Self {
             ctx,
@@ -168,11 +163,8 @@ where
     /// executions in flight: their replay fails with
     /// `NonDeterministicExecutionError`.
     ///
-    /// With [`without_child_context`](Self::without_child_context) the
-    /// block has no record, so the subtype has no recorded effect.
     /// With [`virtual_context`](Self::virtual_context) the block has no
-    /// record either, so the subtype appears only in errors and plugin hook
-    /// infos.
+    /// record, so the subtype appears only in errors and plugin hook infos.
     ///
     /// # Examples
     ///
@@ -197,52 +189,6 @@ where
     /// ```
     pub fn sub_type(mut self, sub_type: OperationSubType) -> Self {
         self.sub_type = Some(sub_type);
-        self
-    }
-
-    /// Runs the attempts in the caller's context, without a `with_retry`
-    /// record, as JS `wrapWithRunInChildContext: false`. When the block is
-    /// named `b`, its attempt children are named `b-attempt-N`; without
-    /// this setter they are `attempt-N` inside the block's own context. In
-    /// every mode the waits of a block named `b` are named `b-backoff-N`,
-    /// and the waits of an unnamed block have no name.
-    ///
-    /// The block claims no operation ID, so `attempt-1` takes the caller's
-    /// next positional ID, and each later attempt and wait takes the
-    /// caller's next ID when it starts. Await the block before the caller
-    /// creates another operation, so those IDs stay the same on every run.
-    /// No operation hook, user-function hook or `wrap_user_function` runs
-    /// for the block itself. On exhaustion the block returns the last
-    /// `attempt-N` child's error unchanged: a
-    /// [`ChildContextError`](crate::ChildContextError) of kind
-    /// `ChildFailed` whose source is the body's error.
-    ///
-    /// The last call of [`virtual_context`](Self::virtual_context) and
-    /// `without_child_context` wins.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use aws_durable_execution_sdk as durable;
-    ///
-    /// async fn handler(
-    ///     _event: serde_json::Value,
-    ///     ctx: durable::DurableContext,
-    /// ) -> Result<u32, durable::BoxError> {
-    ///     // Records `charge-attempt-1`, `charge-attempt-2`, ... directly in
-    ///     // the handler's context.
-    ///     let total = ctx
-    ///         .with_retry(|child, _attempt| async move {
-    ///             Ok(child.step(|_| async { Ok(42_u32) }).name("work").await?)
-    ///         })
-    ///         .name("charge")
-    ///         .without_child_context()
-    ///         .await?;
-    ///     Ok(total)
-    /// }
-    /// ```
-    pub fn without_child_context(mut self) -> Self {
-        self.wrap = RetryWrap::None;
         self
     }
 
@@ -288,8 +234,7 @@ where
     ///
     /// When the block is named `b`, its attempt children are named
     /// `b-attempt-N` and its waits `b-backoff-N`; the waits of an unnamed
-    /// block have no name. The last call of `virtual_context` and
-    /// [`without_child_context`](Self::without_child_context) wins.
+    /// block have no name.
     ///
     /// # Examples
     ///
@@ -439,11 +384,8 @@ where
     /// applies to the block's own child context, as
     /// [`ChildBuilder::summary`](crate::builders::ChildBuilder::summary)
     /// does to a child context; the `attempt-N` contexts record their
-    /// results without one. With
-    /// [`without_child_context`](Self::without_child_context) the block
-    /// writes no record of its own, so the summary is never called. With
-    /// [`virtual_context`](Self::virtual_context) the block writes no
-    /// record either, and the summary is never called.
+    /// results without one. With [`virtual_context`](Self::virtual_context)
+    /// the block writes no record, so the summary is never called.
     ///
     /// The output is observability only: replay never reads it. A replay
     /// that rebuilds the result of a completed `ReplayChildren` record does
@@ -556,14 +498,11 @@ where
     /// The operation's future. With `started`, its start step runs now, on
     /// the caller's task (see [`crate::start`]); `.spawn()` uses that.
     ///
-    /// A block with its own child context claims its operation ID here,
-    /// when the builder becomes its future. An unwrapped block claims
-    /// nothing: its first attempt claims the caller's next ID when it
-    /// starts.
+    /// The block claims its operation ID here, when the builder becomes its
+    /// future.
     fn build(self, started: bool) -> DurableFuture<O> {
         match self.wrap {
             RetryWrap::Child => self.build_child(started),
-            RetryWrap::None => self.build_unwrapped(started),
             RetryWrap::Virtual => self.build_virtual(),
         }
     }
@@ -607,7 +546,6 @@ where
                     outer_ctx,
                     loop_name,
                     RetryWrap::Virtual,
-                    None,
                     closure,
                     strategy,
                     loop_serdes,
@@ -670,7 +608,6 @@ where
                     outer_ctx,
                     loop_name,
                     RetryWrap::Child,
-                    None,
                     closure,
                     strategy,
                     loop_serdes,
@@ -690,49 +627,6 @@ where
             DurableFuture::for_start_step(&execution.ctx.clone(), move || {
                 execution.execute_started()
             })
-        }
-    }
-
-    /// The future of an unwrapped block: the retry loop runs in the
-    /// caller's context, and the block writes no record and fires no hook
-    /// of its own. Its start step is attempt 1's start step.
-    fn build_unwrapped(self, started: bool) -> DurableFuture<O> {
-        let ctx = self.ctx;
-        let name = self.name;
-        let closure = Arc::new(self.closure);
-        let strategy: Arc<RetryStrategy> = Arc::new(
-            self.retry_strategy
-                .unwrap_or_else(crate::step::default_retry_strategy),
-        );
-        let serdes = Arc::new(self.serdes);
-        let loop_ctx = ctx.clone();
-        let begin = move || {
-            let first = crate::with_retry::start_attempt(
-                &loop_ctx,
-                crate::with_retry::attempt_name(name.as_deref(), RetryWrap::None, 1),
-                1,
-                &closure,
-                &serdes,
-                true,
-            );
-            async move {
-                crate::with_retry::retry_loop(
-                    loop_ctx,
-                    name,
-                    RetryWrap::None,
-                    Some(first),
-                    closure,
-                    strategy,
-                    serdes,
-                )
-                .await
-                .map_err(LoopFailure::into_operation_error)
-            }
-        };
-        if started {
-            DurableFuture::for_started_operation(&ctx, begin())
-        } else {
-            DurableFuture::for_start_step(&ctx, begin)
         }
     }
 
@@ -810,7 +704,6 @@ mod tests {
                         outer_ctx,
                         Some("block".to_owned()),
                         RetryWrap::Child,
-                        None,
                         attempt,
                         Arc::new(crate::step::default_retry_strategy()),
                         Arc::new(JsonSerdes),
@@ -841,41 +734,19 @@ mod tests {
         );
     }
 
-    /// `serdes` keeps the wrap mode in both directions.
+    /// `serdes` keeps the virtual and child wrap modes.
     #[test]
     fn serdes_keeps_wrap_mode() {
         let ctx = DurableContext::test_context();
-        let unwrapped = ctx
+        let virtual_block = ctx
             .with_retry(|_child, _attempt| async { Ok(1_u32) })
-            .without_child_context()
+            .virtual_context()
             .serdes(Arc::new(JsonSerdes));
-        assert_eq!(unwrapped.wrap, RetryWrap::None);
+        assert_eq!(virtual_block.wrap, RetryWrap::Virtual);
         let wrapped = ctx
             .with_retry(|_child, _attempt| async { Ok(1_u32) })
             .serdes(Arc::new(JsonSerdes));
         assert_eq!(wrapped.wrap, RetryWrap::Child);
-    }
-
-    /// The later of `without_child_context` and `virtual_context` wins,
-    /// and `serdes` keeps the virtual mode.
-    #[test]
-    fn last_wrap_setter_wins() {
-        let ctx = DurableContext::test_context();
-        let virtual_last = ctx
-            .with_retry(|_child, _attempt| async { Ok(1_u32) })
-            .without_child_context()
-            .virtual_context();
-        assert_eq!(virtual_last.wrap, RetryWrap::Virtual);
-        let unwrapped_last = ctx
-            .with_retry(|_child, _attempt| async { Ok(1_u32) })
-            .virtual_context()
-            .without_child_context();
-        assert_eq!(unwrapped_last.wrap, RetryWrap::None);
-        let kept = ctx
-            .with_retry(|_child, _attempt| async { Ok(1_u32) })
-            .virtual_context()
-            .serdes(Arc::new(JsonSerdes));
-        assert_eq!(kept.wrap, RetryWrap::Virtual);
     }
 
     /// A second `sub_type` call replaces the first, and `serdes` keeps

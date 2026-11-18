@@ -11359,11 +11359,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    /// A `with_retry` block without a child context writes no record of
-    /// its own, so its summary is never called, even for an oversized
-    /// result.
+    /// A virtual `with_retry` block writes no record of its own, so its summary
+    /// is never called, even for an oversized result.
     #[tokio::test]
-    async fn with_retry_summary_never_called_without_child_context() {
+    async fn virtual_with_retry_never_calls_summary() {
         let calls = Arc::new(AtomicU32::new(0));
         let handler_calls = Arc::clone(&calls);
         let result = LocalRunner::new()
@@ -11376,7 +11375,7 @@ mod tests {
                                 Ok("x".repeat(300 * 1024))
                             })
                             .name("block")
-                            .without_child_context()
+                            .virtual_context()
                             .summary(move |_s: &String| {
                                 calls.fetch_add(1, Ordering::SeqCst);
                                 "unused".to_owned()

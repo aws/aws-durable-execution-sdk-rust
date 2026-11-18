@@ -5022,13 +5022,12 @@ async fn with_retry_exhaustion_end_hook() {
     }
 }
 
-/// An unwrapped `with_retry` block `block` inside a child `outer` is no
-/// user-function site and fires no operation hook: only its
-/// `block-attempt-1` and `block-attempt-2` children fire their operation
-/// hooks, they fire no user-function hook, and each attempt body runs
-/// inside `outer`'s wraps only.
+/// A virtual `with_retry` block `block` inside a child `outer` is a
+/// user-function site although it writes no record. Its attempt children
+/// fire operation hooks but no user-function hooks, and each attempt body
+/// runs inside `block`'s wraps.
 #[tokio::test]
-async fn unwrapped_block_is_not_a_user_function_site() {
+async fn virtual_block_is_a_user_function_site() {
     let uf = Uf::default();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let handler_seen = Arc::clone(&seen);
@@ -5053,7 +5052,7 @@ async fn unwrapped_block_is_not_a_user_function_site() {
                                     }
                                 })
                                 .name("block")
-                                .without_child_context()
+                                .virtual_context()
                                 .retry_strategy(retry_once)
                                 .await?)
                         })
@@ -5068,8 +5067,9 @@ async fn unwrapped_block_is_not_a_user_function_site() {
         .expect("runner");
     assert_eq!(result.output(), Some(&4));
     assert!(result.operation("block").is_none(), "{result}");
+    uf.assert_full(2, "block");
     assert!(
-        uf.recs().iter().all(|r| r.op != "block"),
+        uf.of("block").iter().all(|r| r.info.is_virtual()),
         "{:?}",
         uf.of("block")
     );
@@ -5084,7 +5084,10 @@ async fn unwrapped_block_is_not_a_user_function_site() {
             assert_eq!(count, 2, "both plugins' {hook} for {attempt}");
         }
     }
-    assert_eq!(*seen.lock().unwrap(), [["I", "outer"], ["I", "outer"]]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [["I", "outer", "block"], ["I", "outer", "block"]]
+    );
 }
 
 /// A `parallel` `p` with one branch `b` running a step `s`: each hook and
