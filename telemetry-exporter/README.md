@@ -46,9 +46,10 @@ standard output. Lambda sends standard output to the function's log group.
 | Exporter | Destination | IAM permissions |
 | --- | --- | --- |
 | `LambdaLogExporter` (default) | Standard output, one JSON line per record | None |
+| `CloudWatchLogsExporter` | A log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
 
-The exporter writes the `operationsByName` form of the record. It
-truncates a record larger than 256,000 bytes. Truncation drops operation
+Both exporters write the `operationsByName` form of the record. Both
+truncate a record larger than 256,000 bytes. Truncation drops operation
 results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
 dropped.
@@ -93,8 +94,7 @@ let telemetry = DurableExecutionTelemetry::builder()
 
 ## Development
 
-The crate is its own cargo workspace. Exporters that need an AWS service
-client depend on crates that the SDK's dependency allowlist does not
-include, so the crate is not a member of the root workspace.
-`make workspaces WORKSPACES=telemetry-exporter` checks the formatting,
-builds, lints, runs the tests and builds the docs.
+The crate is its own cargo workspace. The SDK's dependency allowlist does
+not include `aws-sdk-cloudwatchlogs`, so the crate is not a member of the
+root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
+formatting, builds, lints, runs the tests and builds the docs.
