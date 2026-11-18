@@ -3074,6 +3074,13 @@ impl DurableContext {
     /// the invocation, and any other serdes error returns
     /// `WaitForCondition(SerializationFailed)` without calling the check.
     ///
+    /// A check whose outcome the service has not recorded when the
+    /// invocation ends, at the function timeout, in a crash or when a
+    /// checkpoint write fails, runs again in the next invocation with the
+    /// initial state, not with the state the previous check returned: the
+    /// service clears the recorded state when it records the check's start.
+    /// The re-run check keeps the attempt number of the check it replaces.
+    ///
     /// A check error fails the operation without a retry. It records the
     /// type of a [`TypedError`](crate::TypedError) in its source chain, or
     /// `Error` when there is none. The error kind follows the recorded

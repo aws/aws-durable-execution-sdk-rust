@@ -997,3 +997,60 @@ async fn fault_setters_replace_the_whole_fault() {
     assert_eq!(replaced.invocation_count(), alone.invocation_count());
     assert!(alone.is_success(), "{alone}");
 }
+
+/// A `wait_for_condition` check that is running when the invocation ends
+/// runs again in the next invocation with the initial state, because the
+/// service clears the recorded state when it applies the check's `START`.
+/// `LocalRunner` does the same. The re-run check keeps its attempt number.
+#[tokio::test]
+async fn wait_for_condition_check_interrupted_after_start_restarts_from_initial_state() {
+    use durable::builders::wait_for_condition::WaitDecision;
+    use std::sync::Mutex;
+
+    let seen = Arc::new(Mutex::new(Vec::<(u32, u32)>::new()));
+    let seen_h = Arc::clone(&seen);
+    let result = LocalRunner::new()
+        // Checkpoints: check 1 START, check 1 RETRY, check 2 START, then
+        // check 2's RETRY fails, so the invocation ends inside check 2.
+        .fail_checkpoints_after_retryable(3, 1)
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let seen = Arc::clone(&seen_h);
+                async move {
+                    let out = ctx
+                        .wait_for_condition(
+                            move |step, state: u32| {
+                                let seen = Arc::clone(&seen);
+                                async move {
+                                    seen.lock()
+                                        .expect("test mutex")
+                                        .push((state, step.attempt()));
+                                    Ok(state + 1)
+                                }
+                            },
+                            0_u32,
+                        )
+                        .wait_strategy_fn(|state: u32, _attempt| {
+                            if state >= 3 {
+                                WaitDecision::complete()
+                            } else {
+                                WaitDecision::continue_with(Duration::from_secs(1))
+                            }
+                        })
+                        .name("counter")
+                        .await?;
+                    Ok::<_, durable::BoxError>(out)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("the run finishes");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.output(), Some(&3));
+    // The re-run check 2 receives the initial state 0 and keeps attempt 2.
+    assert_eq!(
+        *seen.lock().expect("test mutex"),
+        vec![(0, 1), (1, 2), (0, 2), (1, 3), (2, 4)]
+    );
+}

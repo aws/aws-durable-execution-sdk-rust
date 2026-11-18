@@ -676,6 +676,13 @@ invocation.
 between attempts, and waits between polls. The invocation suspends during
 that wait only when no other SDK work can make progress, and a check that
 becomes due while other work runs continues in the same invocation.
+A check whose outcome the service has not recorded when the invocation
+ends, at the function timeout, in a crash or when a checkpoint write
+fails, runs again in the next invocation with the initial state, not with
+the state the previous check returned: the service clears the recorded
+state when it records the check's start. The re-run check keeps the
+attempt number of the check it replaces. So a check must give a correct
+result when it starts again from the initial state.
 A wait strategy is required: call `.wait_strategy(...)` or
 `.wait_strategy_fn(...)` before the builder can become a future. Code that
 awaits the builder without one, or calls `.future()` or `.spawn()` on it,

@@ -411,7 +411,10 @@ where
         // prior result; reading the state after START would overwrite the
         // carried state with initial_state and prevent the condition from
         // ever advancing. The carried state is a property of the prior
-        // attempt's checkpoint, independent of this attempt's START.
+        // attempt's checkpoint, independent of this attempt's START. The
+        // service clears the result when it applies START, so a check
+        // re-entered in a `STARTED` record, after an invocation ended
+        // inside it, finds no result and receives the initial state.
         let current_state =
             if let Some(payload) = self.ctx.checkpoint_result_payload(&positional_id) {
                 // On deserialization failure, surface the error loudly and

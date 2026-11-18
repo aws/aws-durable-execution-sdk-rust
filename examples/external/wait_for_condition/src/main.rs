@@ -5,17 +5,18 @@
 //! delay between polls. The invocation suspends during that wait only when no
 //! other SDK work can make progress. This handler runs no other SDK work
 //! during its waits, so its invocation suspends at each wait and the polling
-//! does not hold the invocation open. The state
-//! (here a counter starting at 0) is checkpointed each attempt and survives
-//! across resumes. The strategy returns
+//! does not hold the invocation open. The state (here a counter starting at
+//! 0) is checkpointed each attempt and survives across resumes. A check
+//! whose outcome is not recorded when an invocation ends runs again from
+//! the initial state, so the counter then starts over. The strategy returns
 //! [`WaitDecision::complete`](aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision::complete)
 //! once the counter reaches the requested threshold, or
 //! [`WaitDecision::continue_with`](aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision::continue_with)
 //! to poll again after a delay.
 //!
-//! The threshold comes from the event and is small, so the loop is bounded to
-//! a handful of polls: a real check would test an external condition (a file
-//! landed, a job finished) instead of a counter.
+//! When no check is interrupted, the threshold from the event is small, so
+//! this example finishes in a handful of polls. A real check would test an
+//! external condition (a file landed, a job finished) instead of a counter.
 
 use std::time::Duration;
 
