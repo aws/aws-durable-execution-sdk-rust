@@ -622,12 +622,14 @@ pub(crate) mod test_hooks {
 /// activity or checkpoint permit. It sends one checkpoint with no updates
 /// through `root`, whose merge wakes every operation the response
 /// readied, and then schedules each due registration's next refresh. Only
-/// then does it release the permit. A refused permit stops the scheduler.
-/// A failed refresh is recorded as a failed checkpoint write of the
-/// first due operation, and never resolves, so the scheduler sends nothing
-/// more. The failure is recorded where the response arrives, not here, so
-/// a refresh that is in flight when the handler returns still decides the
-/// outcome (see [`crate::DurableContext::checkpoint_refresh`]).
+/// then does it release the permit. When the permit is refused, it sends
+/// nothing and waits for the next re-arm before it reads the registrations
+/// again, so a registration armed later in the invocation is still
+/// refreshed. A failed refresh is recorded as a failed checkpoint write of
+/// the first due operation, and never resolves, so the scheduler sends
+/// nothing more. The failure is recorded where the response arrives, not
+/// here, so a refresh that is in flight when the handler returns still
+/// decides the outcome (see [`crate::DurableContext::checkpoint_refresh`]).
 async fn refresh_scheduler(root: crate::DurableContext) {
     use crate::coordinator::{DueRefresh, PermitKind};
 
@@ -654,7 +656,8 @@ async fn refresh_scheduler(root: crate::DurableContext) {
             } => (keys, first_wire_id),
         };
         let Some(permit) = coordinator.acquire(PermitKind::Scheduler) else {
-            return std::future::pending().await;
+            coordinator.rearmed().await;
+            continue;
         };
         root.checkpoint_refresh(&first_wire_id).await;
         let records = keys
@@ -5669,14 +5672,83 @@ mod refresh_scheduler {
 
     /// The scheduler of a drive whose only work holds no permit sends
     /// nothing. A recorded fatal error keeps the phase `Running` with a due
-    /// registration and no permit, the one state in which the coordinator
-    /// refuses the scheduler's permit while the scheduler is polled.
+    /// registration and no permit, so the coordinator refuses the
+    /// scheduler's permit, and the scheduler waits for a re-arm.
     #[tokio::test(start_paused = true)]
     async fn refused_scheduler_permit_sends_nothing() {
         let client = Arc::new(RefreshClient::new(|_| Ok(Vec::new())));
         let ctx = refresh_ctx(&client);
         let coordinator = Arc::clone(ctx.coordinator());
         coordinator.record_fatal("Fatal".to_owned(), "stop".to_owned());
+        let _wait = coordinator
+            .register_test_wait("op", std::task::Waker::noop())
+            .expect("running");
+        let mut scheduler = std::pin::pin!(super::refresh_scheduler(ctx));
+        let polled = tokio::time::timeout(secs(30), scheduler.as_mut()).await;
+        assert!(polled.is_err(), "the scheduler stays pending");
+        assert_eq!(client.empty_calls(), Vec::<Duration>::new());
+        assert_eq!(coordinator.permits(PermitKind::Scheduler), 0);
+    }
+
+    /// A permit refused while the phase stays `Running` does not stop the
+    /// scheduler: a registration armed later in the drive is refreshed. The
+    /// first registration is due while no permit is held, so the permit is
+    /// refused as when the handler retires the due wait and parks on an
+    /// await outside the SDK between `take_due` and `acquire`.
+    #[tokio::test(start_paused = true)]
+    async fn refused_scheduler_permit_while_running_keeps_refreshing() {
+        let client = Arc::new(RefreshClient::new(|_| Ok(Vec::new())));
+        let ctx = refresh_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        let w1 = coordinator
+            .register_test_wait("w1", std::task::Waker::noop())
+            .expect("running");
+        let mut scheduler = std::pin::pin!(super::refresh_scheduler(ctx));
+        let polled = tokio::time::timeout(secs(2), scheduler.as_mut()).await;
+        assert!(polled.is_err(), "the scheduler stays pending");
+        assert_eq!(client.empty_calls(), Vec::<Duration>::new());
+        drop(w1);
+        let _activity = coordinator.acquire(PermitKind::Activity).expect("running");
+        let _w2 = coordinator
+            .register_test_wait("w2", std::task::Waker::noop())
+            .expect("running");
+        let polled = tokio::time::timeout(millis(1500), scheduler.as_mut()).await;
+        assert!(polled.is_err(), "the scheduler stays pending");
+        assert_eq!(client.empty_calls(), vec![secs(3)]);
+    }
+
+    /// After a withdrawal, and after the phase left `Running`, a refused
+    /// scheduler sends nothing and stays pending.
+    #[tokio::test(start_paused = true)]
+    async fn refused_scheduler_permit_after_withdrawal_or_finish_sends_nothing() {
+        for withdraw in [true, false] {
+            let client = Arc::new(RefreshClient::new(|_| Ok(Vec::new())));
+            let ctx = refresh_ctx(&client);
+            let coordinator = Arc::clone(ctx.coordinator());
+            let _wait = coordinator
+                .register_test_wait("op", std::task::Waker::noop())
+                .expect("running");
+            if withdraw {
+                coordinator.withdraw("arn", "request", || {});
+            } else {
+                coordinator.finish();
+            }
+            let mut scheduler = std::pin::pin!(super::refresh_scheduler(ctx));
+            let polled = tokio::time::timeout(secs(30), scheduler.as_mut()).await;
+            assert!(polled.is_err(), "the scheduler stays pending");
+            assert_eq!(client.empty_calls(), Vec::<Duration>::new());
+            assert_eq!(coordinator.permits(PermitKind::Scheduler), 0);
+        }
+    }
+
+    /// After a kept panic, which ends the drive and leaves the phase
+    /// `Running`, a refused scheduler sends nothing and stays pending.
+    #[tokio::test(start_paused = true)]
+    async fn refused_scheduler_permit_after_panic_sends_nothing() {
+        let client = Arc::new(RefreshClient::new(|_| Ok(Vec::new())));
+        let ctx = refresh_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        assert!(coordinator.record_panic(Box::new("boom")).is_none());
         let _wait = coordinator
             .register_test_wait("op", std::task::Waker::noop())
             .expect("running");
