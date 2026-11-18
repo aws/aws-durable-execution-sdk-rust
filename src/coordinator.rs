@@ -643,6 +643,13 @@ impl InvocationCoordinator {
         self.lock().wake_log.clone()
     }
 
+    /// Whether a permit or a wait registration can be taken now: the phase
+    /// is `Running` and the withdrawal latch is not set (see
+    /// [`State::admits`]).
+    pub(crate) fn admits(&self) -> bool {
+        self.lock().admits()
+    }
+
     /// Returns the current phase.
     pub(crate) fn phase(&self) -> Phase {
         self.lock().phase

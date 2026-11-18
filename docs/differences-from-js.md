@@ -47,10 +47,10 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### Work left when the drive ends
 
 - **JavaScript:** Drains the queued checkpoints and returns; work still running keeps running.
-- **Rust:** Aborts and awaits the handler's root task and every tracked operation task, including one whose `.spawn()` handle was dropped. It then waits for work it cannot abort, such as admitted checkpoint writes, drains plugin hook work, and returns.
+- **Rust:** Starts no further poll of the handler's root task or of any operation task once the handler returned, a checkpoint response withdrew the checkpoint token, or the drive ended; a poll already running continues to its next `.await`. At the end of the drive it aborts and awaits the handler's root task and every tracked operation task, including one whose `.spawn()` handle was dropped. It then waits for work it cannot abort, such as admitted checkpoint writes, drains plugin hook work, and returns.
 - **Why:** Lambda resumes unfinished background work when it reuses the execution environment ([Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html)). So JavaScript's leftover work can run during a later invocation and checkpoint through the earlier invocation's checkpoint manager.
 - **Decision:** JavaScript defect.
-- **Where:** `src/driver.rs`, `drive_invocation`; `src/plugin.rs`, `InvocationPlugins::invocation_end`.
+- **Where:** `src/task.rs`, `Schedule::begin_poll`; `src/driver.rs`, `drive_invocation`; `src/plugin.rs`, `InvocationPlugins::invocation_end`.
 
 ### Custom checkpoint transport
 

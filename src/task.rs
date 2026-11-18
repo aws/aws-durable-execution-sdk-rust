@@ -65,8 +65,9 @@
 //!    permit. A poll that returns `Pending` without a wake releases it.
 //! 3. A task that finishes hands its outcome over, which wakes the consumer
 //!    and so gives the consumer its permit, and only then releases its own.
-//! 4. Once the phase is not `Running`, the wrapper no longer polls its
-//!    future.
+//! 4. Once the coordinator admits no work (the phase is not `Running`, or
+//!    the withdrawal latch is set), the wrapper starts no further poll of
+//!    its future. A poll already running runs to its next `.await`.
 //!
 //! Detached tasks run the user's checkpoint client, but no handler code.
 //! They take no activity permit and ignore the phase.
@@ -81,7 +82,7 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use tokio::task::{AbortHandle, Id, JoinSet};
 
-use crate::coordinator::{InvocationCoordinator, Permit, PermitKind, Phase};
+use crate::coordinator::{InvocationCoordinator, Permit, PermitKind};
 use crate::driver::TaskOwnership;
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
 use crate::plugin::Frames;
@@ -537,17 +538,25 @@ impl Schedule {
     }
 
     /// Starts a poll: `Queued` becomes `Polling` with the same permit, and
-    /// `Idle` takes a fresh permit. Returns `false` when no permit can be
-    /// taken (the phase left `Running`) or the task is done.
+    /// `Idle` takes a fresh permit. Returns `false` when the coordinator
+    /// admits no work (the phase left `Running`, or the withdrawal latch is
+    /// set) or the task is done. A refused `Queued` task becomes `Idle`, and
+    /// its permit is released after the lock is.
     fn begin_poll(&self) -> bool {
         let mut state = self.lock();
         match std::mem::replace(&mut *state, ScheduleState::Done) {
-            ScheduleState::Queued(permit) => {
+            ScheduleState::Queued(permit) if self.coordinator.admits() => {
                 *state = ScheduleState::Polling {
                     permit,
                     woken: false,
                 };
                 true
+            }
+            ScheduleState::Queued(permit) => {
+                *state = ScheduleState::Idle;
+                drop(state);
+                drop(permit);
+                false
             }
             ScheduleState::Idle => {
                 if let Some(permit) = self.coordinator.acquire(PermitKind::Activity) {
@@ -834,8 +843,8 @@ impl Drop for BlessGuard {
 
 /// How a wrapper takes part in the suspension decision.
 enum Gate {
-    /// An operation task or the root: polled under its [`Schedule`] while
-    /// the phase is `Running`, and not polled afterwards.
+    /// An operation task or the root: polled under its [`Schedule`], which
+    /// starts no poll once the coordinator admits no work.
     Scheduled {
         schedule: Arc<Schedule>,
         waker: Waker,
@@ -1059,7 +1068,7 @@ where
         let this = self.get_mut();
         if let Gate::Scheduled { schedule, .. } = &this.gate {
             schedule.set_outer(cx.waker());
-            if this.coordinator.phase() != Phase::Running || !schedule.begin_poll() {
+            if !schedule.begin_poll() {
                 return Poll::Pending;
             }
         }
@@ -3132,6 +3141,91 @@ mod tests {
         schedule.waker().wake_by_ref();
         assert_eq!(schedule.state(), ScheduleState::Idle);
         assert_eq!(coord.permits(PermitKind::Activity), 0);
+    }
+
+    /// After the phase left `Running`, a queued schedule does not start a
+    /// poll: it becomes idle and releases the permit it was queued with.
+    #[test]
+    fn queued_schedule_is_not_polled_after_the_phase_ends() {
+        use crate::task::test_support::{Schedule, ScheduleState};
+
+        let coord = coordinator();
+        let schedule = Schedule::idle(&coord);
+        schedule.waker().wake_by_ref();
+        assert_eq!(schedule.state(), ScheduleState::Queued);
+        coord.finish();
+        assert!(!schedule.begin_poll(), "no poll after the phase ended");
+        assert_eq!(schedule.state(), ScheduleState::Idle);
+        assert_eq!(coord.permits(PermitKind::Activity), 0);
+    }
+
+    /// After a withdrawal, a queued schedule does not start a poll.
+    #[test]
+    fn queued_schedule_is_not_polled_after_withdrawal() {
+        use crate::task::test_support::{Schedule, ScheduleState};
+
+        let coord = coordinator();
+        let schedule = Schedule::idle(&coord);
+        schedule.waker().wake_by_ref();
+        coord.withdraw("arn", "request", || {});
+        assert!(!schedule.begin_poll(), "no poll after withdrawal");
+        assert_eq!(schedule.state(), ScheduleState::Idle);
+        assert_eq!(coord.permits(PermitKind::Activity), 0);
+    }
+
+    /// While a withdrawal drops the queued writes, the latch is set and the
+    /// phase still reads `Running`. A queued schedule polled in that window
+    /// does not start a poll.
+    #[test]
+    fn queued_schedule_is_not_polled_between_withdrawal_latch_and_phase_move() {
+        use crate::task::test_support::{Schedule, ScheduleState};
+
+        let coord = coordinator();
+        let schedule = Schedule::idle(&coord);
+        schedule.waker().wake_by_ref();
+        assert_eq!(schedule.state(), ScheduleState::Queued);
+        let polled = std::cell::Cell::new(None);
+        coord.withdraw("arn", "request", || {
+            assert!(coord.withdrawn(), "the latch is set");
+            assert_eq!(coord.phase(), Phase::Running, "the phase has not moved");
+            polled.set(Some(schedule.begin_poll()));
+        });
+        assert_eq!(
+            polled.get(),
+            Some(false),
+            "no poll after the withdrawal latch"
+        );
+        assert_eq!(schedule.state(), ScheduleState::Idle);
+        assert_eq!(coord.permits(PermitKind::Activity), 0);
+    }
+
+    /// A task that is queued when the phase leaves `Running` is never
+    /// polled, and its wrapper releases the permit it was queued with.
+    #[tokio::test]
+    async fn queued_task_is_not_polled_after_the_phase_ends() {
+        let coord = coordinator();
+        let ran = Arc::new(AtomicBool::new(false));
+        let task_ran = Arc::clone(&ran);
+        let _task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &ownership(),
+            async move {
+                task_ran.store(true, Ordering::SeqCst);
+            },
+        )
+        .expect("runtime");
+        assert_eq!(coord.permits(PermitKind::Activity), 1, "the task is queued");
+        coord.finish();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!ran.load(Ordering::SeqCst), "the task's future never ran");
+        assert_eq!(
+            coord.permits(PermitKind::Activity),
+            0,
+            "the refused poll released the permit"
+        );
     }
 
     /// A root spawned after the phase ended is never polled.
