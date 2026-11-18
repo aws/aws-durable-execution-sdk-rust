@@ -79,7 +79,12 @@
 //! - [`Plugin::on_operation_start`], [`Plugin::on_attempt_start`],
 //!   [`Plugin::on_attempt_end`] and [`Plugin::on_operation_end`] run in
 //!   lifecycle order: a parent's start before a child's, and a child's end
-//!   before the parent's.
+//!   before the parent's. One exception: a scope that closes, for example
+//!   when a child context's body returns, stops the tasks still running in
+//!   it, and a task that is in a poll then finishes that poll. So the hooks
+//!   that poll reaches can run after the end hooks of the operation whose
+//!   scope closed. [`DurableFuture`](crate::DurableFuture) lists when a
+//!   scope closes.
 //! - For one user function, [`Plugin::on_user_function_start`] runs after
 //!   [`Plugin::on_attempt_start`] (or the child's
 //!   [`Plugin::on_operation_start`]), each plugin's start inside the wraps
@@ -897,7 +902,11 @@ pub trait Plugin: Send + Sync {
     /// it returns gets no end hook either: its scope closed, a combinator
     /// stopped it as a loser, its batch completed early, or the invocation
     /// ended. The SDK drops it inside its wraps, so a destructor in it runs
-    /// in the plugins' context. A container whose item `START` write fails
+    /// in the plugins' context. Those wraps include the wraps of the user
+    /// functions that enclosed the operation when its builder became its
+    /// future, and the drop can come after their `on_user_function_end`. So
+    /// a wrap must not rely on state that the end hook of its own user
+    /// function removed. A container whose item `START` write fails
     /// fails the invocation and never returns, so it gets no end hook.
     ///
     /// These run no user function and fire no start hook, no wrap and no

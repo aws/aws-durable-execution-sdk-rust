@@ -1791,7 +1791,10 @@ parallel and `parallel_mixed` branches, combinator inputs) inside the wraps
 and the `tracing` span that were current when that operation's builder
 became its future (`.await`, `.spawn()` or `.future()`), or, for a map item
 or branch, when the container dispatched it, around every poll and every
-drop. The SDK enters the captured span first and the wraps inside it, so a
+drop. So when a scope closes, for example because a child context's body
+returns, the SDK can drop a task that the scope stops, such as an unawaited
+`.spawn()` operation of that body, inside the body's wraps after the body's
+`on_user_function_end`. The SDK enters the captured span first and the wraps inside it, so a
 span a wrap enters is a child of the captured span. The handler's root task
 runs inside the invocation's `durable_execution` span and, inside it, the
 invocation's wraps, around every poll and its drop. A child namespace's

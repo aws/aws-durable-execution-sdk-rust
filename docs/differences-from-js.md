@@ -562,8 +562,8 @@ This page lists every place where the Rust SDK behaves differently from the Java
 
 ### Scope close and end hooks
 
-- **JavaScript:** A child wrapper returns after `fn` settles, and JavaScript accepts the descendants' checkpoints until then.
-- **Rust:** A scope closes when its raw body returns, before the SDK derives its `WireError` and calls the end hooks, and stops its tracked tasks, so a stopped descendant gets no end hook. The end hook's synchronous part runs in the poll in which the body returned, so a stop cannot interrupt it.
+- **JavaScript:** A child wrapper returns after `fn` settles, and JavaScript accepts the descendants' checkpoints until then. A descendant whose terminal checkpoint is still in flight when the child returns fires its end hook after the child's.
+- **Rust:** A scope closes when its raw body returns, before the SDK derives its `WireError` and calls the end hooks, and stops its tracked tasks at their next `.await`, so a stopped descendant gets no end hook. A descendant whose task is in a poll when the scope closes finishes that poll, so the end hooks that poll reaches can follow the scope's own end hooks. The synchronous part of the scope's own end hook runs in the poll in which the body returned, so a stop cannot interrupt it.
 - **Why:** Work that outlives its scope has no owner that records it.
 - **Decision:** Decision (2026-11-03): Rust stops the `.future()` inputs a combinator started, the work inside a child context or batch that has closed, and all tracked operation work when the drive ends.
 - **Where:** `src/plugin/scope.rs`, `run_user_function`; `src/child.rs`, `ChildExecution::run`; `src/checkpoint_coalescer.rs`, `ScopeClose`.
