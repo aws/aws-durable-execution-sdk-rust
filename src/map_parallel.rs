@@ -3256,10 +3256,11 @@ struct BatchDecisionRecord {
 ///    rather than re-executing items the recorded batch may never have
 ///    started.
 /// 2. A JSON object with the key `itemStatuses` is the JS summary. Its
-///    `itemStatuses` must be a non-empty string of `S`, `F` and `-`; the
-///    started prefix is its length, the terminal indexes are its `S` and
-///    `F` positions, and the reason is `completionReason`. As in JS,
-///    `itemStatuses` is the only per-item field replay reads.
+///    `itemStatuses` must be a string of `S`, `F` and `-`, empty for a
+///    batch that reported no item; the started prefix is its length, the
+///    terminal indexes are its `S` and `F` positions, and the reason is
+///    `completionReason`. As in JS, `itemStatuses` is the only per-item
+///    field replay reads.
 /// 3. A JSON object with `totalCount` and `startedIndexes` or
 ///    `completedIndexes` is the decision record the Python SDK writes
 ///    (see [`parse_decision_record`]).
@@ -3282,11 +3283,10 @@ fn parse_replay_children_payload(
     if let Some(statuses) = value.get("itemStatuses") {
         let statuses = statuses
             .as_str()
-            .filter(|s| !s.is_empty() && s.chars().all(|c| matches!(c, 'S' | 'F' | '-')))
+            .filter(|s| s.chars().all(|c| matches!(c, 'S' | 'F' | '-')))
             .ok_or_else(|| {
                 batch_error(
-                    "malformed batch decision record: itemStatuses must be a non-empty \
-                     string of S, F and -",
+                    "malformed batch decision record: itemStatuses must be a string of S, F and -",
                 )
             })?;
         let completed = statuses
@@ -12932,13 +12932,23 @@ mod tests {
         assert_eq!(record.started_indexes, None);
         assert_eq!(record.completion_reason, "ALL_COMPLETED");
 
-        for statuses in [r#""""#, r#""SX""#, "1", "null"] {
+        // A batch that reported no item writes an empty `itemStatuses`.
+        let record = parse_replay_children_payload(Some(
+            r#"{"itemStatuses":"","completionReason":"ALL_COMPLETED"}"#,
+        ))
+        .expect("an empty JS summary parses")
+        .expect("an empty JS summary is a decision");
+        assert_eq!(record.total_count, 0);
+        assert_eq!(record.completed_indexes, Some(vec![]));
+
+        for statuses in [r#""SX""#, "1", "null"] {
             let payload =
                 format!(r#"{{"itemStatuses":{statuses},"completionReason":"ALL_COMPLETED"}}"#);
             let err = parse_replay_children_payload(Some(&payload))
                 .expect_err("an invalid itemStatuses is corrupt");
             assert!(
-                crate::error::chain_string(&err).contains("itemStatuses must be a non-empty"),
+                crate::error::chain_string(&err)
+                    .contains("itemStatuses must be a string of S, F and -"),
                 "{statuses}"
             );
         }

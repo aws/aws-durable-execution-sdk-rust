@@ -350,3 +350,172 @@ async fn invalid_percentage_starts_no_batch() {
         "no operation stays STARTED: {result}"
     );
 }
+
+/// A lossless result serdes that prefixes 300 KiB and removes it on read,
+/// so every batch record it stores is over the 256 KiB limit.
+struct PaddedSerdes;
+
+/// The length of the padding [`PaddedSerdes`] adds.
+const PAD: usize = 300 * 1024;
+
+impl durable::Serdes<String> for PaddedSerdes {
+    fn serialize(
+        &self,
+        value: String,
+        _context: durable::serdes::SerdesContext,
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(Ok(format!("{}{value}", " ".repeat(PAD))))
+    }
+
+    fn deserialize(
+        &self,
+        wire: String,
+        _context: durable::serdes::SerdesContext,
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(
+            wire.get(PAD..)
+                .map(str::to_owned)
+                .ok_or_else(|| "the payload has no padding".into()),
+        )
+    }
+}
+
+/// A map over an empty input stores the oversized summary, and the next
+/// invocation replays it.
+#[tokio::test]
+async fn empty_map_with_oversized_result_replays_after_a_wait() {
+    let result = LocalRunner::new()
+        .run(
+            |_event: serde_json::Value, ctx: durable::DurableContext| async move {
+                let values = ctx
+                    .map(Vec::<u32>::new(), |_, item, _| async move { Ok(item) })
+                    .name("b")
+                    .result_serdes(PaddedSerdes)
+                    .await?;
+                ctx.wait(Duration::from_secs(1)).name("after").await?;
+                Ok::<_, durable::BoxError>(values.len())
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    let op = result.operation("b").expect("record b");
+    assert!(
+        matches!(
+            op.details(),
+            durable::test_util::TestOperationDetails::Context(c) if c.replay_children()
+        ),
+        "the record is the oversized summary"
+    );
+    assert!(result.is_success(), "{result} {:?}", result.error_message());
+    assert_eq!(result.output(), Some(&0));
+}
+
+/// Runs `map([0, 1, 2])` named `b` with `nesting`, a predicate that
+/// completes the batch before its first item starts, and `PaddedSerdes`,
+/// then waits 1 s. Returns the item count and the reason each invocation
+/// saw.
+async fn completed_before_first_dispatch(
+    nesting: durable::builders::map_parallel::NestingMode,
+) -> Vec<(usize, &'static str)> {
+    let seen: Arc<Mutex<Vec<(usize, &'static str)>>> = Arc::default();
+    let handler_seen = Arc::clone(&seen);
+    let result = LocalRunner::new()
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let seen = Arc::clone(&handler_seen);
+                async move {
+                    let batch = ctx
+                        .map(vec![0_u32, 1, 2], |_, item, _| async move { Ok(item) })
+                        .name("b")
+                        .nesting(nesting)
+                        .completion(CompletionConfig::with_completion_predicate(|_| {
+                            CompletionDecision::complete(CompletionOutcome::Succeeded)
+                        }))
+                        .result_serdes(PaddedSerdes)
+                        .await_batch()
+                        .await?;
+                    let seen_now = (batch.items.len(), batch.reason.as_str());
+                    seen.lock().expect("lock").push(seen_now);
+                    ctx.wait(Duration::from_secs(1)).name("after").await?;
+                    Ok::<_, durable::BoxError>(())
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{result} {:?}", result.error_message());
+    std::mem::take(&mut *seen.lock().expect("lock"))
+}
+
+/// Both invocations see the same empty batch.
+#[tokio::test]
+async fn map_completed_before_first_dispatch_with_oversized_result_replays() {
+    let nesting = durable::builders::map_parallel::NestingMode::Normal;
+    assert_eq!(
+        completed_before_first_dispatch(nesting).await,
+        vec![(0, "CUSTOM_COMPLETION_SUCCEEDED"); 2]
+    );
+}
+
+/// A `Flat` batch replays the same summary through the coordinator.
+#[tokio::test]
+async fn flat_map_completed_before_first_dispatch_with_oversized_result_replays() {
+    let nesting = durable::builders::map_parallel::NestingMode::Flat;
+    assert_eq!(
+        completed_before_first_dispatch(nesting).await,
+        vec![(0, "CUSTOM_COMPLETION_SUCCEEDED"); 2]
+    );
+}
+
+/// An empty map whose predicate completes it stores the oversized summary
+/// with that reason. The next invocation replays the recorded reason and
+/// does not ask the predicate again, with either nesting.
+#[tokio::test]
+async fn empty_batch_replay_uses_recorded_reason_without_reinvoking_predicate() {
+    for nesting in [
+        durable::builders::map_parallel::NestingMode::Normal,
+        durable::builders::map_parallel::NestingMode::Flat,
+    ] {
+        let seen: Calls = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (handler_seen, handler_calls) = (Arc::clone(&seen), Arc::clone(&calls));
+        let result = LocalRunner::new()
+            .run(
+                move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                    let seen = Arc::clone(&handler_seen);
+                    let calls = Arc::clone(&handler_calls);
+                    let predicate_calls = Arc::clone(&calls);
+                    async move {
+                        let batch = ctx
+                            .map(Vec::<u32>::new(), |_, item, _| async move { Ok(item) })
+                            .name("b")
+                            .nesting(nesting)
+                            .completion(CompletionConfig::with_completion_predicate(move |_| {
+                                predicate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                CompletionDecision::complete(CompletionOutcome::Succeeded)
+                            }))
+                            .result_serdes(PaddedSerdes)
+                            .await_batch()
+                            .await?;
+                        seen.lock().expect("lock").push((
+                            batch.reason.as_str().to_owned(),
+                            calls.load(std::sync::atomic::Ordering::SeqCst),
+                        ));
+                        ctx.wait(Duration::from_secs(1)).name("after").await?;
+                        Ok::<_, durable::BoxError>(())
+                    }
+                },
+                serde_json::Value::Null,
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{result} {:?}", result.error_message());
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            vec![("CUSTOM_COMPLETION_SUCCEEDED".to_owned(), 1); 2],
+            "{nesting:?}: the replay reads the recorded reason and asks nothing"
+        );
+    }
+}

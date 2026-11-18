@@ -316,6 +316,14 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Rust language.
 - **Where:** `src/map_parallel.rs`, `from_batch_result`.
 
+### Batch summary `itemStatuses` on replay
+
+- **JavaScript:** Replay reads an `itemStatuses` that is empty, is not a string, or holds a character other than `S`, `F` and `-` as no recorded statuses. It then decides each item from the item's own record, or by probing the records under the item.
+- **Rust:** Replay reads an empty `itemStatuses` as a batch that started no item. JavaScript writes an empty `itemStatuses` only for a batch that reported no item, so its probe finds the same. Any other `itemStatuses` that is not a string of `S`, `F` and `-` fails the replay with a corrupt-record error.
+- **Why:** The probe can read an item that was still running as finished and run its unfinished operations again, and it cannot find a completed item whose body created no durable operation, as the comment on JavaScript's `encodeItemStatuses` says. Neither SDK writes such an `itemStatuses`.
+- **Decision:** JavaScript defect.
+- **Where:** `src/map_parallel.rs`, `parse_replay_children_payload`.
+
 ### Batch item names
 
 - **JavaScript:** The batch record items and `BatchResult` items carry no name.
