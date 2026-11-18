@@ -210,18 +210,39 @@ async fn on_complete_skips_the_pending_invocations() {
 async fn on_change_emits_running_records_then_the_terminal_record_last() {
     let (telemetry, recording) =
         recorded(DurableExecutionTelemetry::builder().emit_mode(EmitMode::OnChange));
-    runner(telemetry)
+    let result = runner(telemetry)
         .run(two_waits, json!({}))
         .await
         .expect("runner");
+    let invocations = result.invocations().len();
+    assert!(invocations > 1);
 
     let records = recording.records();
-    assert!(records.len() > 1, "{records:?}");
     let (last, earlier) = records.split_last().expect("records");
     assert_eq!(last["status"], "SUCCEEDED");
     assert!(earlier.iter().all(|r| r["status"] == "RUNNING"));
     assert!(earlier.iter().all(|r| r.get("output").is_none()));
     assert!(earlier.iter().all(|r| r["input"] == json!({})));
+
+    // Each invocation exports one record at its start and one at its end.
+    // So every further record comes from an operation change.
+    assert!(
+        records.len() > 2 * invocations,
+        "{} records in {invocations} invocations",
+        records.len()
+    );
+    // A record lists every operation so far. So a later record never lists
+    // fewer operations than an earlier one.
+    let counts: Vec<usize> = records
+        .iter()
+        .map(|r| r["operations"].as_array().expect("operations").len())
+        .collect();
+    assert!(
+        counts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{counts:?}"
+    );
+    assert_eq!(counts.first(), Some(&0), "{counts:?}");
+    assert_eq!(counts.last(), Some(&2), "{counts:?}");
 }
 
 #[tokio::test]
