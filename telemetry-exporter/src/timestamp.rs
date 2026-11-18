@@ -156,6 +156,15 @@ mod tests {
     }
 
     #[test]
+    fn epoch_ms_saturates_a_time_past_the_i64_range() {
+        // `SystemTime` counts seconds in an `i64`, so it holds times whose
+        // millisecond count is outside the `i64` range.
+        let far = Duration::from_secs(u64::MAX / 2);
+        assert_eq!(epoch_ms(SystemTime::UNIX_EPOCH + far), i64::MAX);
+        assert_eq!(epoch_ms(SystemTime::UNIX_EPOCH - far), i64::MIN);
+    }
+
+    #[test]
     fn now_is_after_2020() {
         assert!(now_ms() > 1_577_836_800_000);
     }
