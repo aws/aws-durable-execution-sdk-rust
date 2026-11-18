@@ -3529,8 +3529,10 @@ impl DurableContext {
     /// the value's serde form omits, such as a `#[serde(skip)]` field, is
     /// absent on both paths.
     ///
-    /// When the combinator resolves, it cancels every input that is still
-    /// running. A cancelled input stops at its next `.await`.
+    /// When the combinator resolves, it cancels every input it started from
+    /// `.future()` that is still running, and a cancelled input stops at its
+    /// next `.await`. An input started with `.spawn()` keeps running, and its
+    /// result is dropped.
     ///
     /// # Oversized results
     ///
@@ -3724,8 +3726,10 @@ impl DurableContext {
 
     /// Returns the first successful result.
     ///
-    /// When the combinator resolves, it cancels every input that is still
-    /// running. A cancelled input stops at its next `.await`.
+    /// When the combinator resolves, it cancels every input it started from
+    /// `.future()` that is still running, and a cancelled input stops at its
+    /// next `.await`. An input started with `.spawn()` keeps running, and its
+    /// result is dropped.
     ///
     /// The returned value has passed through the combinator's JSON
     /// encoding: the SDK decodes the payload it recorded and returns that.
@@ -3741,8 +3745,9 @@ impl DurableContext {
     ///
     /// A winning value larger than 256 KiB is not stored in the
     /// combinator's record. The record stores the winner's input index
-    /// instead. Replay then drives only the recorded winner again, and drops
-    /// every other input without running it. The winner replays without
+    /// instead. Replay then drives only the recorded winner again. It drops
+    /// every other `.future()` input without running it, and an input
+    /// started with `.spawn()` keeps running. The winner replays without
     /// running again when its own terminal record is inline. A winner whose
     /// own terminal record has `ReplayChildren` runs its body again to
     /// rebuild its value, and its recorded descendants replay.
@@ -3821,8 +3826,10 @@ impl DurableContext {
 
     /// Returns the first settled result, whether success or failure.
     ///
-    /// When the combinator resolves, it cancels every input that is still
-    /// running. A cancelled input stops at its next `.await`.
+    /// When the combinator resolves, it cancels every input it started from
+    /// `.future()` that is still running, and a cancelled input stops at its
+    /// next `.await`. An input started with `.spawn()` keeps running, and its
+    /// result is dropped.
     ///
     /// The returned value has passed through the combinator's JSON
     /// encoding: the SDK decodes the payload it recorded and returns that.
@@ -3840,8 +3847,9 @@ impl DurableContext {
     ///
     /// A winning value larger than 256 KiB is not stored in the
     /// combinator's record. The record stores the winner's input index
-    /// instead. Replay then drives only the recorded winner again, and drops
-    /// every other input without running it. The winner replays without
+    /// instead. Replay then drives only the recorded winner again. It drops
+    /// every other `.future()` input without running it, and an input
+    /// started with `.spawn()` keeps running. The winner replays without
     /// running again when its own terminal record is inline. A winner whose
     /// own terminal record has `ReplayChildren` runs its body again to
     /// rebuild its value, and its recorded descendants replay.

@@ -1246,8 +1246,9 @@ nothing.
 A combined result larger than 256 KiB is not stored in the combinator's
 record, which then carries `ReplayChildren`. Replay drives the inputs again
 for `try_join_all` and `join_all`. For `select_ok` and `race` the record
-stores the winner's input index, and replay drives only that input again and
-drops the others without running them. An input whose own terminal record is
+stores the winner's input index, and replay drives only that input again.
+It drops the other `.future()` inputs without running them, and an input
+started with `.spawn()` keeps running. An input whose own terminal record is
 inline replays without running again. An input whose own terminal record has
 `ReplayChildren` runs its body again to rebuild its value, and its recorded
 descendants replay.
@@ -1293,7 +1294,7 @@ in the SDK: the SDK resumes the original panic payload, and `join_all` writes
 no record and returns no result. Nothing cancels an input that `join_all`
 awaits, because `join_all` drops no input before it settles.
 
-`select_ok` returns the first success, cancelling the inputs still running:
+`select_ok` returns the first success, cancelling the `.future()` inputs still running:
 
 ```rust ignore
 let primary = ctx

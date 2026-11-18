@@ -494,6 +494,53 @@ async fn race_replay_children_does_not_stop_spawned_input() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn select_ok_replay_children_does_not_stop_spawned_input() {
+    let second_attempts = counter();
+    let handler_attempts = Arc::clone(&second_attempts);
+    let result = run(move |(), ctx: DurableContext| {
+        let attempts = Arc::clone(&handler_attempts);
+        async move {
+            let slow = ctx
+                .step(move |step_ctx| async move {
+                    if step_ctx.attempt() == 1 {
+                        return Err::<String, BoxError>("first attempt fails".into());
+                    }
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok("slow".to_owned())
+                })
+                .name("slow")
+                .retry_strategy(|_err, attempt| {
+                    if attempt >= 2 {
+                        RetryDecision::Stop
+                    } else {
+                        RetryDecision::retry(secs(2))
+                    }
+                })
+                .spawn();
+            // A value larger than the checkpoint limit, so the child and the
+            // select_ok record `ReplayChildren`.
+            let fast = ctx
+                .run_in_child_context(|_child| async { Ok("x".repeat(300 * 1024)) })
+                .name("fast")
+                .future();
+            let winner = ctx.select_ok([fast, slow]).name("s").await?;
+            assert_eq!(winner.len(), 300 * 1024, "the child wins");
+            ctx.wait(secs(1)).name("w1").await?;
+            ctx.wait(secs(2)).name("w2").await?;
+            Ok(())
+        }
+    })
+    .await;
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(
+        status(&result, "slow"),
+        Some(OperationStatus::Succeeded),
+        "{result}"
+    );
+    assert_eq!(count(&second_attempts), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn race_stops_spawned_nested_combinator_in_future_child() {
     let started = counter();
     let runs = counter();

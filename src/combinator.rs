@@ -26,9 +26,10 @@
 //! `CombinatorErrorKind::EmptyInput` since no winner can exist.
 //!
 //! When `try_join_all`, `select_ok` or `race` resolves, it cancels every
-//! input that is still running, and a cancelled input stops at its next
-//! `.await`. `join_all` cancels nothing. Each combinator runs inside a
-//! child context so the combined result is checkpointed atomically.
+//! input it started from `.future()` that is still running, and a cancelled
+//! input stops at its next `.await`. An input started with `.spawn()` keeps
+//! running. `join_all` cancels nothing. Each combinator runs inside a child
+//! context so the combined result is checkpointed atomically.
 //!
 //! A combinator's first run returns the value decoded from the payload it
 //! just recorded, with the same helper its replay path uses. So the first
@@ -42,9 +43,10 @@
 //! invocation when a checkpoint response completes it. The combined outcome
 //! is recorded the moment the completion condition is met (a winner for
 //! `race`/`select_ok`, a first error for `try_join_all`), whatever the
-//! losing inputs are doing; the losers are then aborted. When every
-//! remaining input waits and nothing else runs, the invocation coordinator
-//! suspends the invocation (issue #49).
+//! losing inputs are doing; the losing `.future()` inputs are then stopped,
+//! and a `.spawn()` input keeps running. When every remaining input waits
+//! and nothing else runs, the invocation coordinator suspends the
+//! invocation (issue #49).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -261,7 +263,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         .await?;
 
         // The join: wait for every input, and on the first failure stop the
-        // inputs still running (fail-fast + loser-drop).
+        // `.future()` inputs still running (fail-fast + loser-drop).
         let join = async move {
             while let Some((_, joined)) = join_set.join_next_with_id().await {
                 // A panicked input resumes its panic here.
@@ -571,8 +573,9 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
     ///
     /// Live path: races all futures; returns the first success.
     /// If all fail, returns `CombinatorError::AllFailed` with all error messages.
-    /// On the first success it cancels every input that is still running;
-    /// a cancelled input stops at its next `.await`.
+    /// On the first success it cancels every input it started from
+    /// `.future()` that is still running; a cancelled input stops at its
+    /// next `.await`.
     /// Replay path: returns the frozen winner, or, for a record with
     /// `ReplayChildren`, drives only the recorded winner again.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
@@ -646,8 +649,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         .await?;
 
         // The join: race all inputs, and keep going until one succeeds or
-        // all fail. On the first success it stops the inputs still
-        // running (loser-drop), so a waiting loser does not block
+        // all fail. On the first success it stops the `.future()` inputs
+        // still running (loser-drop), so a waiting loser does not block
         // recording the winner. An empty input list has no input that
         // could succeed: it fails with `EmptyInput` (matching `race`)
         // rather than an `AllFailed` carrying zero errors.
@@ -749,8 +752,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
     /// Executes the `race` combinator.
     ///
     /// Live path: races all futures; returns the first settled (success OR
-    /// failure), and cancels every input that is still running; a
-    /// cancelled input stops at its next `.await`.
+    /// failure), and cancels every input it started from `.future()` that
+    /// is still running; a cancelled input stops at its next `.await`.
     /// Replay path: returns the frozen result, or, for a record with
     /// `ReplayChildren`, drives only the recorded winner again.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
@@ -824,11 +827,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         .await?;
 
         // The join: race all inputs, first settled wins, and stop the
-        // inputs still running. A losing input that waits stays pending and
-        // never suspends the invocation once the winner settled (issue
-        // #49): the winner is recorded, and the losers are stopped. An
-        // empty input list has no input that could settle: it fails with
-        // `EmptyInput` (matching `select_ok`).
+        // `.future()` inputs still running. A losing input that waits stays
+        // pending and never suspends the invocation once the winner settled
+        // (issue #49): the winner is recorded, and the `.future()` losers
+        // are stopped. An empty input list has no input that could settle:
+        // it fails with `EmptyInput` (matching `select_ok`).
         let join = async move {
             if empty {
                 return Err(FirstFailure::Empty("race called with no futures"));
@@ -1377,7 +1380,7 @@ async fn checkpoint_winner_succeed(
 ///    that does not decode, is an internal error.
 /// 3. An index past the inputs is an internal error.
 /// 4. Every other input is dropped without being polled: a lazy input never
-///    runs, and a spawned one is aborted. The winner runs on its own task in
+///    runs, and a spawned one keeps running. The winner runs on its own task in
 ///    the context that created it, as on the live run, and its error, or its
 ///    wait for the service, is the combinator's.
 /// 5. The value is serialized and decoded, as the live path does, so both
