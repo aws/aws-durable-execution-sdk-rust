@@ -18,7 +18,8 @@ pub enum EmitMode {
     OnComplete,
     /// A `RUNNING` record when an invocation starts and on every
     /// checkpoint response that changes an operation, and a record at
-    /// every invocation end, terminal or not.
+    /// every invocation end, terminal or not. The handler starts after
+    /// the exporters have received the invocation-start record.
     OnChange,
     /// One record when an invocation fails the execution.
     OnFailure,

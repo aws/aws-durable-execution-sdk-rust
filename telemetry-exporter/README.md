@@ -62,7 +62,7 @@ warning. It never fails the execution.
 
 | Builder method | Default | Effect |
 | --- | --- | --- |
-| `emit_mode` | `EmitMode::OnComplete` | `OnComplete` emits when the execution succeeds or fails. `OnFailure` emits only when it fails. `OnChange` also emits `RUNNING` records while the execution runs. |
+| `emit_mode` | `EmitMode::OnComplete` | `OnComplete` emits when the execution succeeds or fails. `OnFailure` emits only when it fails. `OnChange` also emits a `RUNNING` record when each invocation starts and on every checkpoint response that changes an operation, and a record at every invocation end. The handler starts after the exporters have received the invocation-start record. |
 | `sampling_rate` | `1.0` | The fraction of executions that emit records. The decision hashes the execution ARN, so every invocation of an execution makes the same decision. |
 | `operation_detail` | `OperationDetail::TopLevel` | `TopLevel` lists operations without a parent. `FullTree` also lists map items, parallel branches and child-context operations. |
 | `content` | input, output and errors; no operation results | `ContentConfig` includes, omits or transforms the input and output, and sets per-operation overrides. |

@@ -316,15 +316,21 @@ impl Plugin for TelemetryInvocation {
         "DurableExecutionTelemetry"
     }
 
-    /// In on-change mode, schedules a `RUNNING` record. The record is
-    /// exported by the next operation change or by the invocation end, so
-    /// the handler does not wait for an export to start. A newer record
-    /// that arrives first replaces it.
+    /// In on-change mode, schedules a `RUNNING` record and exports it.
+    ///
+    /// Every later hook schedules a newer record before it exports. A
+    /// record that only waited in the slot would always be replaced. So
+    /// this hook exports its record itself. The SDK awaits this hook
+    /// before the handler runs, so the handler starts after the export.
     fn on_invocation_start<'a>(&'a self, info: &'a InvocationInfo) -> HookFuture<'a> {
-        if self.env.emit_mode == EmitMode::OnChange {
-            self.slot.schedule(self.running_record(info.operations()));
+        if self.env.emit_mode != EmitMode::OnChange {
+            return Box::pin(std::future::ready(Ok(())));
         }
-        Box::pin(std::future::ready(Ok(())))
+        self.slot.schedule(self.running_record(info.operations()));
+        Box::pin(async move {
+            self.env.scheduler.export_pending(&self.slot).await;
+            Ok(())
+        })
     }
 
     /// In on-change mode, schedules a `RUNNING` record and returns the work

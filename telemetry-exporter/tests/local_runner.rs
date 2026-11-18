@@ -225,6 +225,27 @@ async fn on_change_emits_running_records_then_the_terminal_record_last() {
 }
 
 #[tokio::test]
+async fn on_change_emits_a_running_record_when_the_invocation_starts() {
+    let (telemetry, recording) =
+        recorded(DurableExecutionTelemetry::builder().emit_mode(EmitMode::OnChange));
+    runner(telemetry)
+        .run(one_step, json!({ "n": 21 }))
+        .await
+        .expect("runner");
+
+    let records = recording.records();
+    let (first, last) = (
+        records.first().expect("records"),
+        records.last().expect("records"),
+    );
+    // The handler has not run yet, so the step is not in the record.
+    assert_eq!(first["status"], "RUNNING");
+    assert_eq!(first["input"], json!({ "n": 21 }));
+    assert!(first["operationsByName"].get("double").is_none(), "{first}");
+    assert_eq!(last["operationsByName"]["double"]["type"], "STEP");
+}
+
+#[tokio::test]
 async fn on_failure_emits_only_for_a_failed_execution() {
     let (telemetry, recording) =
         recorded(DurableExecutionTelemetry::builder().emit_mode(EmitMode::OnFailure));
