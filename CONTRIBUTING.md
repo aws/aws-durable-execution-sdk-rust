@@ -489,6 +489,72 @@ agent. A round is one review of a revision, followed by the contributor's change
 5. The reviewer approves only a change that follows every rule. A reviewer who wants an
    exception names the rule and the reason in the review, and a maintainer decides.
 
+## Releasing
+
+Each crate in this repository is released on its own. The tag of a GitHub
+Release names the crate and its version, and `crates-io-publish.yml`
+publishes that crate when the release is published.
+
+| Crate | Directory | Tag |
+| --- | --- | --- |
+| `aws-durable-execution-sdk` | `.` | `v<version>` |
+
+A maintainer releases a version in three steps. Only members of the
+`aws-lambda-durable-functions-rust-admin` team, an owner of the SDK crate on
+crates.io, can create, move or delete a release tag. The `release-tags` tag
+ruleset enforces that for every tag pattern in the table.
+
+1. Open a pull request that sets `version` in the crate's `Cargo.toml`. For
+   the SDK, also run `cargo metadata --format-version 1 > /dev/null` in the
+   repository root, in `conformance/` and in `examples/`, so that the SDK's
+   entry in each of the three lockfiles names the new version, and update
+   the version requirement in the README's `[dependencies]` example when the
+   new version no longer matches it.
+2. After the pull request merges, tag the commit it added to `main` with an
+   annotated tag, and push the tag:
+
+   ```sh
+   git tag -a v1.0.1 -m "aws-durable-execution-sdk 1.0.1" <commit>
+   git push origin v1.0.1
+   ```
+
+3. Publish a GitHub Release for the tag, with the release notes. For a crate
+   other than the SDK, pass `--latest=false` to `gh release create`, so that
+   the repository page keeps showing the SDK's release as the latest.
+
+The workflow's `verify` job checks that the tagged commit is on `main`, finds
+the crate from the tag, checks that the tag's version is the version in the
+crate's `Cargo.toml`, and builds the packaged crate. Its `publish` job runs in
+the `crates-io` environment, which admits only the tag patterns in the table.
+It gets a token through crates.io trusted publishing and uploads the package.
+The build in `verify` takes a dependency on another crate of this repository
+from crates.io, so release that crate's new version first.
+
+The `main` check runs from the tagged commit's copy of the workflow, so it
+catches only a tag put on an unmerged commit by mistake. Someone who can push
+a release tag can also push a copy of the workflow without the check. The
+`release-tags` ruleset stops that by limiting release tags to the team.
+
+When a job fails before the upload, fix the cause and re-run the run's failed
+jobs. A re-run uses the tagged commit's copy of the workflow, so a fix to the
+workflow file reaches only later tags.
+
+To publish another crate of this repository:
+
+1. Publish its first version by hand with `cargo publish`. crates.io adds a
+   trusted publisher only to a crate that already exists.
+2. On crates.io, add a trusted publisher to the crate that names this
+   repository, the workflow file `crates-io-publish.yml` and the
+   environment `crates-io`. Renaming the workflow file or the environment
+   later stops publishing until every crate's trusted publisher names the new
+   one.
+3. Add the crate's tag pattern, such as `telemetry-exporter-v*`, to the
+   deployment rules of the `crates-io` environment and to the target
+   patterns of the `release-tags` ruleset. A pattern missing from the
+   ruleset lets anyone with write access create that crate's release tags.
+4. Add the crate's tag prefix, directory and package name to the `case` in
+   the workflow's `verify` job, and a row to the table above.
+
 ## Reporting bugs and requesting features
 
 Use the GitHub issue tracker. Check the open and recently closed issues first.

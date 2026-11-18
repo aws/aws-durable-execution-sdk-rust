@@ -1,0 +1,129 @@
+name: Publish to crates.io
+
+# Publishes one crate to crates.io when a maintainer publishes a GitHub
+# Release. The release tag names the crate and its version: v<version>
+# for the SDK, and a prefix of its own for each other crate that the
+# `case` in the verify job lists. So each crate is released on its own.
+# CONTRIBUTING.md, "Releasing", gives the release steps and how to add a
+# crate.
+#
+# The publish job gets its crates.io token through crates.io trusted
+# publishing. The token expires after 30 minutes and is revoked when the
+# job ends, so the repository stores no crates.io token. crates.io issues
+# the token only to this workflow file in this repository, running in the
+# crates-io environment, and only for a crate whose trusted publisher
+# settings name both. The environment admits only tags that match its
+# rules, v* for the SDK.
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  # Finds the crate the tag names, checks the version, and builds the
+  # packaged crate, the build that `cargo publish` runs before it uploads.
+  # The build runs the build scripts and procedural macros of every
+  # dependency, so it runs here, in a job that cannot request a crates.io
+  # token.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      directory: ${{ steps.crate.outputs.directory }}
+      package: ${{ steps.crate.outputs.package }}
+    steps:
+      # The full history, so the next step can check that the tagged
+      # commit is on main.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Catches a release tag put on a commit that has not merged to main.
+      # The check runs from the tagged commit's own copy of this file, so
+      # it catches mistakes only. The release-tags ruleset, which lets only
+      # the crate owners' team create, move or delete a v* tag, is what
+      # stops anyone else from publishing.
+      - name: Check that the tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::The tag points at a commit that is not on main. Tag a commit after its pull request has merged."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup show active-toolchain
+
+      - name: Find the crate and check its version
+        id: crate
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # One entry per crate: its tag prefix, its directory and its
+          # package name.
+          case "$TAG" in
+            v[0-9]*)
+              directory=.
+              package=aws-durable-execution-sdk
+              version=${TAG#v}
+              ;;
+            *)
+              echo "::error::The tag $TAG does not name a crate that this workflow publishes."
+              exit 1
+              ;;
+          esac
+          manifest_version=$(cargo metadata --no-deps --format-version 1 --manifest-path "$directory/Cargo.toml" \
+            | jq -r --arg package "$package" '.packages[] | select(.name == $package) | .version')
+          if [ "$version" != "$manifest_version" ]; then
+            echo "::error::The tag $TAG names version $version, but $directory/Cargo.toml sets $package to version $manifest_version."
+            exit 1
+          fi
+          echo "directory=$directory" >> "$GITHUB_OUTPUT"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+
+      - name: Package and build the crate
+        working-directory: ${{ steps.crate.outputs.directory }}
+        env:
+          PACKAGE: ${{ steps.crate.outputs.package }}
+        run: cargo publish --dry-run --locked --package "$PACKAGE"
+
+  # Packages the same commit again and uploads it without building it
+  # (--no-verify), so no dependency code runs in the job that holds the
+  # token.
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/${{ needs.verify.outputs.package }}
+    permissions:
+      contents: read
+      id-token: write # Required for the crates.io trusted publishing token
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup show active-toolchain
+
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+
+      - name: Publish
+        working-directory: ${{ needs.verify.outputs.directory }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          PACKAGE: ${{ needs.verify.outputs.package }}
+        run: cargo publish --locked --no-verify --package "$PACKAGE"
