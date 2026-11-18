@@ -113,9 +113,9 @@ These rules apply to the SDK code in `src/`.
   unit-test exemption in `src/lib.rs` is the one `allow`.
 - **Do not call `tokio::spawn`.** The SDK's task-ownership checks and
   suspension accounting do not cover a task that `tokio::spawn` starts.
-  `clippy.toml` disallows the call, and also `JoinSet::spawn` and
-  `spawn_blocking`. Start every task through the task gateway in
-  `src/task.rs`.
+  `clippy.toml` disallows the call, and also `Handle::spawn`,
+  `JoinSet::spawn`, `JoinSet::spawn_on` and `spawn_blocking`. Start every
+  task through the task gateway in `src/task.rs`.
 - **Do not call `tokio::task::yield_now` in SDK code outside
   `#[cfg(test)]` code.** The invocation coordinator suspends the
   invocation when no SDK work holds a permit and an operation waits. A

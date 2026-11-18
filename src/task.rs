@@ -11,6 +11,12 @@
 //! - [`spawn_detached`] starts internal work that must not be aborted;
 //! - [`run_blocking`] runs work on the blocking pool.
 //!
+//! [`spawn_tracked`], [`TrackedJoinSet::spawn`] and [`spawn_detached`]
+//! start their tasks on the invocation's runtime: the Tokio runtime that
+//! was running when the invocation's coordinator was created. So a task
+//! they start while the caller polls inside a second runtime keeps running
+//! when that runtime is dropped.
+//!
 //! Every task except the root holds one count on the invocation's
 //! [`TaskTracker`] until it exits. The invocation driver aborts every
 //! abortable task at the end of the drive and waits until the count is
@@ -84,9 +90,11 @@ use crate::plugin::Frames;
 type Payload = Box<dyn Any + Send + 'static>;
 
 /// The message of the error an operation returns when it needs a task and
-/// no Tokio runtime is running on the calling thread.
-pub(crate) const NO_RUNTIME_MESSAGE: &str = "durable operation started with `.spawn()` while no \
-     Tokio runtime is running; call it from the handler or from an SDK operation";
+/// no Tokio runtime is available on the calling thread or for the
+/// invocation.
+pub(crate) const NO_RUNTIME_MESSAGE: &str = "durable operation could not start an SDK task because no Tokio runtime \
+     is available on the calling thread or for the invocation; call it from \
+     the handler or from an SDK operation";
 
 tokio::task_local! {
     /// The coordinator of the invocation whose task is being polled. The
@@ -362,14 +370,15 @@ impl Drop for TaskPermit {
     }
 }
 
-/// No Tokio runtime is running on the calling thread.
+/// No Tokio runtime can run a task: none is running on the calling thread,
+/// or none was running when the invocation's coordinator was created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NoRuntime;
 
 impl NoRuntime {
-    /// The error an operation returns when it needs a task and no Tokio
-    /// runtime is running. Its kind is the one the task-ownership check
-    /// returns.
+    /// The error an operation returns when no Tokio runtime is available on
+    /// the calling thread or for its invocation. Its kind is the one the
+    /// task-ownership check returns.
     pub(crate) fn operation_error(_no_runtime: Self) -> OperationError {
         OperationError::from_kind(OperationErrorKind::Step(StepError::new(
             StepErrorKind::ExecutionFailed,
@@ -393,12 +402,23 @@ pub(crate) fn ensure_runtime() -> Result<(), NoRuntime> {
         .map_err(|_| NoRuntime)
 }
 
+/// The runtime that the tracked, join-set and detached tasks of
+/// `coordinator`'s invocation run on: the runtime that was running when the
+/// coordinator was created. They run there even when the caller polls
+/// inside a second runtime, so dropping that runtime drops none of them.
+/// Returns `Err(NoRuntime)` when no runtime was running.
+pub(crate) fn task_runtime(
+    coordinator: &InvocationCoordinator,
+) -> Result<tokio::runtime::Handle, NoRuntime> {
+    coordinator.runtime().cloned().ok_or(NoRuntime)
+}
+
 /// Returns the ID of the task being polled.
 fn current_task_id() -> Id {
     #[expect(clippy::expect_used)]
     // reason: only the gateway wrapper calls this, while tokio polls it as
-    // the future of a task that `tokio::spawn` or `JoinSet::spawn` started,
-    // and such a future always runs with a task ID.
+    // the future of a task that the `raw` module started, and such a
+    // future always runs with a task ID.
     tokio::task::try_id().expect("a future that tokio spawned runs with a task ID")
 }
 
@@ -1176,7 +1196,7 @@ impl<F: Future> Drop for Wrapped<F> {
     }
 }
 
-/// The three raw tokio spawn calls. Everything else in the crate starts a
+/// The raw tokio spawn calls. Everything else in the crate starts a
 /// task through the gateway functions of this module.
 #[expect(clippy::disallowed_methods)]
 // reason: the gateway is the one place that calls tokio's spawn functions;
@@ -1193,11 +1213,22 @@ mod raw {
         tokio::spawn(future)
     }
 
-    pub(super) fn join_set_spawn<F>(set: &mut JoinSet<()>, future: F) -> AbortHandle
+    pub(super) fn spawn_on<F>(handle: &tokio::runtime::Handle, future: F) -> JoinHandle<()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        set.spawn(future)
+        handle.spawn(future)
+    }
+
+    pub(super) fn join_set_spawn<F>(
+        set: &mut JoinSet<()>,
+        handle: &tokio::runtime::Handle,
+        future: F,
+    ) -> AbortHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        set.spawn_on(future, handle)
     }
 
     pub(super) fn spawn_blocking<F>(f: F)
@@ -1294,22 +1325,25 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    ensure_runtime()?;
+    let runtime = task_runtime(coordinator)?;
     let Some(schedule) = Schedule::queued(coordinator) else {
         return Ok(TrackedTask::refused());
     };
     let tasks = coordinator.tasks();
     let permit = tasks.acquire();
     let slot = Arc::new(Slot::new(Some(Arc::clone(coordinator))));
-    let handle = raw::spawn(Wrapped::new(
-        task_cx,
-        future,
-        Some(Arc::clone(ownership)),
-        Arc::clone(coordinator),
-        scheduled(schedule, false),
-        Sink::Slot(Arc::clone(&slot)),
-        Some(permit),
-    ));
+    let handle = raw::spawn_on(
+        &runtime,
+        Wrapped::new(
+            task_cx,
+            future,
+            Some(Arc::clone(ownership)),
+            Arc::clone(coordinator),
+            scheduled(schedule, false),
+            Sink::Slot(Arc::clone(&slot)),
+            Some(permit),
+        ),
+    );
     tasks.register_abort(handle.abort_handle());
     Ok(TrackedTask {
         slot,
@@ -1375,17 +1409,20 @@ pub(crate) fn spawn_detached<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    ensure_runtime()?;
+    let runtime = task_runtime(coordinator)?;
     let permit = coordinator.tasks().acquire();
-    drop(raw::spawn(Wrapped::new(
-        TaskContext::none(),
-        future,
-        None,
-        Arc::clone(coordinator),
-        Gate::Detached,
-        Sink::Record,
-        Some(permit),
-    )));
+    drop(raw::spawn_on(
+        &runtime,
+        Wrapped::new(
+            TaskContext::none(),
+            future,
+            None,
+            Arc::clone(coordinator),
+            Gate::Detached,
+            Sink::Record,
+            Some(permit),
+        ),
+    ));
     Ok(())
 }
 
@@ -1457,7 +1494,7 @@ impl<T: Send + 'static> TrackedJoinSet<T> {
     where
         F: Future<Output = T> + Send + 'static,
     {
-        ensure_runtime()?;
+        let runtime = task_runtime(&self.coordinator)?;
         // A refused task still counts as pending, so the set never reports
         // that every task was joined.
         self.pending += 1;
@@ -1468,6 +1505,7 @@ impl<T: Send + 'static> TrackedJoinSet<T> {
         let permit = tracker.acquire();
         let abort = raw::join_set_spawn(
             &mut self.tasks,
+            &runtime,
             Wrapped::new(
                 task_cx,
                 future,

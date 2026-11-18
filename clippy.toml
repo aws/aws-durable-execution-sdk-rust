@@ -16,6 +16,8 @@
 disallowed-methods = [
     { path = "tokio::task::spawn", reason = "a raw tokio::spawn bypasses the task gateway; start the task through src/task.rs" },
     { path = "tokio::task::JoinSet::spawn", reason = "a raw JoinSet::spawn bypasses the task gateway; use TrackedJoinSet from src/task.rs" },
+    { path = "tokio::runtime::Handle::spawn", reason = "a raw Handle::spawn bypasses the task gateway; start the task through src/task.rs" },
+    { path = "tokio::task::JoinSet::spawn_on", reason = "a raw JoinSet::spawn_on bypasses the task gateway; use TrackedJoinSet from src/task.rs" },
     { path = "tokio::task::spawn_blocking", reason = "a raw spawn_blocking bypasses the task gateway; use run_blocking from src/task.rs" },
     { path = "tracing::subscriber::set_default", reason = "a test capture installed directly can miss events whose callsite another thread reached first; use test_tracing::install_test_subscriber" },
     { path = "tracing::subscriber::with_default", reason = "a test capture installed directly can miss events whose callsite another thread reached first; hold the guard of test_tracing::install_test_subscriber in a scope" },

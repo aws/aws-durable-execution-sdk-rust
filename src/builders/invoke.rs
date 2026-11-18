@@ -338,8 +338,9 @@ where
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     ///
     /// # Examples
     ///

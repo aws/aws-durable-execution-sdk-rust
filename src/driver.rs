@@ -6516,9 +6516,13 @@ mod panic_owner {
         // behind the root task on the runtime's inject queue.
         fn drop(&mut self) {
             let (tx, rx) = std::sync::mpsc::channel();
-            drop(tokio::runtime::Handle::current().spawn(async move {
+            #[expect(clippy::disallowed_methods)]
+            // reason: the probe must start outside the task gateway, so that
+            // it queues behind the root task on the runtime's inject queue.
+            let probe = tokio::runtime::Handle::current().spawn(async move {
                 tx.send(()).ok();
-            }));
+            });
+            drop(probe);
             // A timeout would leave the flag unset, which fails the test.
             if rx.recv_timeout(Duration::from_secs(10)).is_ok() {
                 self.0.store(true, Ordering::SeqCst);

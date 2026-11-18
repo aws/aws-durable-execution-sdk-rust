@@ -334,9 +334,19 @@ pub(crate) struct InvocationCoordinator {
     /// every refresh time follows tokio time, and two registrations with
     /// the same end time are due at the same instant.
     clock: (Instant, SystemTime),
+    /// The Tokio runtime that was running when the coordinator was
+    /// created, which is the runtime that runs the invocation. `None` when
+    /// no runtime was running.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl InvocationCoordinator {
+    /// The runtime the coordinator was created on (see the `runtime`
+    /// field).
+    pub(crate) fn runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.runtime.as_ref()
+    }
+
     /// Creates a coordinator in the `Running` phase with no permit and no
     /// registration.
     pub(crate) fn new() -> Arc<Self> {
@@ -362,6 +372,7 @@ impl InvocationCoordinator {
             window: tokio::sync::Notify::new(),
             rearm: tokio::sync::Notify::new(),
             clock: (Instant::now(), SystemTime::now()),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
 

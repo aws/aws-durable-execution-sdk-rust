@@ -1812,7 +1812,8 @@ impl DurableContext {
     /// A failed write is recorded where its response arrives (see
     /// [`InvocationCoordinator::fail_write`]), and its caller never
     /// resolves. So the only error a write returns to its caller is the
-    /// one of a write that found no Tokio runtime and sent nothing (see
+    /// one of a write that sent nothing because the invocation coordinator
+    /// was created without a Tokio runtime (see
     /// [`Self::spawn_batch_flush`]). The operation then returns the
     /// error `.spawn()` returns without a runtime, at once, and nothing is
     /// recorded. Any other error leaves the operation pending: the
@@ -2264,8 +2265,8 @@ impl DurableContext {
             }
         };
         let spawned = crate::task::spawn_detached(self.coordinator(), flush);
-        // No Tokio runtime is running on this thread, so nothing can write
-        // the batch: it is dropped from the buffer with its updates and
+        // The invocation coordinator was created without a Tokio runtime, so
+        // nothing can write the batch: it is dropped from the buffer with its updates and
         // permits, so no later flush sends it, and every contributor
         // receives the error instead of waiting forever. Its source marks
         // it, so an operation returns the error `.spawn()` returns without

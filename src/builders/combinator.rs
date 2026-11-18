@@ -141,8 +141,9 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     pub fn spawn(self) -> DurableFuture<Vec<O>> {
         spawn_terminal!(self)
     }
@@ -309,8 +310,9 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     pub fn spawn(self) -> DurableFuture<Vec<Result<O, OperationError>>> {
         spawn_terminal!(self)
     }
@@ -453,8 +455,9 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self)
     }
@@ -597,8 +600,9 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self)
     }

@@ -234,8 +234,9 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     pub fn spawn(self) -> DurableFuture<Callback<O>>
     where
         S: Serdes<O>,
@@ -706,8 +707,9 @@ where
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self, started)
     }

@@ -890,8 +890,9 @@ fn record_remainder(idx: usize) {
 ///
 /// The input future runs on its own task; an input that waits stays pending
 /// in the set until a checkpoint response completes it. The join set
-/// blesses the task before its first poll. When no Tokio runtime is
-/// running, the input is dropped and the combinator returns the error.
+/// blesses the task before its first poll. When the invocation coordinator
+/// was created without a Tokio runtime, the input is dropped and the
+/// combinator returns the error.
 fn spawn_constituent<O: Send + 'static>(
     ctx: &DurableContext,
     join_set: &mut TrackedJoinSet<(usize, Result<O, OperationError>)>,

@@ -456,9 +456,9 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// starts, and a combinator claims no ID. Otherwise a combinator claims
     /// its ID here, before its task starts. A panic in the operation resumes on
     /// the task that awaits the handle, with its original payload, and
-    /// fails the invocation when nothing awaits it. When no Tokio runtime is
-    /// running, the returned future resolves to an error and the operation
-    /// records nothing.
+    /// fails the invocation when nothing awaits it. When the invocation
+    /// coordinator was created without a Tokio runtime, the returned future
+    /// resolves to an error and the operation records nothing.
     ///
     /// `awaited` is the first-poll flag the operation's wait registrations
     /// carry. The returned handle sets it on its first poll and asks the
@@ -492,8 +492,8 @@ impl<O: Send + 'static> DurableFuture<O> {
                 handle.task_cx = task_cx;
                 handle
             }
-            // No Tokio runtime is running on this thread: the operation
-            // records nothing and resolves to an error.
+            // The invocation coordinator was created without a Tokio runtime:
+            // the operation records nothing and resolves to an error.
             Err(no_runtime) => {
                 Self::from_async(
                     async move { Err(crate::task::NoRuntime::operation_error(no_runtime)) },
@@ -527,9 +527,9 @@ impl<O: Send + 'static> DurableFuture<O> {
     ///
     /// The task-ownership check runs first: a caller that does not own the
     /// context fails the execution, `start` is not called, and nothing is
-    /// queued. The runtime check runs next: when no Tokio runtime is
-    /// running, the returned future resolves to an error, `start` is not
-    /// called, and nothing is queued. Otherwise `start` builds the
+    /// queued. The runtime check runs next: when the invocation coordinator
+    /// was created without a Tokio runtime, the returned future resolves to
+    /// an error, `start` is not called, and nothing is queued. Otherwise `start` builds the
     /// operation future after it ran the start step (see [`crate::start`])
     /// on this task: the admission check, the task-ownership check, and the
     /// `START` the
@@ -550,7 +550,7 @@ impl<O: Send + 'static> DurableFuture<O> {
         if let Some(refused) = Self::refuse_foreign_spawn(ctx) {
             return refused;
         }
-        if let Err(no_runtime) = crate::task::ensure_runtime() {
+        if let Err(no_runtime) = crate::task::task_runtime(ctx.coordinator()).map(drop) {
             return Self::from_async(async move {
                 Err(crate::task::NoRuntime::operation_error(no_runtime))
             });
@@ -994,8 +994,9 @@ impl<O: Send + 'static> Callback<O> {
     ///
     /// # Errors
     ///
-    /// For a pending callback, when no Tokio runtime is running, the
-    /// returned future resolves to an error. A settled callback needs no
+    /// For a pending callback, the task runs on the invocation's runtime;
+    /// when the invocation coordinator was created without one, the returned
+    /// future resolves to an error. A settled callback needs no
     /// runtime. For a pending callback, a call on a task or thread that
     /// does not own the context fails the execution with a context usage
     /// error.
@@ -1954,6 +1955,31 @@ mod tests {
             msg.contains("kaboom-spawn"),
             "original panic payload must be preserved, got: {msg}"
         );
+    }
+
+    /// A context created outside every runtime has no invocation runtime.
+    /// `spawn_started` called later inside a current-thread runtime still
+    /// refuses: `start` is not called, and the handle resolves to the
+    /// no-runtime error.
+    #[test]
+    fn spawn_started_with_current_runtime_but_no_invocation_runtime_does_not_start() {
+        let ctx = test_ctx_with_client();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime builds");
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&started);
+        let error = runtime.block_on(async move {
+            let handle: DurableFuture<u32> = DurableFuture::spawn_started(&ctx, None, move || {
+                flag.store(true, Ordering::SeqCst);
+                DurableFuture::from_async(async { Ok(1_u32) })
+            });
+            handle.await.expect_err("no invocation runtime").to_string()
+        });
+        assert!(!started.load(Ordering::SeqCst), "start must not be called");
+        let expected = crate::task::NoRuntime::operation_error(crate::task::NoRuntime).to_string();
+        assert_eq!(error, expected);
     }
 
     /// `.spawn()` on a thread with no Tokio runtime resolves to the error

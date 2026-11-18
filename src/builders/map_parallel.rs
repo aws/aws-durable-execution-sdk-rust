@@ -415,8 +415,9 @@ where
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     ///
     /// # Examples
     ///
@@ -572,8 +573,9 @@ where
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     pub fn spawn(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
@@ -977,8 +979,9 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     ///
     /// # Examples
     ///
@@ -1132,8 +1135,9 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     pub fn spawn(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
@@ -1468,8 +1472,9 @@ impl<RS> ParallelMixedBuilder<RS> {
     ///
     /// # Errors
     ///
-    /// When no Tokio runtime is running, the returned future resolves to an
-    /// error and the operation records nothing.
+    /// When the invocation coordinator was created without a Tokio runtime,
+    /// the returned future resolves to an error and the operation records
+    /// nothing.
     pub fn spawn(self) -> DurableFuture<CompletionReason>
     where
         RS: Serdes<String>,
