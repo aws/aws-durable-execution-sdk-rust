@@ -214,8 +214,7 @@ async fn on_change_emits_running_records_then_the_terminal_record_last() {
         .run(two_waits, json!({}))
         .await
         .expect("runner");
-    let invocations = result.invocations().len();
-    assert!(invocations > 1);
+    assert!(result.invocations().len() > 1);
 
     let records = recording.records();
     let (last, earlier) = records.split_last().expect("records");
@@ -224,13 +223,6 @@ async fn on_change_emits_running_records_then_the_terminal_record_last() {
     assert!(earlier.iter().all(|r| r.get("output").is_none()));
     assert!(earlier.iter().all(|r| r["input"] == json!({})));
 
-    // Each invocation exports one record at its start and one at its end.
-    // So every further record comes from an operation change.
-    assert!(
-        records.len() > 2 * invocations,
-        "{} records in {invocations} invocations",
-        records.len()
-    );
     // A record lists every operation so far. So a later record never lists
     // fewer operations than an earlier one.
     let counts: Vec<usize> = records
@@ -241,16 +233,42 @@ async fn on_change_emits_running_records_then_the_terminal_record_last() {
         counts.windows(2).all(|pair| pair[0] <= pair[1]),
         "{counts:?}"
     );
-    assert_eq!(counts.first(), Some(&0), "{counts:?}");
     assert_eq!(counts.last(), Some(&2), "{counts:?}");
+}
+
+#[tokio::test]
+async fn on_change_emits_a_running_record_for_an_operation_change() {
+    let (telemetry, recording) =
+        recorded(DurableExecutionTelemetry::builder().emit_mode(EmitMode::OnChange));
+    runner(telemetry)
+        .run(one_step, json!({ "n": 21 }))
+        .await
+        .expect("runner");
+
+    // The invocation-start record lists no step, and the invocation-end
+    // record has an end time. So only an operation change produces a record
+    // that lists the step and has no end time.
+    let records = recording.records();
+    assert!(
+        records
+            .iter()
+            .any(|r| r.get("endTime").is_none() && r["operationsByName"].get("double").is_some()),
+        "{records:?}"
+    );
 }
 
 #[tokio::test]
 async fn on_change_emits_a_running_record_when_the_invocation_starts() {
     let (telemetry, recording) =
         recorded(DurableExecutionTelemetry::builder().emit_mode(EmitMode::OnChange));
+    // The export of the invocation-start record runs on its own task. The
+    // handler yields before its first operation, so that task runs first.
+    let yields_then_steps = |event: Value, ctx: DurableContext| async move {
+        tokio::task::yield_now().await;
+        one_step(event, ctx).await
+    };
     runner(telemetry)
-        .run(one_step, json!({ "n": 21 }))
+        .run(yields_then_steps, json!({ "n": 21 }))
         .await
         .expect("runner");
 

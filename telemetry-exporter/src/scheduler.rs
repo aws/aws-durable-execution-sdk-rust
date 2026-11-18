@@ -194,6 +194,20 @@ impl Scheduler {
         let slot = Arc::clone(slot);
         async move { scheduler.export_pending(&slot).await }
     }
+
+    /// Starts a task that exports the slot's pending record, and does not
+    /// wait for it.
+    ///
+    /// The task takes the same lock as every other export. So
+    /// [`Self::drain`] waits for an export that this task has started. A
+    /// task that gets the lock after the record was taken exports nothing.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the SDK's task gateway is private to the SDK crate; this task creates no durable operation, and drain waits for its export through the lock"
+    )]
+    pub(crate) fn spawn_export(self: &Arc<Self>, slot: &Arc<Slot>) {
+        drop(tokio::spawn(self.export_pending_owned(slot)));
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +357,18 @@ mod tests {
         scheduler.export_pending_owned(&slot).await;
         assert_eq!(*lock(&recorder.exported), ["1"]);
         assert!(format!("{scheduler:?}").contains("exporters: 1"));
+    }
+
+    #[tokio::test]
+    async fn spawn_export_exports_without_being_awaited() {
+        let recorder = Arc::new(Recorder::default());
+        let scheduler = Arc::new(Scheduler::new(vec![recorder.clone()]));
+        let slot = Arc::new(Slot::default());
+        slot.schedule(stamped("1"));
+        scheduler.spawn_export(&slot);
+        assert!(lock(&recorder.exported).is_empty());
+        tokio::task::yield_now().await;
+        assert_eq!(*lock(&recorder.exported), ["1"]);
     }
 
     #[tokio::test]
