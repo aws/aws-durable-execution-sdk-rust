@@ -519,3 +519,165 @@ async fn empty_batch_replay_uses_recorded_reason_without_reinvoking_predicate() 
         );
     }
 }
+
+/// Runs `map([0, 1])` with `max_concurrency(2)` and `completion`: item 1
+/// fails, and item 0 returns `Ok(7)` after item 1 failed. The batch's own
+/// outcome write fails retryably once, so a second invocation resumes the
+/// batch from the two recorded item outcomes, which the helper asserts.
+/// Returns, for each invocation that got past the batch, its number and
+/// what it saw: the reason from `.await_batch()`, or, with `values`, the
+/// result of `.await` as `Ok(<values>)` or `Err(<the error's recorded
+/// message>)`.
+async fn resumed_batch(completion: CompletionConfig, values: bool) -> Vec<(usize, String)> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Mutex::new(0_usize));
+    let (handler_seen, handler_calls) = (Arc::clone(&seen), Arc::clone(&calls));
+    let result = LocalRunner::new()
+        .max_invocations(4)
+        // Calls 1 and 2 hold the STARTs and the two item outcomes; call 3 is
+        // the batch's own outcome.
+        .fail_checkpoints_after_retryable(2, 1)
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let (seen, calls, completion) = (
+                    Arc::clone(&handler_seen),
+                    Arc::clone(&handler_calls),
+                    completion.clone(),
+                );
+                async move {
+                    let invocation = {
+                        let mut n = calls.lock().expect("lock");
+                        *n += 1;
+                        *n
+                    };
+                    let failed = Arc::new(tokio::sync::Notify::new());
+                    let map = ctx
+                        .map(vec![0_u32, 1], move |_child, item, _idx| {
+                            let failed = Arc::clone(&failed);
+                            async move {
+                                if item == 1 {
+                                    failed.notify_one();
+                                    return Err::<u32, durable::BoxError>("item 1 fails".into());
+                                }
+                                failed.notified().await;
+                                Ok(7)
+                            }
+                        })
+                        .max_concurrency(2)
+                        .completion(completion);
+                    let outcome = if values {
+                        match map.await {
+                            Ok(values) => format!("Ok({values:?})"),
+                            Err(err) => {
+                                let wire = err.wire();
+                                let message = wire.and_then(durable::WireError::error_message);
+                                format!("Err({})", message.unwrap_or_default())
+                            }
+                        }
+                    } else {
+                        map.await_batch().await?.reason.as_str().to_owned()
+                    };
+                    seen.lock().expect("lock").push((invocation, outcome));
+                    Ok::<_, durable::BoxError>(())
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert_eq!(
+        result.invocation_count(),
+        2,
+        "the batch outcome write failed once"
+    );
+    let items: Vec<_> = ["map-item-0", "map-item-1"]
+        .iter()
+        .map(|name| result.operation(name).expect("the item record").status())
+        .collect();
+    assert_eq!(
+        items,
+        [
+            durable::OperationStatus::Succeeded,
+            durable::OperationStatus::Failed
+        ],
+        "invocation 1 recorded both item outcomes"
+    );
+    std::mem::take(&mut *seen.lock().expect("lock"))
+}
+
+/// `min_successful(1)` with a tolerance of 0 failures.
+fn min_one_no_failure() -> CompletionConfig {
+    CompletionConfig::builder()
+        .min_successful(1)
+        .tolerated_failure_count(0)
+        .build()
+        .expect("valid completion config")
+}
+
+/// Live, item 1's failure settles first and exceeds the tolerance of 0. The
+/// resumed batch decides the same on the two recorded outcomes, although
+/// item 0's success comes first in index order.
+#[tokio::test]
+async fn resumed_batch_checks_the_failure_tolerance_on_every_recorded_outcome() {
+    assert_eq!(
+        resumed_batch(min_one_no_failure(), false).await,
+        [(2, "FAILURE_TOLERANCE_EXCEEDED".to_owned())]
+    );
+}
+
+/// The resumed `.await` returns the recorded failure, not the values.
+#[tokio::test]
+async fn resumed_batch_await_returns_the_recorded_failure() {
+    assert_eq!(
+        resumed_batch(min_one_no_failure(), true).await,
+        [(2, "Err(item 1 fails)".to_owned())]
+    );
+}
+
+/// Every item has a recorded outcome, so the resumed batch records
+/// `ALL_COMPLETED`, as the live batch does, and not `MIN_SUCCESSFUL_REACHED`.
+#[tokio::test]
+async fn resumed_batch_with_every_outcome_recorded_is_all_completed() {
+    assert_eq!(
+        resumed_batch(CompletionConfig::with_min_successful(1), false).await,
+        [(2, "ALL_COMPLETED".to_owned())]
+    );
+}
+
+/// A concurrent batch with no recorded item evaluates no threshold before
+/// its first settle: `min_successful(0)` completes at item 0's settle.
+#[tokio::test]
+async fn concurrent_min_successful_zero_completes_at_first_settle() {
+    let result = LocalRunner::new()
+        .run(
+            |_event: serde_json::Value, ctx: durable::DurableContext| async move {
+                let batch = ctx
+                    .map(vec![0_u32, 1], |_child, item, _idx| async move {
+                        if item == 1 {
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(item)
+                    })
+                    .max_concurrency(2)
+                    .completion(CompletionConfig::with_min_successful(0))
+                    .await_batch()
+                    .await?;
+                let statuses: Vec<String> = batch
+                    .items
+                    .iter()
+                    .map(|i| format!("{:?}", i.status))
+                    .collect();
+                Ok::<_, durable::BoxError>((batch.reason.as_str().to_owned(), statuses))
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert_eq!(
+        result.output().expect("output"),
+        &(
+            "MIN_SUCCESSFUL_REACHED".to_owned(),
+            vec!["Succeeded".to_owned(), "Started".to_owned()]
+        )
+    );
+}

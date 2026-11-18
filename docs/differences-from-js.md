@@ -364,6 +364,14 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Decision (2026-10-26): abort the running items.
 - **Where:** `src/map_parallel.rs`, `produce_batch`.
 
+### Resumed items without a recorded outcome
+
+- **JavaScript:** A concurrent batch that resumes starts its items in index order, within `maxConcurrency`, up to the last item with a recorded outcome. An item below that index without a recorded outcome runs its body again, and its outcome counts when it settles before the last recorded item does. JavaScript skips such an item only once the outcomes settled so far decide the batch.
+- **Rust:** A concurrent batch that resumes applies every recorded item outcome first, then checks the fixed thresholds once. It starts an item without a recorded outcome only when no rule fired.
+- **Why:** JavaScript derives each item's ID from the order of the starts, so it starts the earlier items to replay a later one, and Rust gives each item its ID by its index. Starting them makes the decision depend on timing: with `minSuccessful: 1` and `toleratedFailureCount: 0`, item 0 `STARTED` and item 1 `SUCCEEDED` give `FAILURE_TOLERANCE_EXCEEDED` when item 0's resumed body fails before item 1 replays, and `MIN_SUCCESSFUL_REACHED` otherwise, after item 0's body ran again for a result the batch does not use.
+- **Decision:** JavaScript defect.
+- **Where:** `src/map_parallel.rs`, `execute_batch` and `CompletionTracker::finish_replay_pass`.
+
 ### Combinator failure records
 
 - **JavaScript:** Records the type `PromiseCombinatorError`, and replay rebuilds an untyped error.

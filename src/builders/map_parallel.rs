@@ -1583,10 +1583,12 @@ pub(crate) type CompletionPredicate =
 ///
 /// Controls early-completion thresholds: how many items must succeed and
 /// how many failures are tolerated before stopping. Thresholds can be
-/// combined, and the first to fire wins. A
-/// [completion predicate](Self::with_completion_predicate) cannot be
-/// combined with a threshold: [`CompletionConfigBuilder::build`] rejects
-/// the mix.
+/// combined, and the first to fire wins. A concurrent batch that resumes
+/// with recorded item outcomes applies all of them, then checks the
+/// thresholds once, in the order failure tolerance, every item finished,
+/// `min_successful`. A [completion predicate](Self::with_completion_predicate)
+/// cannot be combined with a threshold: [`CompletionConfigBuilder::build`]
+/// rejects the mix.
 ///
 /// # Default: fail fast
 ///

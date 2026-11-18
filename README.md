@@ -1011,9 +1011,14 @@ fail the batch once the failures exceed the tolerance.
 wins. After each settle the SDK checks them in JS's order: the failure
 tolerance first, then "every item finished" (`ALL_COMPLETED`), then the
 minimum. So `min_successful(2)` over two items records `ALL_COMPLETED`.
-`min_successful(0)` completes a non-empty batch at its first settle. The
-percentage is an `f64` and accepts a fraction such as `12.5`; the batch fails
-when the failure rate strictly exceeds it. The SDK compares
+`min_successful(0)` completes a non-empty batch at its first settle. A
+concurrent batch that resumes with recorded item outcomes applies all of them
+first, then checks the thresholds once, in the same order, on the counts of
+those outcomes. So a recorded failure beyond the tolerance fails the batch
+whatever its index, and a batch without a completion predicate whose items all
+have a recorded outcome records `ALL_COMPLETED` unless the tolerance is
+exceeded. The percentage is an `f64` and accepts a fraction such as `12.5`;
+the batch fails when the failure rate strictly exceeds it. The SDK compares
 `failures * 100 > pct * total` rather than dividing, so 7 failures of 50 do
 not exceed `14.0`. `with_tolerated_failure_percentage` and `build()` return
 a `CompletionConfigValidationError` for a percentage that is not finite or

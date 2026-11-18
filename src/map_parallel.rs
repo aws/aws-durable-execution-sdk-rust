@@ -20,7 +20,6 @@
 //! - Completion decision uses the STARTED set
 //! - Results collected positionally per branch index
 //! - Each branch runs in its own child context
-//! - Fail-fast when `min_successful` can no longer be met
 
 use std::future::Future;
 use std::sync::Arc;
@@ -2678,21 +2677,21 @@ where
 
     // 7b. Replay pass (concurrent mode): resolve every recorded-terminal
     // child inline on the coordinator, in input order, BEFORE dispatching
-    // any live work, never through the live `JoinSet` schedule. This is
-    // what keeps completion triggers deterministic under replay: outcomes
-    // already in the checkpoint log feed the statistics in canonical input
-    // order before any live settlement joins, so identical recorded state
-    // yields identical trigger decisions no matter how the scheduler orders
-    // the join events of resumed live branches. Recorded terminals are
-    // completed history, real work whose outcome the service persisted,
-    // so they are applied unconditionally: a trigger firing mid-pass halts
-    // future live dispatch but never drops an already-recorded outcome
-    // from the result.
+    // any live work, never through the live `JoinSet` schedule. Recorded
+    // terminals are completed history, real work whose outcome the service
+    // persisted, so every one of them is applied to the result. The settles
+    // of the pass check no threshold. After the last of them,
+    // `finish_replay_pass` checks the thresholds once, on the counts of
+    // every recorded outcome, so the reason depends only on the recorded
+    // state and not on which index holds which outcome. The predicate is
+    // asked at each settle until its first `Complete` decision, which halts
+    // live dispatch.
     //
     // The sequential path (`concurrency == 1`) discovers terminality lazily
     // at the dispatch cursor instead, where settlement order and input
     // order already coincide.
     if concurrency > 1 {
+        progress.tracker.replaying_recorded = true;
         for i in 0..total_items {
             let Some(pre) = pre_claimed.get(i) else {
                 return Err(batch_error("pre-claimed index out of range"));
@@ -2713,6 +2712,9 @@ where
             env.resolve_terminal_inline(&pre.op_id, i, &item_name, &mut join_set, &mut progress)
                 .await?;
         }
+        progress
+            .tracker
+            .finish_replay_pass(completion_cfg, total_items);
     }
 
     loop {
@@ -2996,10 +2998,11 @@ where
     }
 
     // 8. Determine completion reason: the first trigger to fire during the
-    // run (recorded at the dispatch gate or the settle that fired it: first
-    // trigger wins), or `AllCompleted` when no trigger fired. A non-empty
-    // batch reaches this point only after a settle or after the dispatch
-    // gate set the reason, and the zero-item batch returned at step 3.
+    // run (recorded at the dispatch gate, at the settle that fired it, or at
+    // the end of the concurrent replay pass: first trigger wins), or
+    // `AllCompleted` when no trigger fired. A non-empty batch reaches this
+    // point only after a settle or after the dispatch gate set the reason,
+    // and the zero-item batch returned at step 3.
     let reason = tracker
         .stop_reason
         .unwrap_or(CompletionReason::AllCompleted);
@@ -3699,18 +3702,23 @@ fn build_child_fail_update(
 /// and the first completion trigger to fire.
 ///
 /// Every settle, a recorded-terminal child applied inline or a live join,
-/// flows through [`settle`](Self::settle), and every live dispatch first
-/// passes [`dispatch_gate`](Self::dispatch_gate). So the completion rule is
-/// evaluated in exactly these two places, as JS evaluates it in `isComplete`
-/// and `shouldContinue`.
+/// flows through [`settle`](Self::settle), every live dispatch first passes
+/// [`dispatch_gate`](Self::dispatch_gate), and the replay pass of a
+/// concurrent batch ends with [`finish_replay_pass`](Self::finish_replay_pass).
+/// So the completion rule is evaluated in exactly these three places, as JS
+/// evaluates it in `isComplete` and `shouldContinue`.
 ///
 /// The fixed thresholds and the predicate cannot both be configured
 /// ([`CompletionConfigBuilder::build`](crate::builders::map_parallel::CompletionConfigBuilder::build)
 /// rejects the mix), so their order within one settle does not matter.
-/// The live settle order is not recorded, and on resume the recorded items
-/// settle first, in index order. The thresholds only grow with the counts,
-/// so they reach the same decision in any order. A predicate reaches the
-/// same decision only when it is monotonic, which its rustdoc requires.
+/// The live settle order is not recorded. When a concurrent batch resumes,
+/// its recorded items settle first, in index order, and the thresholds are
+/// checked once, after the last of them, on the counts of every recorded
+/// outcome. A sequential batch settles its items in index order live and
+/// on resume, so it checks the thresholds at every settle. The predicate
+/// is asked at each settle until its first `Complete` decision, and it
+/// reaches the same decision only when it is monotonic, which its rustdoc
+/// requires.
 struct CompletionTracker {
     /// Count of items that have succeeded so far (settle order).
     success_count: usize,
@@ -3721,6 +3729,9 @@ struct CompletionTracker {
     /// The first completion trigger to fire (first trigger wins). `Some`
     /// halts new dispatch, and nothing changes it afterwards.
     stop_reason: Option<CompletionReason>,
+    /// `true` while the replay pass of a concurrent batch applies the
+    /// recorded outcomes: [`settle`](Self::settle) then checks no threshold.
+    replaying_recorded: bool,
     /// `false` while the coordinator rebuilds a batch that already
     /// completed: its reason is read from the decision record, so neither
     /// the thresholds nor the predicate run.
@@ -3740,6 +3751,7 @@ impl CompletionTracker {
                 .map(|(index, name)| CompletionItem::new(index, name, None))
                 .collect(),
             stop_reason: None,
+            replaying_recorded: false,
             evaluating: true,
         }
     }
@@ -3777,6 +3789,7 @@ impl CompletionTracker {
     /// Applies one settled outcome to the counts and the view and, while no
     /// trigger has fired yet, evaluates the thresholds, then the predicate
     /// (first trigger wins: once `stop_reason` is set it never changes).
+    /// While `replaying_recorded` is `true`, it evaluates only the predicate.
     fn settle(
         &mut self,
         cfg: &crate::builders::map_parallel::CompletionConfig,
@@ -3798,12 +3811,32 @@ impl CompletionTracker {
         if !self.evaluating {
             return;
         }
-        if self.stop_reason.is_none() {
+        if self.stop_reason.is_none() && !self.replaying_recorded {
             self.stop_reason =
                 evaluate_thresholds(cfg, self.success_count, self.failure_count, total_items);
         }
         if self.stop_reason.is_none() {
             self.stop_reason = custom_reason(cfg.predicate_decision(&self.stats()));
+        }
+    }
+
+    /// Ends the replay pass of a concurrent batch: sets `replaying_recorded`
+    /// to `false` and, while the tracker evaluates and no trigger has fired,
+    /// checks the thresholds once on the counts of every recorded outcome. A
+    /// pass that applied no outcome checks nothing, so the batch first checks
+    /// the thresholds at its first settle, as a batch with no record does.
+    fn finish_replay_pass(
+        &mut self,
+        cfg: &crate::builders::map_parallel::CompletionConfig,
+        total_items: usize,
+    ) {
+        self.replaying_recorded = false;
+        if self.evaluating
+            && self.stop_reason.is_none()
+            && self.success_count + self.failure_count > 0
+        {
+            self.stop_reason =
+                evaluate_thresholds(cfg, self.success_count, self.failure_count, total_items);
         }
     }
 }
@@ -3825,9 +3858,10 @@ fn custom_reason(decision: CompletionDecision) -> Option<CompletionReason> {
 /// Evaluates the fixed completion thresholds against the running batch
 /// counts, returning the first that fires (or `None`).
 ///
-/// Called after each settled item. The order follows JS: the failure
-/// tolerance first, then "every item finished" (which leaves the reason
-/// `AllCompleted`), then `min_successful`.
+/// Called after each settled item, except the recorded items of a
+/// concurrent batch's replay pass, and once after that pass. The order
+/// follows JS: the failure tolerance first, then "every item finished"
+/// (which leaves the reason `AllCompleted`), then `min_successful`.
 fn evaluate_thresholds(
     cfg: &crate::builders::map_parallel::CompletionConfig,
     success_count: usize,
@@ -7124,6 +7158,26 @@ mod tests {
             0,
             "the predicate is never called"
         );
+    }
+
+    /// A tracker that stopped evaluating checks no threshold when the
+    /// replay pass of a concurrent batch ends, whatever outcomes the pass
+    /// applied.
+    #[test]
+    fn stopped_tracker_finish_replay_pass_checks_nothing() {
+        let cfg = Config::builder()
+            .min_successful(1)
+            .tolerated_failure_count(0)
+            .build()
+            .expect("valid completion config");
+        let mut tracker = CompletionTracker::new(vec![None; 2]);
+        tracker.stop_evaluating();
+        tracker.replaying_recorded = true;
+        tracker.settle(&cfg, 2, 0, BatchItemStatus::Succeeded);
+        tracker.settle(&cfg, 2, 1, BatchItemStatus::Failed);
+        tracker.finish_replay_pass(&cfg, 2);
+        assert_eq!(tracker.stop_reason, None);
+        assert!(!tracker.replaying_recorded);
     }
 
     /// Once the predicate completed the batch, the SDK does not ask it
