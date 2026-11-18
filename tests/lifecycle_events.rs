@@ -927,3 +927,54 @@ async fn failed_create_callback_replay_decode_emits_no_operation_replayed() {
         "a failed callback decode must not emit operation_replayed. Got: {output}"
     );
 }
+
+/// A batch replays its recorded result and emits `operation_replayed`. A
+/// batch recorded in replay-children mode (its result over 256 KiB)
+/// rebuilds from its items instead, so it emits none of its own, as the
+/// `observability` module documents for a child context and a batch in
+/// that mode. Every item of `big` is stored inline, so neither batch runs
+/// an item body on replay.
+#[tokio::test]
+async fn replay_children_batch_emits_no_operation_replayed() {
+    let (buffer, _guard) = capture_subscriber();
+
+    let result = LocalRunner::new()
+        .run(
+            |_event: serde_json::Value, ctx: durable::DurableContext| async move {
+                let small = ctx
+                    .map(vec![1_usize, 2], |_child, len, _idx| async move {
+                        Ok("s".repeat(len))
+                    })
+                    .name("small")
+                    .await?;
+                // Three items of 100 KiB: each fits its own record, the
+                // batch result does not.
+                let big = ctx
+                    .map(vec![100 * 1024_usize; 3], |_child, len, _idx| async move {
+                        Ok("b".repeat(len))
+                    })
+                    .name("big")
+                    .await?;
+                ctx.wait(Duration::from_secs(1)).name("pause").await?;
+                Ok::<_, durable::BoxError>(small.len() + big.len())
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+
+    assert_eq!(result.output(), Some(&5), "{result}");
+    assert_eq!(result.invocation_count(), 2, "{result}");
+
+    let output = captured(&buffer);
+    let replayed = lifecycle_events(&output, event_names::OPERATION_REPLAYED);
+    assert_eq!(
+        events_with_field(&replayed, field_names::OPERATION_NAME, "small").len(),
+        1,
+        "a batch whose record holds its result emits operation_replayed. Got: {output}"
+    );
+    assert!(
+        events_with_field(&replayed, field_names::OPERATION_NAME, "big").is_empty(),
+        "a replay-children batch emits no operation_replayed of its own. Got: {output}"
+    );
+}

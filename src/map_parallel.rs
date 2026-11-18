@@ -2307,52 +2307,12 @@ where
             };
 
         if let Some(record) = decision {
-            let plan = ReplayPlan::from_record(&record, total_items)?;
-            // Fast path (Normal nesting): decode every completed item
-            // straight from its child record (after validating each
-            // child's replay identity), report items in the started
-            // set as STARTED without consulting their child
-            // checkpoints, and omit every index at or beyond
-            // `totalCount`. Flat items have no
-            // child records, so Flat always reconstructs through the
-            // plan-constrained re-execution below.
-            if nesting != NestingMode::Flat {
-                match replay_batch_from_record(
-                    &batch_ctx,
-                    &plan,
-                    &record_names,
-                    &serdes,
-                    child_sub_type,
-                    item_ids,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        // Recorded terminal batch returned without
-                        // re-running the batch.
-                        ctx.emit_operation_replayed(
-                            &parent_wire,
-                            parent_name.as_deref(),
-                            "Context",
-                            Some(parent_sub_type),
-                            view.attempt,
-                        );
-                        return Ok(result);
-                    }
-                    Err(e) => {
-                        let is_replay_children =
-                            crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
-                        if !is_replay_children {
-                            return Err(e);
-                        }
-                        // A completed CHILD whose own result was too
-                        // large to checkpoint inline: reconstruct it by
-                        // re-execution, still constrained by the plan.
-                    }
-                }
-            }
-            replay_plan = Some(plan);
-            // Fall through: re-execute ONLY the recorded admission set.
+            // Fall through: rebuild the batch from its items, constrained
+            // to the recorded admission set and completion reason. Each
+            // completed item decodes its record once, or reruns its body
+            // when its own record carries `ReplayChildren`, as JS
+            // `replayItems` does.
+            replay_plan = Some(ReplayPlan::from_record(&record, total_items)?);
         } else {
             match replay_terminal_batch(
                 &ctx,
@@ -2586,13 +2546,18 @@ where
         replay_plan,
     } = section;
 
-    // 3. Empty collection: the batch succeeds at once. As in JS, a
+    // 3. Empty collection: the batch succeeds at once. As in JS, a live
     // zero-item batch asks the predicate once, on an empty view; without a
     // predicate the decision is `Continue`, which records `AllCompleted`.
+    // A rebuild takes the reason its replay plan recorded and asks
+    // nothing, as JS `replayItems` does.
     if total_items == 0 {
-        let reason =
-            custom_reason(completion_cfg.predicate_decision(&BatchStats::from_counts(0, 0, &[])))
-                .unwrap_or(CompletionReason::AllCompleted);
+        let reason = if let Some(plan) = &replay_plan {
+            plan.reason
+        } else {
+            let decision = completion_cfg.predicate_decision(&BatchStats::from_counts(0, 0, &[]));
+            custom_reason(decision).unwrap_or(CompletionReason::AllCompleted)
+        };
         return Ok(Produced {
             result: BatchResult {
                 items: Vec::new(),
@@ -3490,84 +3455,6 @@ impl ReplayPlan {
     fn admits(&self, index: usize) -> bool {
         index < self.total_count && self.completed.get(index).copied().unwrap_or(false)
     }
-}
-
-/// Fast replay of a large-result batch (Normal nesting): reconstructs the
-/// batch result directly from the decision record and the child checkpoint
-/// records, without re-running any item body.
-///
-/// Each child's ID comes from the batch's [`ItemIds`] table. An admitted
-/// child whose own result was too large to checkpoint inline surfaces as
-/// the `ReplayChildren` sentinel, and the caller falls back to
-/// re-execution, which reads the same table. Items in the started set are
-/// reported as [`BatchItemStatus::Started`] without consulting their child
-/// checkpoints, and indexes at or beyond `totalCount` are omitted entirely.
-///
-/// Every completed child's replay identity (type, sub-type, name) is
-/// validated against its checkpoint record before its terminal payload is
-/// read, so a handler change that renames or retypes a child raises
-/// `NonDeterministicExecution` here exactly as it does on the re-execution
-/// path. Started-set children are exempt: their records are never
-/// consulted at all.
-async fn replay_batch_from_record<O, IS>(
-    ctx: &DurableContext,
-    plan: &ReplayPlan,
-    record_names: &[String],
-    serdes: &Arc<IS>,
-    child_sub_type: &str,
-    item_ids: &ItemIds,
-) -> Result<BatchResult<O>, OperationError>
-where
-    O: Send + 'static,
-    IS: Serdes<O>,
-{
-    let mut items = Vec::new();
-    for i in 0..plan.total_count {
-        // `ReplayPlan::from_record` rejects a `totalCount` above the input
-        // length, and `record_names` has one entry per input item. So the
-        // lookup cannot miss.
-        #[expect(clippy::expect_used)]
-        // reason: `totalCount` is at most the input length, which is the length of `record_names`
-        let item_name = record_names
-            .get(i)
-            .expect("record_names has one entry per input item")
-            .clone();
-        if !plan.completed.get(i).copied().unwrap_or(false) {
-            // STARTED at batch completion: reported from the record with
-            // no result and no error; its child checkpoints are never
-            // read.
-            items.push(BatchItem {
-                index: i,
-                name: item_name,
-                status: BatchItemStatus::Started,
-                result: None,
-                error_message: None,
-                error_type: None,
-                error_data: None,
-                stack_trace: Vec::new(),
-            });
-            continue;
-        }
-        let op_id = item_ids.id(i);
-        // Non-determinism detection: validate the claimed child identity
-        // against the record before decoding its terminal payload.
-        ctx.checkpoint_view_validated(
-            op_id.positional(),
-            op_id.wire(),
-            "Context",
-            Some(child_sub_type),
-            Some(&item_name),
-        )?;
-        let serdes_ctx = SerdesContext::new(op_id.wire().to_owned(), ctx.execution_arn());
-        let (item, _wire) =
-            replay_terminal_child(ctx, op_id.positional(), i, &item_name, serdes, &serdes_ctx)
-                .await?;
-        items.push(item);
-    }
-    Ok(BatchResult {
-        items,
-        reason: plan.reason,
-    })
 }
 
 /// Checkpoints the parent batch as SUCCEEDED with the pre-serialized result.
@@ -10025,15 +9912,14 @@ mod tests {
         assert_eq!(batch.results().collect::<Vec<_>>(), vec!["a", "c"]);
     }
 
-    /// The plan-constrained FALLBACK (fast replay hit a completed child
-    /// recorded `replay_children` and fell through to re-execution) must
-    /// consult child checkpoints only for indexes the plan admits as
+    /// The plan-constrained rebuild of a batch recorded `replay_children`
+    /// must consult child checkpoints only for indexes the plan admits as
     /// COMPLETED. Started-set and never-started indexes here hold records
     /// with a hostile identity (`op_type: Step`) that would raise
     /// `NonDeterministicExecution` if the concurrent pre-claim loop read
     /// them: as it did before this fix.
     #[tokio::test]
-    async fn plan_constrained_fallback_reads_only_admitted_child_checkpoints() {
+    async fn plan_constrained_rebuild_reads_only_admitted_child_checkpoints() {
         // A record whose stored identity can never match a batch child's
         // claim ("Context"): any validated read of it fails.
         let poisoned_record = |positional_id: &str| {
@@ -10068,8 +9954,8 @@ mod tests {
         };
         // Live history: items 0 and 2 completed, item 1 started-not-
         // terminal, item 3 never started. Item 0's own result was too
-        // large to store inline (`replay_children`), so fast replay falls
-        // through and the plan constrains the re-execution.
+        // large to store inline (`replay_children`), so the rebuild reruns
+        // its body, and the plan constrains the rebuild.
         let decision =
             r#"{"totalCount":3,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[1]}"#;
         let log = CheckpointLog::from_records(vec![
@@ -10079,7 +9965,7 @@ mod tests {
             succeeded_record("1-3", "\"c\""),
             poisoned_record("1-4"),
         ]);
-        // The fallback re-executes item 0's body to reconstruct its
+        // The rebuild re-executes item 0's body to reconstruct its
         // oversized result, so a live client is needed.
         let (ctx, _client) = test_ctx_with_client(log);
 
@@ -10091,7 +9977,7 @@ mod tests {
             .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(2))
             .await_batch()
             .await
-            .expect("plan-constrained fallback must not read non-admitted child checkpoints");
+            .expect("the plan-constrained rebuild must not read non-admitted child checkpoints");
 
         assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
         let statuses: Vec<(usize, BatchItemStatus)> =
@@ -10427,12 +10313,12 @@ mod tests {
         );
     }
 
-    /// Non-determinism regression (fast replay path): a completed child's
+    /// Non-determinism regression (batch rebuild): a completed child's
     /// replay identity is validated before its terminal payload is read, so
     /// a changed child sub-type raises `NonDeterministicExecution` instead
     /// of replaying the stale record successfully.
     #[tokio::test]
-    async fn fast_replay_validates_completed_child_identity() {
+    async fn batch_rebuild_validates_completed_child_identity() {
         // Child "1-1" (item 0) carries a recorded identity that does NOT
         // match a map iteration: same type but a different sub-type.
         let mismatched_child = {
