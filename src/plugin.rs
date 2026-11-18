@@ -667,8 +667,8 @@ pub trait Plugin: Send + Sync {
     /// once per plugin, in registration order, and once per such response,
     /// in response order. A refresh checkpoint without updates is a
     /// checkpoint response too. A paginated response and the state pages
-    /// the SDK reads after it count as one response. When reading those
-    /// pages fails, the changes already merged are still reported.
+    /// the SDK reads for it count as one response. When reading those
+    /// pages fails, the changes in the response itself are still reported.
     ///
     /// An operation counts as changed when the SDK held no record of it,
     /// or held one with another status. Other fields do not count. The
@@ -2418,11 +2418,19 @@ pub(crate) struct InvocationPlugins {
     /// checks the queue again. A test pushes a change set there.
     #[cfg(test)]
     after_release: Mutex<Option<AfterRelease>>,
+    /// Runs at the start of [`Self::push_operation_change`], before the
+    /// change set is queued. A test polls a waiting operation there.
+    #[cfg(test)]
+    before_push: Mutex<Option<BeforePush>>,
 }
 
 /// The test hook of [`InvocationPlugins::set_after_release`].
 #[cfg(test)]
 type AfterRelease = Box<dyn FnMut(&InvocationPlugins) + Send>;
+
+/// The test hook of [`InvocationPlugins::set_before_push`].
+#[cfg(test)]
+type BeforePush = Box<dyn FnMut(&InvocationPlugins) + Send>;
 
 /// The delivery progress of the change sets of one invocation.
 #[derive(Default)]
@@ -2524,6 +2532,8 @@ impl InvocationPlugins {
     /// Queues the change set of one checkpoint response for
     /// `on_operation_change`. The SDK never queues an empty change set.
     pub(crate) fn push_operation_change(&self, updated: Vec<OperationInfo>) {
+        #[cfg(test)]
+        self.run_before_push();
         let mut queue = self
             .change_queue
             .lock()
@@ -2725,6 +2735,29 @@ impl InvocationPlugins {
     pub(crate) fn set_after_release(&self, hook: impl FnMut(&Self) + Send + 'static) {
         *self
             .after_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Runs and clears the test hook of `before_push`.
+    #[cfg(test)]
+    fn run_before_push(&self) {
+        let hook = self
+            .before_push
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut hook) = hook {
+            hook(self);
+        }
+    }
+
+    /// Sets a hook that runs once, at the start of the next
+    /// [`Self::push_operation_change`], before the change set is queued.
+    #[cfg(test)]
+    pub(crate) fn set_before_push(&self, hook: impl FnMut(&Self) + Send + 'static) {
+        *self
+            .before_push
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
     }
@@ -3528,6 +3561,8 @@ pub(crate) fn create_plugins(
         delivery: Mutex::new(ChangeDelivery::default()),
         #[cfg(test)]
         after_release: Mutex::new(None),
+        #[cfg(test)]
+        before_push: Mutex::new(None),
     }))
 }
 

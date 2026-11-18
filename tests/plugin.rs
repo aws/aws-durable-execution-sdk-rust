@@ -6840,3 +6840,211 @@ async fn live_operation_infos_have_type_and_status_tokens() {
         assert_eq!(row.4.as_deref(), Some("SUCCEEDED"), "{name}");
     }
 }
+
+/// A paginated checkpoint response that completes a waiting callback.
+mod paginated_change {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use aws_durable_execution_sdk as durable;
+    use durable::lambda_types::{
+        CallbackDetails, DateTime, Operation, OperationAction, OperationStatus as WireStatus,
+        OperationType, OperationUpdate,
+    };
+    use durable::plugin::{
+        HookWork, InvocationInfo, OperationChangeInfo, OperationInfo, Plugin, PluginFactory,
+    };
+    use durable::{
+        BoxError, CheckpointOutput, DurableContext, ExecutionClient, ExecutionClientError,
+        GetStateOutput, InvocationPayload, OperationKind, Options, lambda_runtime,
+    };
+
+    /// Answers a callback `START` with the callback's `STARTED` record, and
+    /// the first request that carries a step update with the callback's
+    /// `SUCCEEDED` record and the marker `page-2`. `get_state` counts its
+    /// calls, notifies `page_read`, takes 50 ms, and returns an empty last
+    /// page.
+    #[derive(Default)]
+    struct PagingTransport {
+        callback: Mutex<Option<(String, Option<String>)>>,
+        completed: Mutex<bool>,
+        tokens: Mutex<u32>,
+        state_reads: Mutex<u32>,
+        page_read: Arc<tokio::sync::Notify>,
+    }
+
+    impl ExecutionClient for PagingTransport {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            let mut operations = Vec::new();
+            let mut callback = self.callback.lock().unwrap();
+            for update in &updates {
+                if update.r#type() == &OperationType::Callback
+                    && update.action() == &OperationAction::Start
+                {
+                    let started = (update.id().to_owned(), update.name().map(ToOwned::to_owned));
+                    operations.push(callback_record(&started, WireStatus::Started));
+                    *callback = Some(started);
+                }
+            }
+            let mut marker = None;
+            let mut completed = self.completed.lock().unwrap();
+            if !*completed
+                && updates.iter().any(|u| u.r#type() == &OperationType::Step)
+                && let Some(started) = callback.as_ref()
+            {
+                operations.push(callback_record(started, WireStatus::Succeeded));
+                marker = Some("page-2".to_owned());
+                *completed = true;
+            }
+            let mut tokens = self.tokens.lock().unwrap();
+            *tokens += 1;
+            let output = CheckpointOutput::new(Some(format!("t-{tokens}")), operations, marker);
+            Box::pin(async move { Ok(output) })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            *self.state_reads.lock().unwrap() += 1;
+            Box::pin(async move {
+                self.page_read.notify_one();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(GetStateOutput::new(Vec::new(), None))
+            })
+        }
+    }
+
+    /// The record of the callback `started` (its ID and name) with
+    /// `status`. A `SUCCEEDED` record carries the result `"ok"`.
+    fn callback_record((id, name): &(String, Option<String>), status: WireStatus) -> Operation {
+        let succeeded = status == WireStatus::Succeeded;
+        let mut details = CallbackDetails::builder().callback_id("cb-1");
+        if succeeded {
+            details = details.result("\"ok\"");
+        }
+        let mut record = Operation::builder()
+            .id(id)
+            .set_name(name.clone())
+            .r#type(OperationType::Callback)
+            .status(status)
+            .start_timestamp(DateTime::from_secs(0))
+            .callback_details(details.build());
+        if succeeded {
+            record = record.end_timestamp(DateTime::from_secs(1));
+        }
+        record.build().expect("every required field is set")
+    }
+
+    /// Records `change cb <status>` for each callback that an
+    /// `on_operation_change` call lists, and `end cb` for the callback's
+    /// `on_operation_end`.
+    #[derive(Clone, Default)]
+    struct Order(Arc<Mutex<Vec<String>>>);
+
+    impl PluginFactory for Order {
+        fn create_plugin(
+            &self,
+            _info: &InvocationInfo,
+        ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    impl Plugin for Order {
+        fn on_operation_change(&self, info: &OperationChangeInfo) -> HookWork {
+            for op in info.updated_operations() {
+                if op.kind() == Some(OperationKind::Callback) {
+                    let entry = format!("change cb {:?}", op.status());
+                    self.0.lock().unwrap().push(entry);
+                }
+            }
+            Ok(None)
+        }
+
+        fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+            if info.kind() == Some(OperationKind::Callback) {
+                self.0.lock().unwrap().push("end cb".to_owned());
+            }
+            Ok(None)
+        }
+    }
+
+    /// When the response that completes a waiting callback is paginated,
+    /// the `on_operation_change` call that lists the callback `SUCCEEDED`
+    /// comes before its `on_operation_end`, also when the callback's result
+    /// is first polled while the SDK reads the pages.
+    #[tokio::test]
+    async fn paginated_response_change_comes_before_waiter_end() {
+        let transport = Arc::new(PagingTransport::default());
+        let page_read = Arc::clone(&transport.page_read);
+        let order = Order::default();
+        let service = durable::wrap(
+            move |_event: serde_json::Value, ctx: DurableContext| {
+                let page_read = Arc::clone(&page_read);
+                async move {
+                    let cb = ctx.create_callback::<String>().name("cb").await?;
+                    let (value, step) = tokio::join!(
+                        async {
+                            page_read.notified().await;
+                            cb.result().await
+                        },
+                        ctx.step(|_| async { Ok(1_u32) }).name("x"),
+                    );
+                    step?;
+                    Ok::<String, BoxError>(value?)
+                }
+            },
+            Options::builder()
+                .execution_client(Arc::clone(&transport) as Arc<dyn ExecutionClient>)
+                .plugin(order.clone())
+                .build()
+                .expect("valid options"),
+        );
+        let payload: InvocationPayload = serde_json::from_value(serde_json::json!({
+            "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:f",
+            "CheckpointToken": "t-0",
+            "InitialExecutionState": { "Operations": [{
+                "Id": "root",
+                "Type": "Execution",
+                "Status": "STARTED",
+                "ExecutionDetails": { "InputPayload": "{}" }
+            }]},
+        }))
+        .expect("a valid payload");
+        let event = lambda_runtime::LambdaEvent::new(payload, lambda_runtime::Context::default());
+        let response = tokio::time::timeout(Duration::from_secs(10), service(event))
+            .await
+            .expect("the invocation finishes within 10 s")
+            .expect("the invocation returns a response");
+        let response = serde_json::to_value(&response).expect("the response serializes");
+        assert_eq!(
+            response.get("Status").and_then(serde_json::Value::as_str),
+            Some("SUCCEEDED"),
+            "{response}"
+        );
+        assert_eq!(*transport.state_reads.lock().unwrap(), 1, "one page read");
+        let events = order.0.lock().unwrap().clone();
+        let change = events.iter().position(|e| e == "change cb Some(Succeeded)");
+        let end = events.iter().position(|e| e == "end cb");
+        assert!(
+            change.is_some() && end.is_some(),
+            "both hooks ran: {events:?}"
+        );
+        assert!(
+            change < end,
+            "the change comes before the end hook: {events:?}"
+        );
+    }
+}

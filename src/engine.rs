@@ -391,6 +391,10 @@ pub(crate) struct CheckpointLog {
     /// Uses interior mutability so that checkpoint responses can merge
     /// backend-assigned fields (e.g. `callback_id`) into the live log.
     records: RwLock<HashMap<String, CheckpointRecord>>,
+    /// Written while a checkpoint response is merged and its change set is
+    /// queued (see [`Self::publish`]), and read by
+    /// [`Self::published_status_view`].
+    publication: RwLock<()>,
 }
 
 impl CheckpointLog {
@@ -399,6 +403,7 @@ impl CheckpointLog {
     pub(crate) fn empty() -> Self {
         Self {
             records: RwLock::new(HashMap::new()),
+            publication: RwLock::new(()),
         }
     }
 
@@ -410,6 +415,7 @@ impl CheckpointLog {
     pub(crate) fn from_records(records: Vec<(String, CheckpointRecord)>) -> Self {
         Self {
             records: RwLock::new(records.into_iter().collect()),
+            publication: RwLock::new(()),
         }
     }
 
@@ -457,6 +463,27 @@ impl CheckpointLog {
             attempt: record.attempt,
             replay_children: record.replay_children,
         })
+    }
+
+    /// Holds back [`Self::published_status_view`] until the returned guard
+    /// drops. The write path holds it from the first merge of a checkpoint
+    /// response until the response's change set is queued, and never
+    /// across an `.await`.
+    pub(crate) fn publish(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.publication
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`Self::status_view`], read when no checkpoint response is being
+    /// published (see [`Self::publish`]). So a status that a response
+    /// changed is read only after the response's change set was queued.
+    pub(crate) fn published_status_view(&self, wire_id: &str) -> Option<CheckpointStatusView> {
+        let _published = self
+            .publication
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.status_view(wire_id)
     }
 
     /// Returns whether a record exists for the given wire ID, without

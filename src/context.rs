@@ -1384,6 +1384,10 @@ impl DurableContext {
     /// Registering before the read means a merge between the read and the
     /// end of the poll still wakes the waiting task. When the coordinator
     /// refuses the registration (the phase left `Running`), never resolves.
+    /// The status is read with
+    /// [`CheckpointLog::published_status_view`], so a status that a
+    /// checkpoint response changed is read only after the response's change
+    /// set was queued, also on another worker.
     pub(crate) async fn wait_for_record(
         &self,
         wire_id: &str,
@@ -1415,7 +1419,7 @@ impl DurableContext {
                 .inner
                 .engine
                 .checkpoint_log
-                .status_view(wire_id)
+                .published_status_view(wire_id)
                 .is_some_and(|view| ready(&view.status));
             if is_ready {
                 registration = None;
@@ -2520,9 +2524,37 @@ impl DurableContext {
             }
         }
 
-        // Merge updated operations into the checkpoint log so that
-        // subsequent reads (e.g. reading callback_id after START) see
-        // backend-assigned fields.
+        // If the checkpoint response is paginated, read the remaining pages
+        // via get_state before anything is merged, so that the merges and
+        // the queue below run under one hold of the publication guard,
+        // which no `.await` crosses. The token lock stays held through this
+        // read: releasing it first would let a concurrent branch checkpoint
+        // and rotate the token, leaving this get_state call with a stale
+        // token. A tokenless response to an `EXECUTION` update left the
+        // spent token in place, so its pages are not read, as in the JS and
+        // Python SDKs.
+        let pages = if output.next_marker.is_some() && !tokenless {
+            Some(
+                crate::client::get_full_state(
+                    client.as_ref(),
+                    &self.inner.execution_arn,
+                    &token_guard,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        // Merge the response's operations, then its pages, into the
+        // checkpoint log so that subsequent reads (e.g. reading callback_id
+        // after START) see backend-assigned fields, and queue their change
+        // set, all under the publication guard. A waiting operation reads
+        // its record's status under the guard's read side (see
+        // `wait_for_record`), so it sees a status this response changed
+        // only after the change set is queued, and the change comes before
+        // its end hook.
+        let publication = self.inner.engine.checkpoint_log.publish();
         let mut merged: Vec<String> = Vec::new();
         // The change set of this call, for `on_operation_change`: the wire
         // IDs whose status changed, each once, and the `EXECUTION`
@@ -2542,43 +2574,31 @@ impl DurableContext {
                     .map(|op| op.id().to_owned()),
             );
         }
-
-        // If the checkpoint response is paginated, fetch remaining pages
-        // via get_state and merge them into the checkpoint log. The token
-        // lock stays held through this fetch: releasing it first would let
-        // a concurrent branch checkpoint and rotate the token, leaving this
-        // get_state call with a stale token. A tokenless response to an
-        // `EXECUTION` update left the spent token in place, so its pages
-        // are not fetched, as in the JS and Python SDKs.
-        if output.next_marker.is_some() && !tokenless {
-            let full_state = match crate::client::get_full_state(
-                client.as_ref(),
-                &self.inner.execution_arn,
-                &token_guard,
-            )
-            .await
-            {
-                Ok(full_state) => full_state,
-                Err(err) => {
-                    // The response is merged already, so its changes are
-                    // reported even though the pages failed.
-                    self.queue_changes(change_set);
-                    self.record_write_failure(failure_id, &err);
-                    return Err(WriteError::Failed(err));
+        match pages {
+            Some(Ok(full_state)) => {
+                if !full_state.is_empty() {
+                    let changed_ids = crate::client::merge_operations_into_log(
+                        &self.inner.engine.checkpoint_log,
+                        &full_state,
+                    );
+                    self.collect_changes(&mut change_set, changed_ids, &full_state);
+                    merged.extend(full_state.iter().map(|op| op.id().to_owned()));
                 }
-            };
-            if !full_state.is_empty() {
-                let changed_ids = crate::client::merge_operations_into_log(
-                    &self.inner.engine.checkpoint_log,
-                    &full_state,
-                );
-                self.collect_changes(&mut change_set, changed_ids, &full_state);
-                merged.extend(full_state.iter().map(|op| op.id().to_owned()));
             }
+            Some(Err(err)) => {
+                // The response is merged, so its changes are reported even
+                // though the pages failed.
+                self.queue_changes(change_set);
+                drop(publication);
+                self.record_write_failure(failure_id, &err);
+                return Err(WriteError::Failed(err));
+            }
+            None => {}
         }
         // Still under the token lock, so change sets queue in response
         // order. No hook runs here: a drain point delivers them later.
         self.queue_changes(change_set);
+        drop(publication);
 
         // A `wait_for_condition` RETRY the response did not carry: the log
         // takes the status the service recorded. This runs under the token
@@ -9323,6 +9343,103 @@ mod change_hook_tests {
             .and_then(|info| info.updated_operations().first())
             .expect("step-1 is listed");
         assert_eq!(step_1.status(), Some(OperationStatus::Succeeded));
+    }
+
+    /// A waiting operation reads a status that a checkpoint response
+    /// changed only after the response's change set is queued, so the
+    /// change is delivered before the operation goes on, also when the
+    /// operation polls on another thread while the response is merged. The
+    /// `before_push` hook, which runs after the merge and before the queue,
+    /// asks the waiter's thread to poll once and waits up to 200 ms for that
+    /// poll. For an unpaginated response, a paginated one, and a paginated
+    /// one whose page read fails.
+    #[tokio::test]
+    async fn merged_status_is_hidden_until_its_change_is_queued() {
+        for case in ["unpaginated", "paginated", "failed page read"] {
+            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+            let response = vec![step_op("d", WireStatus::Succeeded)];
+            client.enqueue_checkpoint_response(if case == "unpaginated" {
+                TestResponse::Success(response)
+            } else {
+                TestResponse::SuccessPaginated(response, "page-2-token".to_owned())
+            });
+            if case == "failed page read" {
+                client.fail_get_state("injected get_state failure");
+            }
+            let recorder = Changes::default();
+            let log = Arc::new(CheckpointLog::from_records(vec![(
+                "d".to_owned(),
+                CheckpointRecord::with_status("d", CheckpointStatus::Started),
+            )]));
+            let ctx = ctx_on(client, log, Duration::ZERO, recorder.plugins());
+            // The waiter's thread polls the wait once per request and replies
+            // after each poll. When the wait resolves, it records how many
+            // change sets were delivered by then.
+            let (poll_tx, poll_rx) = std::sync::mpsc::channel::<()>();
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel::<()>();
+            let resolved: Arc<Mutex<Option<usize>>> = Arc::default();
+            let waiter = {
+                let ctx = ctx.clone();
+                let calls = Arc::clone(&recorder.calls);
+                let resolved = Arc::clone(&resolved);
+                std::thread::spawn(move || {
+                    let mut wait =
+                        Box::pin(ctx.wait_for_record("d", |s| *s == CheckpointStatus::Succeeded));
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    while poll_rx.recv().is_ok() {
+                        let ready = wait.as_mut().poll(&mut cx).is_ready();
+                        if ready {
+                            *resolved.lock().unwrap() = Some(calls.lock().unwrap().len());
+                        }
+                        reply_tx.send(()).unwrap();
+                        if ready {
+                            return;
+                        }
+                    }
+                })
+            };
+            poll_tx.send(()).unwrap();
+            reply_rx.recv().unwrap();
+            assert_eq!(
+                *resolved.lock().unwrap(),
+                None,
+                "{case}: the wait registers"
+            );
+            let reply_rx = Arc::new(Mutex::new(reply_rx));
+            {
+                let poll_tx = poll_tx.clone();
+                let reply_rx = Arc::clone(&reply_rx);
+                ctx.shared_plugins()
+                    .expect("the context has plugins")
+                    .set_before_push(move |_| {
+                        poll_tx.send(()).unwrap();
+                        // A waiter that reads the merged status replies at once.
+                        let _ = reply_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_millis(200));
+                    });
+            }
+            // A failed page read leaves the write unresolved.
+            let write = ctx.checkpoint_updates_direct(vec![start("d")]);
+            let _ = tokio::time::timeout(Duration::from_millis(500), write).await;
+            for _ in 0..50 {
+                if resolved.lock().unwrap().is_some() || poll_tx.send(()).is_err() {
+                    break;
+                }
+                let _ = reply_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(100));
+            }
+            drop(poll_tx);
+            waiter.join().unwrap();
+            assert_eq!(
+                *resolved.lock().unwrap(),
+                Some(1),
+                "{case}: the change is delivered before the wait resolves"
+            );
+        }
     }
 }
 
