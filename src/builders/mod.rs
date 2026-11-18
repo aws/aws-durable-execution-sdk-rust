@@ -711,13 +711,15 @@ impl RetryStrategyConfigBuilder {
     /// with `err.source().and_then(|e| e.downcast_ref::<T>())`. Combine
     /// several conditions with `||`.
     ///
-    /// With [`WithRetryBuilder::retry_strategy_config`], the source is the
-    /// attempt's [`OperationError`](crate::OperationError), and an attempt
-    /// that replays has no live source error, only its record. Match the
-    /// record through [`OperationError::wire`](crate::OperationError::wire)
+    /// With [`WithRetryBuilder::retry_strategy_config`], a failed attempt
+    /// that has a `FAIL` record supplies the attempt's
+    /// [`OperationError`](crate::OperationError) as the source, rebuilt from
+    /// that record in every invocation. Match the record through
+    /// [`OperationError::wire`](crate::OperationError::wire)
     /// ([`WireError::error_type`](crate::WireError::error_type) or
     /// [`WireError::error_message`](crate::WireError::error_message))
-    /// there, not with a downcast.
+    /// there, not with a downcast. An attempt error without a record reaches
+    /// the predicate unchanged.
     ///
     /// # Examples
     ///

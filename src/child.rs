@@ -941,7 +941,7 @@ async fn replay_success<O, S: Serdes<O>>(
 /// path yielded after persisting that record, so replay reproduces the
 /// recorded failure's classification (issue #43). Every other record is
 /// a closure failure and reconstructs `ChildFailed`.
-fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+pub(crate) fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
     let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
         ChildContextErrorKind::Internal
     } else {

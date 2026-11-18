@@ -25,9 +25,11 @@ use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
 use durable::lambda_types::EventType;
+use durable::serdes::{Serdes, SerdesContext};
 use durable::test_util::{LocalRunner, TestOperationDetails};
 use durable::{
     ChildContextErrorKind, DurableContext, OperationErrorKind, OperationStatus, RetryDecision,
+    TypedError,
 };
 
 /// A failing first attempt re-runs BOTH steps of the block on the second
@@ -1189,4 +1191,250 @@ async fn wrapped_mismatched_wait_records_no_block_failure() {
             EventType::ExecutionFailed,
         ]
     );
+}
+
+/// The mode of the block in `attempt_one_views`.
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    Default,
+    Virtual,
+}
+
+/// What the strategy saw of attempt 1's error in one invocation: its
+/// `{:#}` text, the wire fields of its source, and the type of each error
+/// in its source chain.
+#[derive(Clone, Debug, PartialEq)]
+struct AttemptView {
+    text: String,
+    wire: Option<(Option<String>, Option<String>, Option<String>)>,
+    chain: Vec<&'static str>,
+}
+
+/// The type of each error in the source chain of `err`, outermost first.
+fn source_chain(err: &durable::StepError) -> Vec<&'static str> {
+    let mut chain = Vec::new();
+    let mut source = std::error::Error::source(err);
+    while let Some(s) = source {
+        chain.push(if s.is::<durable::OperationError>() {
+            "OperationError"
+        } else if s.is::<durable::ChildContextError>() {
+            "ChildContextError"
+        } else if s.is::<durable::ReplayedFailure>() {
+            "ReplayedFailure"
+        } else if s.is::<TypedError>() {
+            "TypedError"
+        } else {
+            "other"
+        });
+        source = s.source();
+    }
+    chain
+}
+
+/// Runs a block whose attempt 1 fails, with a `TypedError` that carries
+/// error data or, with `propagate`, by propagating a failed inner step,
+/// and whose attempt 2 returns 7. The strategy records what it sees of
+/// every error it receives for attempt 1 and retries after 1 s. Returns
+/// the views and the output.
+async fn attempt_one_views(propagate: bool, mode: Mode) -> (Vec<AttemptView>, Option<u32>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_h = Arc::clone(&seen);
+    let result = LocalRunner::new()
+        .run(
+            move |_: serde_json::Value, ctx: DurableContext| {
+                let seen = Arc::clone(&seen_h);
+                async move {
+                    let block = ctx
+                        .with_retry(move |child, attempt| async move {
+                            if attempt >= 2 {
+                                return Ok(7_u32);
+                            }
+                            if propagate {
+                                child
+                                    .step(|_| async {
+                                        Err::<u32, durable::BoxError>("inner boom".into())
+                                    })
+                                    .name("inner")
+                                    .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                                    .await?;
+                            }
+                            Err(TypedError::with_type("PaymentError", "declined")
+                                .with_error_data(r#"{"code":42}"#)
+                                .into())
+                        })
+                        .name("block")
+                        .retry_strategy(move |err, attempt| {
+                            if attempt > 1 {
+                                return RetryDecision::Stop;
+                            }
+                            let wire = std::error::Error::source(err)
+                                .and_then(|s| s.downcast_ref::<durable::OperationError>())
+                                .and_then(durable::OperationError::wire)
+                                .map(|w| {
+                                    (
+                                        w.error_type().map(str::to_owned),
+                                        w.error_message().map(str::to_owned),
+                                        w.error_data().map(str::to_owned),
+                                    )
+                                });
+                            seen.lock().expect("lock").push(AttemptView {
+                                text: format!("{err:#}"),
+                                wire,
+                                chain: source_chain(err),
+                            });
+                            RetryDecision::retry(Duration::from_secs(1))
+                        });
+                    let block = match mode {
+                        Mode::Default => block,
+                        Mode::Virtual => block.virtual_context(),
+                    };
+                    Ok::<_, durable::BoxError>(block.await?)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    let views = seen.lock().expect("lock").clone();
+    (views, result.output().copied())
+}
+
+/// The strategy receives the same error for a failed attempt in every
+/// invocation that asks about it, in every mode of the block: the
+/// attempt's failure rebuilt from its record, whose source chain holds no
+/// error the body returned.
+#[tokio::test]
+async fn strategy_sees_recorded_failure_in_every_invocation() {
+    for mode in [Mode::Default, Mode::Virtual] {
+        for (propagate, text) in [(false, "declined"), (true, "inner boom")] {
+            let expected =
+                format!("execution failed: operation error: child_context: child failed: {text}");
+            let (views, output) = attempt_one_views(propagate, mode).await;
+            let texts: Vec<&str> = views.iter().map(|v| v.text.as_str()).collect();
+            assert!(texts.len() >= 2, "{mode:?}: {texts:?}");
+            assert!(texts.iter().all(|t| *t == expected), "{mode:?}: {texts:?}");
+            assert!(views.iter().all(|v| *v == views[0]), "{mode:?}: {views:?}");
+            assert_eq!(
+                views[0].chain,
+                ["OperationError", "ChildContextError", "ReplayedFailure"],
+                "{mode:?}"
+            );
+            let wire = views[0].wire.clone().expect("the attempt's record");
+            assert_eq!(wire.1.as_deref(), Some(text), "{mode:?}");
+            if !propagate {
+                assert_eq!(wire.0.as_deref(), Some("PaymentError"), "{mode:?}");
+                assert_eq!(wire.2.as_deref(), Some(r#"{"code":42}"#), "{mode:?}");
+            }
+            assert_eq!(output, Some(7), "{mode:?}");
+        }
+    }
+}
+
+/// A serdes whose `deserialize` always fails.
+struct FailDecode;
+
+impl Serdes<u32> for FailDecode {
+    fn serialize(
+        &self,
+        value: u32,
+        _context: SerdesContext,
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(Ok(value.to_string()))
+    }
+
+    fn deserialize(
+        &self,
+        _wire: String,
+        _context: SerdesContext,
+    ) -> impl Future<Output = Result<u32, durable::BoxError>> + Send {
+        std::future::ready(Err("cannot decode".into()))
+    }
+}
+
+/// A succeeded attempt whose result does not decode reaches the strategy
+/// as an internal error with the decode failure's text, and the stopped
+/// block fails with that same error as the source of its own.
+#[tokio::test]
+async fn strategy_sees_attempt_decode_failure() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let returned = Arc::new(Mutex::new(Vec::new()));
+    let (seen_h, returned_h) = (Arc::clone(&seen), Arc::clone(&returned));
+    let result = LocalRunner::new()
+        .run(
+            move |_: serde_json::Value, ctx: DurableContext| {
+                let seen = Arc::clone(&seen_h);
+                let returned = Arc::clone(&returned_h);
+                async move {
+                    let outcome = ctx
+                        .with_retry(|_child, _attempt| async { Ok(1_u32) })
+                        .name("block")
+                        .serdes(FailDecode)
+                        .retry_strategy(move |err, _attempt| {
+                            seen.lock().expect("lock").push(format!("{err:#}"));
+                            RetryDecision::Stop
+                        })
+                        .await;
+                    if let Err(err) = &outcome {
+                        returned.lock().expect("lock").push(format!("{err:#}"));
+                    }
+                    Ok::<_, durable::BoxError>(outcome?)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_failure(), "{result}");
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        [
+            "execution failed: operation error: child_context: internal error: deserialize result: cannot decode"
+        ]
+    );
+    assert_eq!(
+        *returned.lock().expect("lock"),
+        [
+            "operation error: child_context: child failed: operation error: child_context: internal error: deserialize result: cannot decode"
+        ]
+    );
+}
+
+/// When the strategy stops in the invocation where the attempt failed,
+/// the block's error keeps the error the body returned in its source
+/// chain.
+#[tokio::test]
+async fn stopped_block_keeps_the_body_error() {
+    let typed = Arc::new(Mutex::new(None));
+    let typed_h = Arc::clone(&typed);
+    let result = LocalRunner::new()
+        .run(
+            move |_: serde_json::Value, ctx: DurableContext| {
+                let typed = Arc::clone(&typed_h);
+                async move {
+                    let err = ctx
+                        .with_retry(|_child, _attempt| async {
+                            Err::<u32, durable::BoxError>(
+                                TypedError::with_type("PaymentError", "declined").into(),
+                            )
+                        })
+                        .name("block")
+                        .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                        .await
+                        .expect_err("the strategy stops");
+                    let mut source = std::error::Error::source(&err);
+                    let mut found = false;
+                    while let Some(s) = source {
+                        found |= s.is::<TypedError>();
+                        source = s.source();
+                    }
+                    *typed.lock().expect("lock") = Some(found);
+                    Err::<u32, durable::BoxError>(Box::new(err))
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_failure(), "{result}");
+    assert_eq!(*typed.lock().expect("lock"), Some(true));
 }

@@ -257,10 +257,10 @@ impl ReplayedFailure {
 impl fmt::Display for ReplayedFailure {
     /// Writes the recorded message as this frame.
     ///
-    /// The recorded `error_type` is deliberately NOT folded into the
-    /// text: it is data, answered by [`error_type()`](Self::error_type),
-    /// so a failure observed live and the same failure observed on replay
-    /// render identically.
+    /// A recorded `error_type` is not prefixed to a recorded message: the
+    /// type is data, answered by [`error_type()`](Self::error_type). When no
+    /// message was recorded, the frame is the recorded type, and without
+    /// either it is `unknown error`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.wire.error_message(), self.wire.error_type()) {
             (Some(m), _) => write!(f, "{m}"),

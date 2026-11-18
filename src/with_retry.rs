@@ -168,10 +168,15 @@ where
 
         // Present the failure to the strategy in the same shape a step's
         // strategy sees: the attempt's error is the step error's source.
-        // Live and replayed failures carry the same recorded failure (the
-        // replay path reads the recorded error), so a strategy that
-        // inspects the error decides identically across invocations.
-        let step_err = StepError::execution_failed(err);
+        // The strategy judges an attempt's failure as a replay of the
+        // attempt rebuilds it from its record, so it decides the same in
+        // every invocation. An error without a record, such as the decode
+        // failure of a succeeded attempt's result, reaches it unchanged.
+        let (judged, kept) = match err.wire().zip(err.operation_id()) {
+            Some((wire, id)) => (crate::child::replay_failure(wire.clone(), id), Some(err)),
+            None => (err, None),
+        };
+        let step_err = StepError::execution_failed(judged);
         match strategy(&step_err, attempt) {
             RetryDecision::Retry { delay } => {
                 // Durable wait between attempts: checkpointed, and the
@@ -190,7 +195,10 @@ where
                 wait.await.map_err(LoopFailure::Wait)?;
                 attempt = attempt.saturating_add(1);
             }
-            RetryDecision::Stop => return Err(LoopFailure::Exhausted(last_error(step_err))),
+            RetryDecision::Stop => {
+                let last = kept.unwrap_or_else(|| last_error(step_err));
+                return Err(LoopFailure::Exhausted(last));
+            }
         }
     }
 }

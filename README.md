@@ -909,6 +909,17 @@ backoff). `RetryStrategyConfig::linear()` retries
 with delays of 1 to 5 seconds and `RetryStrategyConfig::no_retry()` makes
 the first failure final, as the JS `linear` and `noRetry` presets do.
 
+When a failed attempt has a `FAIL` record, the strategy receives the
+attempt's failure rebuilt from that record, in the invocation where the
+attempt failed and in every later one, so it decides the same way in every
+invocation. The error's `source()` is the attempt's `OperationError`, whose
+`wire()` carries the recorded type, message, data and stack trace, and its
+source chain holds no error that the body returned. Match
+`OperationError::wire()` instead of a downcast: the type of a `TypedError`
+is the wire record's `error_type()`. An attempt error without a record,
+such as the decode failure of a succeeded attempt's result, reaches the
+strategy unchanged.
+
 The wait after failed attempt `N` is named `{name}-backoff-N` when the
 block has a non-empty name, as in the JS SDK. The waits of an unnamed block
 are unnamed.

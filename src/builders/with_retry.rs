@@ -271,6 +271,16 @@ where
     /// pure function of the error and the attempt number, because it is
     /// re-evaluated against the recorded error during replay.
     ///
+    /// When a failed attempt has a `FAIL` record, the strategy receives the
+    /// attempt's failure rebuilt from that record, in the invocation where the
+    /// attempt failed and in every later one. The error's
+    /// [`source()`](std::error::Error::source) is the attempt's
+    /// [`OperationError`], whose [`wire()`](OperationError::wire) holds the
+    /// recorded type, message, data and stack trace, and whose source chain
+    /// holds no error that the body returned. Match `wire()`, not a downcast.
+    /// An attempt error without a record, such as the decode failure of a
+    /// succeeded attempt's result, reaches the strategy unchanged.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -316,12 +326,12 @@ where
     /// [`retry_strategy`](Self::retry_strategy) remains for retry rules the config
     /// cannot express, such as a delay that depends on the error.
     ///
-    /// The strategy receives the attempt's
-    /// [`OperationError`] as the error's source, and
-    /// an attempt that replays has no live source error. So a `retry_if`
-    /// predicate here matches
-    /// [`OperationError::wire`](crate::OperationError::wire), not a
-    /// downcast.
+    /// When the failed attempt has a `FAIL` record, the strategy receives
+    /// the attempt's [`OperationError`] as the error's source, rebuilt from
+    /// that record in every invocation. So a `retry_if` predicate here
+    /// matches [`OperationError::wire`](crate::OperationError::wire), not a
+    /// downcast. An attempt error without a record reaches the strategy
+    /// unchanged.
     ///
     /// # Examples
     ///
