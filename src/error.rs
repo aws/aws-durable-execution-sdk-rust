@@ -1906,16 +1906,13 @@ pub enum NonDeterministicExecutionErrorKind {
     /// The claimed operation's identity (type, sub-type, or name) does not
     /// match the checkpointed record at the same positional slot.
     OperationMismatch(OperationMismatch),
-    /// The checkpointed record carries a status this SDK version does not
-    /// recognize, so replay cannot interpret the recorded outcome.
+    /// The operation's checkpoint record carries a status the SDK does not
+    /// recognize, so the recorded outcome cannot be interpreted.
     ///
-    /// This arises when the durable execution service introduces a new
-    /// operation status that predates this SDK build. Guessing is unsafe in
-    /// both directions, treating a possibly-terminal operation as
-    /// re-runnable re-executes completed work, and fabricating a terminal
-    /// outcome returns a result that was never recorded, so the execution
-    /// fails naming the raw status. Upgrading the SDK to a version that
-    /// understands the status is the remedy.
+    /// Guessing is unsafe in both directions: treating a possibly-terminal
+    /// operation as re-runnable can repeat completed work, and fabricating a
+    /// terminal outcome can return a result the service never recorded. The
+    /// execution fails and names the raw status.
     UnrecognizedStatus(UnrecognizedStatus),
 }
 
@@ -2013,9 +2010,8 @@ impl fmt::Display for UnrecognizedStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "operation at wire id {} replayed with unrecognized status {:?}: \
-             this SDK version cannot interpret the recorded outcome; \
-             upgrade the SDK to a version that understands this status",
+            "operation at wire id {} has unrecognized status {:?}: \
+             the SDK cannot interpret the recorded outcome",
             self.wire_id, self.status
         )
     }

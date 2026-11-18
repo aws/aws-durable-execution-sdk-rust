@@ -178,6 +178,14 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** JavaScript defect and Decision (2026-10-31): return `Wait(UnexpectedStatus)`.
 - **Where:** `src/wait.rs`, `recorded_outcome`, called from `WaitExecution::execute_after_start`.
 
+### Record with an unknown status
+
+- **JavaScript:** Compares a record's status with the statuses it knows, and takes the path of an unfinished operation for any other. On replay, a step with such a record runs its body again, and a callback waits for another status change. A waiting callback that a checkpoint response gives such a status rejects its result with a `CallbackExternalError`, which the handler can catch.
+- **Rust:** Fails the execution with `NonDeterministicExecutionError`, naming the raw status, when it replays such a record and when a checkpoint response gives one to an operation that waits in the invocation. Catching the operation's error does not stop the failure.
+- **Why:** A status the SDK does not know can be a terminal status the service added. Running the operation again repeats completed work, waiting can last forever, and returning a failure reports an outcome the service never recorded.
+- **Decision:** JavaScript defect: fail the execution naming the raw status. Python also rejects such a status when it reads the record.
+- **Where:** `src/context.rs`, `DurableContext::checkpoint_view_validated` and `DurableContext::unrecognized_status_error`; `src/wait.rs` and `src/invoke.rs`, `recorded_outcome`; `src/callback.rs`, `callback_outcome` and `WfcbAfter::settle`.
+
 ### `wait_for_condition` replay check
 
 - **JavaScript:** Skips the replay identity check that every other operation makes.

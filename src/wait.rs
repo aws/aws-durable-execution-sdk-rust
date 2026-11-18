@@ -198,10 +198,9 @@ fn recorded_outcome(
     match status {
         CheckpointStatus::Succeeded => Ok(()),
         CheckpointStatus::Unknown(raw) => {
-            // Unreachable in production: `checkpoint_view_validated`
-            // already failed the execution (issue #45). Kept as a typed arm
-            // so a future bypass fails loudly instead of being demoted to a
-            // catchable unexpected-status error.
+            // A checkpoint response gave the waiting record a status this
+            // SDK does not know, and `resume` reads it here. Replay of such a
+            // record already failed in `checkpoint_view_validated`.
             Err(ctx.unrecognized_status_error(wire_id, raw))
         }
         CheckpointStatus::Started

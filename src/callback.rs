@@ -417,8 +417,16 @@ where
                 view.status.wire_str(),
             )))
         }
-        _ => {
-            // Unexpected status: treat as internal error.
+        CheckpointStatus::Unknown(ref raw) => {
+            // A status this SDK does not know fails the execution, as replay
+            // of the record does in `checkpoint_view_validated`.
+            // Only a pending callback's result reads such a record here: a
+            // checkpoint response gave it the status after the callback was
+            // created.
+            Err(ctx.unrecognized_status_error(&wire_id, raw))
+        }
+        CheckpointStatus::Started | CheckpointStatus::Pending | CheckpointStatus::Ready => {
+            // A status a callback cannot settle with.
             Err(callback_internal_error(&format!(
                 "unexpected checkpointed status: {:?}",
                 view.status
@@ -954,6 +962,21 @@ impl WfcbAfter {
                     crate::plugin::operation_ended(plugins, &info);
                 }
                 Ok(raw)
+            }
+            Err((err, _))
+                if matches!(
+                    err.kind(),
+                    OperationErrorKind::NonDeterministicExecution(error)
+                        if matches!(
+                            error.kind(),
+                            crate::error::NonDeterministicExecutionErrorKind::UnrecognizedStatus(_)
+                        )
+                ) =>
+            {
+                // `callback_outcome` already recorded this error as fatal. An
+                // outer FAIL would be refused and leave this future pending, so
+                // return the error without writing an outer record.
+                Err(err)
             }
             Err((err, wire)) => {
                 // Failure: checkpoint ContextFailed with the wire the
@@ -4934,6 +4957,110 @@ mod coordinator_tests {
             )
             .build()
             .expect("all required fields set")
+    }
+
+    /// The record of the callback `start` in `PAUSED`, a status this SDK
+    /// does not know.
+    fn paused(start: &OperationUpdate) -> Operation {
+        operation_like(start, OperationStatus::from("PAUSED"))
+            .callback_details(CallbackDetails::builder().callback_id("cb-1").build())
+            .build()
+            .expect("all required fields set")
+    }
+
+    /// Asserts that `outcome` failed the execution with an unrecognized
+    /// `PAUSED` status.
+    fn assert_unrecognized_paused(outcome: &InvocationOutcome) {
+        let InvocationOutcome::Failed { error } = outcome else {
+            unreachable!("expected a failed execution, got {outcome:?}");
+        };
+        assert_eq!(error.error_type(), Some("NonDeterministicExecutionError"));
+        assert!(
+            error.error_message().is_some_and(|m| {
+                m.ends_with(
+                    "has unrecognized status \"PAUSED\": \
+                     the SDK cannot interpret the recorded outcome",
+                )
+            }),
+            "{error:?}"
+        );
+    }
+
+    /// A callback that a checkpoint response moves to a status this SDK
+    /// does not know fails the execution when its result reads the record,
+    /// as replay of that record does, even when the handler catches the
+    /// error.
+    #[tokio::test(start_paused = true)]
+    async fn pending_unrecognized_status_fails_execution() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The record changes while `result()` waits.
+        let client = Arc::new(client_completing(paused));
+        let (outcome, _) = join_callback_with_step(&client).await;
+        assert_unrecognized_paused(&outcome);
+
+        // The record changes while `spawn_result()` waits.
+        let client = Arc::new(client_completing(paused));
+        let outcome = drive_handler(scripted_ctx(&client), None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let (result, step) = tokio::join!(
+                cb.spawn_result(),
+                ctx.step(|_| async { Ok(2_u32) }).name("s").future()
+            );
+            step.map_err(wire_err)?;
+            Ok(format!("caught: {}", result.is_err()))
+        })
+        .await
+        .expect("no panic");
+        assert_unrecognized_paused(&outcome);
+
+        // The record changed before `result()` started waiting.
+        let client = Arc::new(client_completing(paused));
+        let outcome = drive_handler(scripted_ctx(&client), None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            ctx.step(|_| async { Ok(2_u32) })
+                .name("s")
+                .await
+                .map_err(wire_err)?;
+            Ok(format!("caught: {}", cb.result().await.is_err()))
+        })
+        .await
+        .expect("no panic");
+        assert_unrecognized_paused(&outcome);
+
+        // Inside `wait_for_callback`, the error returns and no outer FAIL is
+        // written.
+        let client = Arc::new(submitter_completing(paused));
+        let returned = Arc::new(AtomicBool::new(false));
+        let returned_h = Arc::clone(&returned);
+        let outcome = drive_handler(scripted_ctx(&client), None, move |ctx| async move {
+            let caught = ctx
+                .wait_for_callback::<String>(|_step, _callback_id| async { Ok(()) })
+                .name("w")
+                .await;
+            returned_h.store(true, Ordering::SeqCst);
+            Ok(format!("caught: {}", caught.is_err()))
+        })
+        .await
+        .expect("no panic");
+        assert!(
+            returned.load(Ordering::SeqCst),
+            "wait_for_callback returned its unrecognized-status error"
+        );
+        assert_unrecognized_paused(&outcome);
+        let written = client.updates();
+        assert!(
+            written.iter().all(|u| u.action() != &OperationAction::Fail),
+            "no FAIL record is written from an unrecognized status: {written:?}"
+        );
     }
 
     /// A callback that becomes `TIMED_OUT` while `result()` or
