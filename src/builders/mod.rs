@@ -385,7 +385,7 @@ pub struct RetryStrategyConfig {
     /// are retried.
     retry_if: Option<RetryPredicate>,
     /// When set, a retry after a failed attempt that is a multiple of this
-    /// value pauses the execution (experimental).
+    /// value pauses the execution.
     pause_every: Option<u32>,
 }
 
@@ -570,7 +570,7 @@ impl RetryStrategyConfig {
     }
 
     /// Returns the [`pause_every`](RetryStrategyConfigBuilder::pause_every)
-    /// value, if one is set. Experimental.
+    /// value, if one is set.
     pub fn pause_every(&self) -> Option<u32> {
         self.pause_every
     }
@@ -793,8 +793,6 @@ impl RetryStrategyConfigBuilder {
     }
 
     /// Pauses the durable execution on every `n`-th failed attempt.
-    /// Experimental: this option may change or be removed in a future
-    /// release.
     ///
     /// When the strategy retries after a failed attempt `a` and `a % n` is
     /// 0, its decision has [`pause`](crate::RetryDecision::Retry::pause)

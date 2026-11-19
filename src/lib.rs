@@ -370,8 +370,7 @@ pub enum RetryDecision {
         /// Duration to wait before retrying.
         delay: Duration,
         /// Whether to pause the durable execution after this failed
-        /// attempt. Experimental: this field may change or be removed in a
-        /// future release. Set it with [`RetryDecision::with_pause`].
+        /// attempt. Set it with [`RetryDecision::with_pause`].
         /// [`RetryDecision::retry`] sets it to `false`.
         ///
         /// When it is `true`, the step saves its `RETRY` as usual. Then the
@@ -412,8 +411,7 @@ impl RetryDecision {
 
     /// This decision with the [`pause`](Self::Retry::pause) field of a
     /// [`Retry`](Self::Retry) set to `pause`. A [`Stop`](Self::Stop) is
-    /// returned unchanged. Experimental: this method may change or be
-    /// removed in a future release.
+    /// returned unchanged.
     ///
     /// # Examples
     ///
