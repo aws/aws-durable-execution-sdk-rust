@@ -137,3 +137,56 @@ async fn pause_lets_other_branches_run_to_their_next_checkpoint() {
     assert_eq!(result.status(), ExecutionStatus::Succeeded);
     assert_eq!(result.output(), Some(&vec![1, 3]));
 }
+
+/// A durable child that pauses after attempt 1 stays suspended. The local
+/// runner does not run attempt 2, and the parent's invoke stays pending,
+/// as on Lambda, where a paused child is not invoked until a resume.
+#[tokio::test]
+async fn paused_durable_child_stays_suspended() {
+    let runs = Arc::new(AtomicU32::new(0));
+    let child_runs = Arc::clone(&runs);
+    let result = LocalRunner::new()
+        .register_durable_function("child", move |(): (), ctx: DurableContext| {
+            let runs = Arc::clone(&child_runs);
+            async move {
+                let value = ctx
+                    .step(move |_| {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                                return Err::<u32, BoxError>("down".into());
+                            }
+                            Ok(2)
+                        }
+                    })
+                    .name("call-partner")
+                    .retry_strategy(|_err, attempt| {
+                        RetryDecision::retry(Duration::from_secs(1)).with_pause(attempt == 1)
+                    })
+                    .await?;
+                Ok::<_, BoxError>(value)
+            }
+        })
+        .run(
+            |(): (), ctx: DurableContext| async move {
+                let value = ctx.invoke::<u32>("child", ()).name("child").await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "attempt 2 waits for a resume"
+    );
+    assert_eq!(result.status(), ExecutionStatus::Running);
+    let message = result
+        .error_message()
+        .expect("a suspended run has a message");
+    assert!(
+        message.ends_with("; chained invokes still pending for: \"child\""),
+        "{message}"
+    );
+}

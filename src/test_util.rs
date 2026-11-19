@@ -2367,6 +2367,11 @@ impl LocalRunner {
     ///   handler's wire error: its type, message, error data and stack
     ///   trace. One that suspends, for example on a callback no reply
     ///   answers, leaves the invoke `Started`.
+    /// - A step of the nested execution can pause it (see
+    ///   [`RetryDecision::with_pause`](crate::RetryDecision::with_pause)).
+    ///   The nested execution then ends suspended, and its next attempt
+    ///   does not run. [`RunHandle::resume`] resumes only the caller's
+    ///   run, so the invoke stays `Started`.
     /// - When the caller's run then ends suspended, because nothing can
     ///   advance, and at least one chained invoke is still `Started`, the
     ///   result's [`error_message`](TestResult::error_message) ends with
@@ -4389,6 +4394,15 @@ struct Backend {
     /// Set when a request was answered without a token, and taken by the
     /// runner after the invocation answered `PENDING`.
     withdrew: std::sync::atomic::AtomicBool,
+    /// Set when a backend with its own records accepted a pause. Such a
+    /// backend has no `resume`, so its run ends suspended at the next
+    /// decision between invocations. A top-level run keeps its pause in
+    /// the run state instead.
+    paused: std::sync::atomic::AtomicBool,
+    /// Set by an accepted pause of a backend with its own records, and
+    /// taken by the next checkpoint request, which is answered without a
+    /// token.
+    pause_tokenless: std::sync::atomic::AtomicBool,
     /// Per-call checkpoint plan (in-crate test seam): while non-empty,
     /// each `checkpoint` call pops and obeys the front entry instead of
     /// the counter-based injection (see
@@ -4446,6 +4460,8 @@ impl Backend {
             registered_functions: BTreeSet::new(),
             withdraw_at: None,
             withdrew: std::sync::atomic::AtomicBool::new(false),
+            paused: std::sync::atomic::AtomicBool::new(false),
+            pause_tokenless: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             checkpoint_plan: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -5468,11 +5484,14 @@ impl Backend {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .saturating_add(1);
         let answer = self.checkpoint_counted(updates, records);
-        if self.withdraw_at != Some(number) {
+        let paused = self
+            .pause_tokenless
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if self.withdraw_at != Some(number) && !paused {
             return answer;
         }
-        // `LocalRunner::withdraw_checkpoints_after`: the request is applied,
-        // and its answer carries no token.
+        // `LocalRunner::withdraw_checkpoints_after` or an accepted pause:
+        // the request is applied, and its answer carries no token.
         Box::pin(async move {
             let output = answer.await?;
             self.withdrew
@@ -5540,6 +5559,11 @@ impl Backend {
     /// nested run has no run state and no hold rule, so it never waits.
     async fn between_step(&self, start: &mut bool, invokes_tried: bool) -> BetweenStep {
         let Some(live) = self.live() else {
+            // A paused nested run has no `resume`, so nothing starts its
+            // next invocation.
+            if self.paused.load(std::sync::atomic::Ordering::SeqCst) {
+                return BetweenStep::Stuck;
+            }
             return progress_decision(*start, invokes_tried, || self.advance());
         };
         loop {
@@ -5818,15 +5842,21 @@ impl ExecutionClient for Backend {
     /// Pauses the run as [`RunHandle::pause`] does, without waiting for
     /// the calling invocation to end: the next checkpoint of the
     /// invocation is answered without a token, and the next invocation
-    /// waits for [`RunHandle::resume`]. A nested durable target, which no
-    /// run control observes, cannot pause.
+    /// waits for [`RunHandle::resume`]. A nested durable target has no
+    /// `resume`: its next checkpoint is also answered without a token, and
+    /// its run ends suspended, so the caller's invoke stays `Started`.
     fn pause_execution(
         &self,
         _execution_arn: &str,
         _client_token: &str,
         _reason: &str,
     ) -> Option<crate::client::PauseFuture<'_>> {
-        let live = self.live()?;
+        let Some(live) = self.live() else {
+            self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.pause_tokenless
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Some(Box::pin(async { Ok(()) }));
+        };
         {
             let mut state = live.lock();
             state.local.paused = true;

@@ -250,6 +250,22 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Rust language and Decision (2026-10-26): call a fresh clone of the closure for each attempt.
 - **Where:** `src/step.rs`, `StepExecution::run`.
 
+### `pause_every` and the backoff
+
+- **JavaScript:** `pauseEvery` is an option of the exponential retry helper only.
+- **Rust:** `RetryStrategyConfig::pause_every` works with exponential and linear backoff.
+- **Why:** Both backoffs use the same `RetryStrategyConfig`, and the pause does not depend on the delay.
+- **Decision:** Decision (2026-11-19): keep `pause_every` for both backoffs.
+- **Where:** `src/builders/mod.rs`, `RetryStrategyConfigBuilder::pause_every`; `src/step.rs`, `RetryStrategyConfig::decide`.
+
+### Checkpoints after a pause
+
+- **JavaScript:** Stops accepting checkpoints in the invocation as soon as a pause request succeeds.
+- **Rust:** Lets another running branch save the invocation's next checkpoint after a pause request succeeds. The service answers that checkpoint without a token, and the invocation then ends. Go behaves like JavaScript, and Python behaves like Rust.
+- **Why:** The paused step runs no further attempt in the invocation. The other branch's work up to its next checkpoint is saved, so it does not run again after the resume.
+- **Decision:** Decision (2026-11-19): keep accepting the next checkpoint after a pause.
+- **Where:** `src/step.rs`, `handle_failure` and `request_pause`.
+
 ### Custom subtype
 
 - **JavaScript:** Any string; an empty string selects the default, and the service rejects an invalid one.
