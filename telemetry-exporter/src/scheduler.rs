@@ -22,31 +22,17 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// replaces a pending older one, and the older one is never exported.
 #[derive(Debug, Default)]
 pub(crate) struct Slot {
-    state: Mutex<SlotState>,
-}
-
-#[derive(Debug, Default)]
-struct SlotState {
-    pending: Option<TelemetryRecord>,
-    revision: u64,
+    pending: Mutex<Option<TelemetryRecord>>,
 }
 
 impl Slot {
     /// Replaces the pending record.
     pub(crate) fn schedule(&self, record: TelemetryRecord) {
-        let mut state = lock(&self.state);
-        state.pending = Some(record);
-        state.revision = state.revision.wrapping_add(1);
+        *lock(&self.pending) = Some(record);
     }
 
     fn take(&self) -> Option<TelemetryRecord> {
-        lock(&self.state).pending.take()
-    }
-
-    /// The number of records scheduled so far, and whether one is pending.
-    fn status(&self) -> (u64, bool) {
-        let state = lock(&self.state);
-        (state.revision, state.pending.is_some())
+        lock(&self.pending).take()
     }
 }
 
@@ -108,9 +94,13 @@ async fn settle_all<'a>(
         }
     })
     .await;
+    #[expect(
+        clippy::expect_used,
+        reason = "poll_fn returns Ready only after every future settled, and each settled future stored its result"
+    )]
     results
         .into_iter()
-        .map(|result| result.unwrap_or(Ok(())))
+        .map(|result| result.expect("every future settled"))
         .collect()
 }
 
@@ -168,21 +158,14 @@ impl Scheduler {
         }
     }
 
-    /// Exports the slot's pending record and flushes, until no record was
-    /// scheduled during the round.
+    /// Exports the slot's pending record, then flushes every exporter.
     ///
-    /// A record scheduled while a flush runs may miss that flush. So the
-    /// loop runs another round when the revision changed.
+    /// The SDK delivers every operation change, and waits for its work,
+    /// before `on_invocation_end`. So no record is scheduled on the slot
+    /// while this runs, and one round exports the last record.
     pub(crate) async fn drain(&self, slot: &Slot) {
-        loop {
-            let (before, _) = slot.status();
-            self.export_pending(slot).await;
-            self.flush().await;
-            let (after, pending) = slot.status();
-            if after == before && !pending {
-                return;
-            }
-        }
+        self.export_pending(slot).await;
+        self.flush().await;
     }
 
     /// A `'static` future that exports the slot's pending record.
