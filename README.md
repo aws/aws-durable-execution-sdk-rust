@@ -650,6 +650,9 @@ let value = ctx
 - Only a body that failed in the current invocation pauses, including the
   submitter of `wait_for_callback`. An interrupted `AtMostOncePerRetry`
   attempt retries without a pause. A `with_retry` block ignores `pause`.
+- After the service accepts the pause, the step runs no further attempt in
+  the invocation, even when other work keeps the invocation running past the
+  retry delay.
 - Steps in other `map` or `parallel` branches keep running. Once the pause
   takes effect, Lambda saves the next checkpoint of the invocation and
   answers it without a checkpoint token. The SDK then sends no further

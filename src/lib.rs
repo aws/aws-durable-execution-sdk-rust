@@ -376,6 +376,8 @@ pub enum RetryDecision {
         /// When it is `true`, the step saves its `RETRY` as usual. Then the
         /// SDK calls the Lambda `PauseDurableExecution` API, and the
         /// invocation ends with `PENDING` once no other SDK work runs. The
+        /// step runs no further attempt in this invocation, even when other
+        /// work keeps the invocation running past the retry delay. The
         /// next attempt runs after an operator resumes the execution with
         /// the Lambda `ResumeDurableExecution` API.
         ///
