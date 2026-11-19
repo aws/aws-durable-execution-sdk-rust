@@ -104,13 +104,8 @@ impl DurableExecutionTelemetry {
 impl DurableExecutionTelemetryBuilder {
     /// Adds an exporter. Without any, the plugin uses the
     /// [`LambdaLogExporter`].
-    pub fn exporter(self, exporter: impl TelemetryExporter) -> Self {
-        self.shared_exporter(Arc::new(exporter))
-    }
-
-    /// Adds an exporter that the caller keeps a handle to.
-    pub fn shared_exporter(mut self, exporter: Arc<dyn TelemetryExporter>) -> Self {
-        self.exporters.push(exporter);
+    pub fn exporter(mut self, exporter: impl TelemetryExporter) -> Self {
+        self.exporters.push(Arc::new(exporter));
         self
     }
 
@@ -428,7 +423,7 @@ mod tests {
     fn the_builder_applies_every_setting() {
         let builder = DurableExecutionTelemetry::builder()
             .exporter(LambdaLogExporter::new())
-            .shared_exporter(Arc::new(LambdaLogExporter::new()))
+            .exporter(LambdaLogExporter::new())
             .emit_mode(EmitMode::OnFailure)
             .sampling_rate(2.0)
             .operation_detail(OperationDetail::FullTree)

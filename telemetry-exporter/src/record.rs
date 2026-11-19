@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: &str = "1.0";
 /// The longest error `name` or `message` a record carries, in Unicode
 /// code points. A longer value keeps this many code points followed by
 /// `…`. The JavaScript, Python and Java exporters cut at the same point.
-pub const MAX_TEXT_LENGTH: usize = 8192;
+const MAX_TEXT_LENGTH: usize = 8192;
 
 /// The execution status a record reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -49,7 +49,7 @@ impl ExecutionStatus {
     }
 
     /// Whether the status is terminal: `Succeeded` or `Failed`.
-    pub fn is_terminal(self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed)
     }
 }
@@ -58,11 +58,11 @@ impl ExecutionStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct ErrorRecord {
-    /// The error type, or `Error` when the error has none. At most
-    /// [`MAX_TEXT_LENGTH`] code points plus `…`.
+    /// The error type, or `Error` when the error has none. At most 8,192
+    /// code points plus `…`.
     pub name: String,
     /// The error message, or the empty string when the error has none. At
-    /// most [`MAX_TEXT_LENGTH`] code points plus `…`.
+    /// most 8,192 code points plus `…`.
     pub message: String,
 }
 

@@ -59,8 +59,7 @@ pub use exporter::{ExportFuture, TelemetryExporter};
 pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
-    ErrorRecord, ExecutionStatus, MAX_TEXT_LENGTH, OperationRecord, RECORD_TYPE, SCHEMA_VERSION,
-    TelemetryRecord,
+    ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
 };
 pub use render::{
     OperationSummary, OperationsByName, OperationsFormat, build_operations_by_name, render_json,
