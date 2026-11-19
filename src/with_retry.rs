@@ -178,7 +178,8 @@ where
         };
         let step_err = StepError::execution_failed(judged);
         match strategy(&step_err, attempt) {
-            RetryDecision::Retry { delay } => {
+            // A `with_retry` block is not a step, so it ignores `pause`.
+            RetryDecision::Retry { delay, .. } => {
                 // Durable wait between attempts: checkpointed, and the
                 // backend owns the timer. `ctx.wait` rounds the delay up
                 // to whole seconds with a one-second minimum. JS names

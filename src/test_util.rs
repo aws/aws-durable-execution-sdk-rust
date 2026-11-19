@@ -804,12 +804,15 @@ impl std::fmt::Display for ExecutionStatus {
 }
 
 impl ExecutionStatus {
-    /// Converts the service's status. A status this enum does not list
+    /// Converts the service's status. A pausing or paused execution has
+    /// not ended, so it maps to `Running`. A status this enum does not list
     /// ended the execution in a way the runner cannot name, so it maps to
     /// `Failed`.
     fn from_wire(status: &WireExecutionStatus) -> Self {
         match status {
-            WireExecutionStatus::Running => Self::Running,
+            WireExecutionStatus::Running
+            | WireExecutionStatus::Pausing
+            | WireExecutionStatus::Paused => Self::Running,
             WireExecutionStatus::Succeeded => Self::Succeeded,
             WireExecutionStatus::TimedOut => Self::TimedOut,
             WireExecutionStatus::Stopped => Self::Stopped,
@@ -3633,7 +3636,7 @@ impl CloudRunner {
                     let out = with_read_retries(|| api.send_get_durable_execution(&execution_arn))
                         .await
                         .map_err(aws_error)?;
-                    if !matches!(out.status(), WireExecutionStatus::Running) {
+                    if ExecutionStatus::from_wire(out.status()) != ExecutionStatus::Running {
                         break out;
                     }
                     continue;
@@ -5810,6 +5813,31 @@ impl ExecutionClient for Backend {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let operations = self.build_pruned_operations();
         Box::pin(async move { Ok(GetStateOutput::new(operations, None)) })
+    }
+
+    /// Pauses the run as [`RunHandle::pause`] does, without waiting for
+    /// the calling invocation to end: the next checkpoint of the
+    /// invocation is answered without a token, and the next invocation
+    /// waits for [`RunHandle::resume`]. A nested durable target, which no
+    /// run control observes, cannot pause.
+    fn pause_execution(
+        &self,
+        _execution_arn: &str,
+        _client_token: &str,
+        _reason: &str,
+    ) -> Option<crate::client::PauseFuture<'_>> {
+        let live = self.live()?;
+        {
+            let mut state = live.lock();
+            state.local.paused = true;
+            if let LocalPhase::Invoking {
+                tokenless_requested,
+            } = &mut state.local.phase
+            {
+                *tokenless_requested = true;
+            }
+        }
+        Some(Box::pin(async { Ok(()) }))
     }
 }
 
@@ -9275,6 +9303,21 @@ mod tests {
                 ExecutionStatus::Stopped,
                 "Stopped",
             ),
+            (
+                WireExecutionStatus::Pausing,
+                ExecutionStatus::Running,
+                "Running",
+            ),
+            (
+                WireExecutionStatus::Paused,
+                ExecutionStatus::Running,
+                "Running",
+            ),
+            (
+                WireExecutionStatus::Deleting,
+                ExecutionStatus::Failed,
+                "Failed",
+            ),
         ];
         for (wire, status, text) in rows {
             assert_eq!(ExecutionStatus::from_wire(&wire), status, "{wire:?}");
@@ -9284,10 +9327,13 @@ mod tests {
             event_family_op_type(Some(&EventType::ChainedInvokeSucceeded)),
             Some(RunnerKind::ChainedInvoke)
         );
-        assert_eq!(
-            event_family_op_type(Some(&EventType::ExecutionStarted)),
-            None
-        );
+        for execution_event in [
+            EventType::ExecutionStarted,
+            EventType::ExecutionPaused,
+            EventType::ExecutionResumed,
+        ] {
+            assert_eq!(event_family_op_type(Some(&execution_event)), None);
+        }
         assert_eq!(event_family_op_type(None), None);
     }
 
@@ -14890,6 +14936,27 @@ mod tests {
                 (4450, m1)
             ]
         );
+    }
+
+    /// A pausing or paused execution has not ended, so the runner keeps
+    /// polling it.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_keeps_polling_a_paused_execution() {
+        let api = Arc::new(
+            FakeApi::new()
+                .with_execution(Ok(execution_output(WireExecutionStatus::Pausing, None)))
+                .with_execution(Ok(execution_output(WireExecutionStatus::Paused, None)))
+                .with_execution(Ok(execution_output(
+                    WireExecutionStatus::Succeeded,
+                    Some("5"),
+                ))),
+        );
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(Arc::clone(&api), Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(api.execution_call_count(), 3);
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
     }
 
     /// A status poll that retries counts once against the poll budget.

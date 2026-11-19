@@ -369,17 +369,95 @@ pub enum RetryDecision {
     Retry {
         /// Duration to wait before retrying.
         delay: Duration,
+        /// Whether to pause the durable execution after this failed
+        /// attempt. Experimental: this field may change or be removed in a
+        /// future release. Set it with [`RetryDecision::with_pause`].
+        /// [`RetryDecision::retry`] sets it to `false`.
+        ///
+        /// When it is `true`, the step saves its `RETRY` as usual. Then the
+        /// SDK calls the Lambda `PauseDurableExecution` API, and the
+        /// invocation ends with `PENDING` once no other SDK work runs. The
+        /// next attempt runs after an operator resumes the execution with
+        /// the Lambda `ResumeDurableExecution` API.
+        ///
+        /// - Only a step whose body failed in the current invocation
+        ///   pauses. This includes the submitter step of
+        ///   `wait_for_callback`. An interrupted
+        ///   [`AtMostOncePerRetry`](StepSemantics::AtMostOncePerRetry)
+        ///   attempt retries without a pause. A `with_retry` block ignores
+        ///   this field.
+        /// - The pause does not change how many attempts run.
+        /// - The execution role needs `lambda:PauseDurableExecution` on its
+        ///   own durable executions, and `kms:Decrypt` on the key when the
+        ///   function uses a customer managed AWS KMS key. When the pause
+        ///   call fails, the SDK logs a warning with the error and the step
+        ///   retries as usual. A transport without pause support also
+        ///   retries as usual (see [`ExecutionClient::pause_execution`]).
+        pause: bool,
     },
-    /// Do not retry; propagate the error.
+    /// Do not retry; propagate the error. A step that stops never pauses.
     Stop,
 }
 
 impl RetryDecision {
     /// A [`Retry`](Self::Retry) decision that waits `delay` before the next
-    /// attempt.
+    /// attempt, and does not pause.
     #[must_use]
     pub fn retry(delay: Duration) -> Self {
-        Self::Retry { delay }
+        Self::Retry {
+            delay,
+            pause: false,
+        }
+    }
+
+    /// This decision with the [`pause`](Self::Retry::pause) field of a
+    /// [`Retry`](Self::Retry) set to `pause`. A [`Stop`](Self::Stop) is
+    /// returned unchanged. Experimental: this method may change or be
+    /// removed in a future release.
+    ///
+    /// # Examples
+    ///
+    /// A strategy that pauses the execution after the fifth failed attempt
+    /// when the error is a `PartnerUnavailable`:
+    ///
+    /// ```
+    /// use std::error::Error as _;
+    /// use std::time::Duration;
+    ///
+    /// use aws_durable_execution_sdk::{RetryDecision, StepError};
+    ///
+    /// #[derive(Debug)]
+    /// struct PartnerUnavailable;
+    ///
+    /// impl std::fmt::Display for PartnerUnavailable {
+    ///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    ///         f.write_str("partner unavailable")
+    ///     }
+    /// }
+    ///
+    /// impl std::error::Error for PartnerUnavailable {}
+    ///
+    /// fn retry_and_pause(err: &StepError, attempt: u32) -> RetryDecision {
+    ///     if attempt >= 20 {
+    ///         return RetryDecision::Stop;
+    ///     }
+    ///     let partner_down = err
+    ///         .source()
+    ///         .and_then(|e| e.downcast_ref::<PartnerUnavailable>())
+    ///         .is_some();
+    ///     RetryDecision::retry(Duration::from_secs(60)).with_pause(attempt == 5 && partner_down)
+    /// }
+    ///
+    /// let err = StepError::execution_failed(PartnerUnavailable);
+    /// assert!(matches!(retry_and_pause(&err, 5), RetryDecision::Retry { pause: true, .. }));
+    /// assert!(matches!(retry_and_pause(&err, 6), RetryDecision::Retry { pause: false, .. }));
+    /// ```
+    #[must_use]
+    pub fn with_pause(self, pause: bool) -> Self {
+        match self {
+            Self::Retry { delay, .. } => Self::Retry { delay, pause },
+            Self::Stop => Self::Stop,
+        }
     }
 }
 
@@ -2103,8 +2181,25 @@ mod tests {
     fn retry_decision_constructor_builds_retry() {
         assert!(matches!(
             RetryDecision::retry(Duration::from_secs(3)),
-            RetryDecision::Retry { delay } if delay == Duration::from_secs(3)
+            RetryDecision::Retry { delay, pause: false } if delay == Duration::from_secs(3)
         ));
+    }
+
+    /// `with_pause` sets the pause of a `Retry` and leaves `Stop` unchanged.
+    #[test]
+    fn retry_decision_with_pause_sets_pause_of_retry_only() {
+        let delay = Duration::from_secs(3);
+        assert_eq!(
+            RetryDecision::retry(delay).with_pause(true),
+            RetryDecision::Retry { delay, pause: true }
+        );
+        assert_eq!(
+            RetryDecision::retry(delay)
+                .with_pause(true)
+                .with_pause(false),
+            RetryDecision::retry(delay)
+        );
+        assert_eq!(RetryDecision::Stop.with_pause(true), RetryDecision::Stop);
     }
 
     #[test]
