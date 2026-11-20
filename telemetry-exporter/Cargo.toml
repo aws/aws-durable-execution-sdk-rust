@@ -1,0 +1,57 @@
+[workspace]
+# The telemetry exporter is its OWN cargo workspace, like conformance/ and
+# examples/. The root workspace's direct-dependency allowlist
+# (scripts/check-direct-deps.sh) covers every root member. Exporters that
+# need an AWS service client depend on crates that are not on that list. A
+# separate workspace keeps the SDK's dependency graph unchanged.
+members = ["."]
+resolver = "2"
+
+[package]
+name = "aws-durable-execution-sdk-telemetry-exporter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "Apache-2.0"
+description = "Durable Execution Telemetry plugin for the AWS Lambda Durable Functions Rust SDK"
+repository = "https://github.com/aws/aws-durable-execution-sdk-rust"
+readme = "README.md"
+keywords = ["aws", "lambda", "durable-execution", "telemetry"]
+publish = false
+
+[lib]
+name = "aws_durable_execution_sdk_telemetry_exporter"
+
+# The same lint policy as the SDK's root workspace.
+[workspace.lints.clippy]
+all = "deny"
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+multiple_crate_versions = { level = "allow", priority = 1 }
+cargo_common_metadata = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "deny"
+unused_qualifications = "warn"
+unsafe_code = "forbid"
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-durable-execution-sdk = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.44", features = ["rt", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+aws-durable-execution-sdk = { path = "..", features = ["test-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
