@@ -361,7 +361,8 @@ pub trait ExecutionClient: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>;
 
     /// Asks the service to pause the execution, or returns `None` when this
-    /// transport cannot pause.
+    /// transport cannot pause. Experimental: this method may change or be
+    /// removed in a future release.
     ///
     /// A step calls it after it saved a `RETRY` whose decision has
     /// [`pause`](crate::RetryDecision::Retry::pause) set. The call sends
