@@ -113,13 +113,23 @@ pub fn truncate_record(
     let order = oldest_first(&record.operations);
     let mut dropped_any = false;
 
+    // `fits()` serializes the whole record. An operation without a result
+    // leaves the record unchanged, so a size check before it would repeat
+    // the previous answer. So the loop measures the record only before an
+    // operation that has a result to drop.
     for &index in &order {
+        let has_result = candidate
+            .record
+            .operations
+            .get(index)
+            .is_some_and(|op| op.result.is_some());
+        if !has_result {
+            continue;
+        }
         if candidate.fits() {
             break;
         }
-        if let Some(op) = candidate.record.operations.get_mut(index)
-            && op.result.is_some()
-        {
+        if let Some(op) = candidate.record.operations.get_mut(index) {
             op.result = None;
             op.truncated = true;
             dropped_any = true;
@@ -227,6 +237,35 @@ mod tests {
         assert_eq!(
             new.map(|o| (o.result.is_some(), o.truncated)),
             Some((true, false))
+        );
+        assert_eq!(out.dropped_operations, 0);
+        assert!(size(&out, OperationsFormat::Array) <= limit);
+    }
+
+    #[test]
+    fn result_dropping_stops_at_the_first_fit_among_operations_without_results() {
+        let big = "x".repeat(200);
+        let r = record(vec![
+            timed("new", Some(40), Some(&big)),
+            timed("plain-late", Some(30), None),
+            timed("old", Some(20), Some(&big)),
+            timed("plain-early", Some(10), None),
+        ]);
+        let limit = size(&r, OperationsFormat::Array) - 100;
+        let out = truncate_record(&r, Some(limit), OperationsFormat::Array);
+        let state: Vec<_> = out
+            .operations
+            .iter()
+            .map(|o| (o.name.as_deref(), o.result.is_some(), o.truncated))
+            .collect();
+        assert_eq!(
+            state,
+            [
+                (Some("new"), true, false),
+                (Some("plain-late"), false, false),
+                (Some("old"), false, true),
+                (Some("plain-early"), false, false),
+            ]
         );
         assert_eq!(out.dropped_operations, 0);
         assert!(size(&out, OperationsFormat::Array) <= limit);
