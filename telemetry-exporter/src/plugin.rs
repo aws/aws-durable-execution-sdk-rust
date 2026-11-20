@@ -238,6 +238,8 @@ struct TelemetryInvocation {
     execution_arn: String,
     arn: ParsedArn,
     start_ms: i64,
+    /// The parsed execution input. `None` when the input setting is
+    /// `Omit`: no record then carries the input, so it is not parsed.
     input: Option<Value>,
     /// The `emittedAt` of the last record, in epoch milliseconds.
     last_emitted_ms: Mutex<Option<i64>>,
@@ -245,13 +247,17 @@ struct TelemetryInvocation {
 
 impl TelemetryInvocation {
     fn new(env: Arc<Environment>, info: &InvocationInfo) -> Self {
+        let input = match env.input {
+            ContentSetting::Omit => None,
+            _ => Some(parse_payload(info.execution_input())),
+        };
         Self {
             env,
             slot: Arc::new(Slot::default()),
             execution_arn: info.execution_arn().to_owned(),
             arn: ParsedArn::parse(info.execution_arn()),
             start_ms: execution_start_ms(info),
-            input: Some(parse_payload(info.execution_input())),
+            input,
             last_emitted_ms: Mutex::new(None),
         }
     }
