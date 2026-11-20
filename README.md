@@ -474,9 +474,9 @@ invocation.
 together with `lambda_client` or `sdk_config`. To decorate the default
 transport, for example to add metrics, build it with
 `LambdaExecutionClient::new` and wrap it in your own `ExecutionClient`.
-The trait's `pause_execution` method has a default that
+The trait's experimental `pause_execution` method has a default that
 returns `None`, so a wrapper forwards it to the inner transport to keep
-[pausing from a retry decision](#pause-after-repeated-failures).
+[pausing from a retry decision](#pause-after-repeated-failures-experimental).
 
 ```rust ignore
 let client = durable::LambdaClient::new(&sdk_config);
@@ -594,7 +594,7 @@ retry strategy, so a non-idempotent body never runs twice for the same
 attempt. The strategy sees `StepErrorKind::Interrupted`, and the recorded
 failure carries the error type `StepInterruptedError`.
 
-#### Pause after repeated failures
+#### Pause after repeated failures (experimental)
 
 A retry decision can pause the durable execution. When the retry strategy
 returns a `Retry` whose `pause` field is `true`, the step saves its `RETRY`
@@ -662,6 +662,8 @@ let value = ctx
   the step retries as usual. A missing permission is one possible cause.
 - A custom `ExecutionClient` pauses only when it implements
   `pause_execution`. Without it, the step retries as usual.
+- This feature is experimental. It may change or be removed in a future
+  release.
 
 A step records the error its body returns. An unwrapped error records the
 type `Error`, because Rust erases the concrete type when the error is
