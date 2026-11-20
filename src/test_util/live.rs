@@ -1085,7 +1085,8 @@ impl<O> RunHandle<O> {
     /// Resumes a paused [`LocalRunner`] run, as JS `resumeExecution`. The
     /// invocation the pause held starts the next time the test awaits a
     /// runner future. Calling `resume` on a run that is not paused changes
-    /// nothing.
+    /// nothing. It resumes only this run's own execution, never a paused
+    /// [durable target](LocalRunner::register_durable_function).
     ///
     /// # Errors
     ///
