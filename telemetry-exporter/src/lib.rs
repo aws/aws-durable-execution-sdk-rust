@@ -32,8 +32,9 @@
 //! ```
 //!
 //! Without an exporter, the plugin writes each record to standard output
-//! with the [`LambdaLogExporter`]. Implement [`TelemetryExporter`] for any
-//! other destination.
+//! with the [`LambdaLogExporter`]. [`CloudWatchLogsExporter`] writes to a
+//! log group of your choice. Implement [`TelemetryExporter`] for any other
+//! destination.
 
 // Compiles the README's Rust examples as doctests, so a README example that
 // stops compiling fails `cargo test`.
@@ -56,7 +57,10 @@ pub use config::{
     ContentConfig, ContentSetting, EmitMode, OperationDetail, OperationOverride, Transform,
 };
 pub use exporter::{ExportFuture, TelemetryExporter};
-pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
+pub use exporters::{
+    CloudWatchLogsExporter, CloudWatchLogsExporterBuilder, DEFAULT_MAX_RECORD_SIZE_BYTES,
+    LambdaLogExporter,
+};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
     ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
