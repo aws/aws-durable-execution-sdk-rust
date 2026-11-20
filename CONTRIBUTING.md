@@ -39,7 +39,9 @@ build on stable, but a dedicated `msrv` job in `ci.yml` runs `cargo check
 --all-targets --all-features` on the declared minimum with warnings denied,
 so reaching for a feature newer than 1.94.1 — or tripping a warning only the
 older compiler emits — fails that leg rather than silently raising the
-true minimum above the declared one. `make check` runs the same check
+true minimum above the declared one. The job runs the same check on the
+`telemetry-exporter/` workspace, which the root check does not compile.
+`make check` runs the same checks
 locally through `scripts/check-msrv.sh`, which reads the version from the
 root `Cargo.toml` and asks you to `rustup toolchain install` the minimum if
 it is missing, so the local gate sees what CI's `msrv` job sees. Bumping the minimum supported Rust
@@ -96,7 +98,7 @@ targets after a failure:
 | `cargo deny --all-features check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source, in the graph with every feature enabled |
 | `cargo deny --manifest-path telemetry-exporter/Cargo.toml --config deny.toml --all-features check` | the same license, advisory and source violations in the telemetry exporter's separate graph, which the root run does not read |
 | `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in either the default-feature or the all-features graph |
-| `sh scripts/check-msrv.sh` | code that does not compile warning-free on the declared minimum supported Rust version |
+| `sh scripts/check-msrv.sh` | code in the SDK or in `telemetry-exporter/` that does not compile warning-free on the declared minimum supported Rust version |
 
 Two of those are stricter than their defaults. Clippy normally reports warnings
 and exits zero; `-D warnings` turns every one into an error, so a `pedantic`

@@ -9,6 +9,11 @@
 # job goes red (and the reverse). This script runs the same check locally
 # so `make check` sees what CI sees.
 #
+# The script checks two cargo workspaces: the root workspace and
+# telemetry-exporter/. The telemetry exporter is its own workspace, so the
+# root check does not compile it. It declares the same rust-version. So
+# the script checks it separately, against its own Cargo.lock.
+#
 # The version is not hard-coded here: it is read from the root
 # Cargo.toml's rust-version, the same source of truth that
 # scripts/check-msrv-consistency.sh enforces, so an MSRV bump propagates
@@ -52,3 +57,7 @@ fi
 echo "msrv-check: RUSTFLAGS=\"-D warnings\" cargo +$MSRV check --all-targets --all-features"
 RUSTFLAGS="-D warnings" cargo "+$MSRV" check --all-targets --all-features || exit 1
 echo "msrv-check OK: the SDK compiles warning-free on Rust $MSRV."
+
+echo "msrv-check: RUSTFLAGS=\"-D warnings\" cargo +$MSRV check --manifest-path telemetry-exporter/Cargo.toml --all-targets --all-features --locked"
+RUSTFLAGS="-D warnings" cargo "+$MSRV" check --manifest-path telemetry-exporter/Cargo.toml --all-targets --all-features --locked || exit 1
+echo "msrv-check OK: the telemetry exporter compiles warning-free on Rust $MSRV."
