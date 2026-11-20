@@ -16,10 +16,11 @@ CI_TARGETS = pins check-sdk msrv dependencies external-types feature-powerset wo
 # the formatting, builds Cargo's default members and lints every workspace
 # member. CI's matrix passes one, for example
 # `make workspaces WORKSPACES=conformance`.
-WORKSPACES ?= conformance examples
+WORKSPACES ?= conformance examples telemetry-exporter
 WORKSPACE_TARGETS = $(addprefix workspace-,$(WORKSPACES))
 
 .PHONY: check ci $(CI_TARGETS) $(WORKSPACE_TARGETS) summary-order-consumer-test \
+	telemetry-exporter-test \
 	test-role conformance conformance-build conformance-run cloud-tests
 
 # The quality gate for every change: the check-sdk, dependencies and msrv
@@ -56,9 +57,15 @@ msrv:
 	. scripts/tools.sh && require cargo msrv-toolchain
 	sh scripts/check-msrv.sh
 
+# The telemetry exporter is its own workspace with its own Cargo.lock, so
+# the root cargo deny run does not read its graph. The second deny line
+# checks that graph against the same deny.toml. check-direct-deps.sh stays
+# root-only: the exporter is a separate workspace because its direct
+# dependencies are outside the SDK allowlist.
 dependencies:
 	. scripts/tools.sh && require cargo cargo-deny
 	cargo deny --all-features check
+	cargo deny --manifest-path telemetry-exporter/Cargo.toml --config deny.toml --all-features check
 	sh scripts/check-direct-deps.sh
 
 # CI's workflow-wide RUSTFLAGS='-D warnings' belongs to the stable lint
@@ -87,6 +94,15 @@ $(WORKSPACE_TARGETS): workspace-%:
 workspace-examples: summary-order-consumer-test
 summary-order-consumer-test:
 	cd examples && cargo test --locked -p parallel_heterogeneous
+
+# The telemetry exporter is a separate workspace because exporters that
+# need an AWS service client depend on crates that the SDK's dependency
+# allowlist does not include. So its tests and doc build run here, not in
+# check-sdk.
+workspace-telemetry-exporter: telemetry-exporter-test
+telemetry-exporter-test:
+	cd telemetry-exporter && cargo test --locked
+	cd telemetry-exporter && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --locked
 
 # Targets that deploy to AWS. They need TEST_ACCOUNT_ID.
 test-role:
