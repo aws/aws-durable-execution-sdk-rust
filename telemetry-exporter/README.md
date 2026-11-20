@@ -58,6 +58,9 @@ export and every flush holds one lock that the plugin factory owns. So an
 exporter never receives two calls at once. An exporter error is logged as a
 warning. It never fails the execution.
 
+To unit test an exporter, build a record with `TelemetryRecord::new` and
+`OperationRecord::new`, then assign the fields the test needs.
+
 ## Configuration
 
 | Builder method | Default | Effect |
