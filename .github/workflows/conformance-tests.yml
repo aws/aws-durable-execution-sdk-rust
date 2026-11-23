@@ -64,7 +64,7 @@ jobs:
     outputs:
       suites: ${{ steps.discover.outputs.suites }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Discover suites from templates
         id: discover
@@ -82,7 +82,7 @@ jobs:
     # reports it, rather than CodeBuild stopping the runner.
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/ensure-rustup
 
@@ -92,12 +92,12 @@ jobs:
           rustup default stable
           rustup show active-toolchain
 
-      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: conformance
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
 
@@ -123,7 +123,7 @@ jobs:
         run: tar -czf handlers.tar.gz publish
 
       - name: Upload handlers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: conformance-handlers
           path: conformance/handlers.tar.gz
@@ -152,10 +152,10 @@ jobs:
       TEST_ACCOUNT_ID: ${{ secrets.TEST_ACCOUNT_ID }}
       EXECUTION_ROLE_ARN: ${{ secrets.TEST_LAMBDA_EXECUTION_ROLE_ARN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download handlers
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: conformance-handlers
           path: conformance
@@ -175,19 +175,19 @@ jobs:
           echo "Unpacked $count executable handler bootstraps."
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: "${{ secrets.TEST_ROLE_ARN }}"
           role-session-name: rustConformanceTest
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup SAM CLI
-        uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+        uses: aws-actions/setup-sam@341eee193f458fa5aae5d52c94b0c5cf3a1c5a52 # v3
 
       # Checks the account, installs the runner from main and
       # ./conformance/conformance_ext into a virtualenv under target/, runs
@@ -202,7 +202,7 @@ jobs:
 
       - name: Upload conformance report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: conformance-report-${{ matrix.suite }}
           path: |
@@ -230,10 +230,10 @@ jobs:
       RUN_ID: ${{ github.run_id }}
       TEST_ACCOUNT_ID: ${{ secrets.TEST_ACCOUNT_ID }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: "${{ secrets.TEST_ROLE_ARN }}"
           role-session-name: rustConformanceTestTeardown

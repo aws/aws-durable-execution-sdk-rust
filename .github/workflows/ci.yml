@@ -39,7 +39,7 @@ jobs:
     # reports it, rather than CodeBuild stopping the runner.
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/ensure-rustup
 
@@ -49,7 +49,7 @@ jobs:
           rustup default stable
           rustup show active-toolchain
 
-      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Format, clippy, tests, docs, MSRV declaration consistency
         run: make check-sdk
@@ -64,7 +64,7 @@ jobs:
     runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/ensure-rustup
 
@@ -74,7 +74,7 @@ jobs:
           rustup default 1.94.1
           rustup show active-toolchain
 
-      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check on MSRV
         run: make msrv
@@ -87,14 +87,14 @@ jobs:
     runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
-      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-deny@0.20.2
 
@@ -116,7 +116,7 @@ jobs:
     runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/ensure-rustup
 
@@ -126,13 +126,13 @@ jobs:
           rustup default nightly-2026-03-20
           rustup show active-toolchain
 
-      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # No prebuilt distribution exists for this tool, so cache the compiled
       # binary; the key ties it to the tool version and the pinned nightly.
       - name: Cache cargo-check-external-types
         id: cache-cet
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-check-external-types
           key: cargo-check-external-types-0.5.0-nightly-2026-03-20
@@ -154,16 +154,16 @@ jobs:
     runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
-      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-hack@0.6.45
 
@@ -185,14 +185,14 @@ jobs:
       matrix:
         workspace: [conformance, examples]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # These workspaces' dependency graphs fill the default runner disk
       # (the examples build has died linking with "no space left"); reclaim
       # the space taken by preinstalled toolchains we never use. Only the
       # GitHub-hosted image is short on disk; the CodeBuild image has a
       # large volume and a different package set.
-      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      - uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         if: runner.environment == 'github-hosted'
         with:
           tool-cache: false
@@ -202,7 +202,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
 
-      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ${{ matrix.workspace }}
 
