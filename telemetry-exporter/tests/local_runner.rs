@@ -189,6 +189,28 @@ async fn a_failed_execution_carries_the_error_and_no_output() {
 }
 
 #[tokio::test]
+async fn include_errors_false_omits_the_operation_error_and_keeps_the_execution_error() {
+    let content = ContentConfig::new().include_errors(false);
+    let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder().content(content));
+    let result = runner(telemetry)
+        .run(failing_step, json!({}))
+        .await
+        .expect("runner");
+    assert!(!result.is_success());
+
+    let records = recording.records();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    let message = record["error"]["message"].as_str().expect("message");
+    assert!(message.contains("step boom"), "{message}");
+    assert_eq!(record["operations"][0]["status"], "FAILED");
+    assert!(record["operations"][0].get("error").is_none());
+    let explode = &record["operationsByName"]["explode"];
+    assert_eq!(explode["status"], "FAILED");
+    assert!(explode.get("error").is_none());
+}
+
+#[tokio::test]
 async fn on_complete_skips_the_pending_invocations() {
     let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder());
     let result = runner(telemetry)
