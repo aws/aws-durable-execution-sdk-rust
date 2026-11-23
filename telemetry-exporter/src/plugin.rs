@@ -317,45 +317,39 @@ impl Plugin for TelemetryInvocation {
         "DurableExecutionTelemetry"
     }
 
-    /// In on-change mode, schedules a `RUNNING` record and starts the
-    /// slot's pump on its own task.
+    /// In on-change mode, schedules a `RUNNING` record.
     ///
-    /// Every later hook schedules a newer record before it exports. A
-    /// record that only waited in the slot would always be replaced. So
-    /// this hook starts the export itself. The SDK awaits this hook before
-    /// the handler runs. So the hook does not wait for the export, and the
-    /// handler starts at once. A newer record that is scheduled before the
-    /// pump takes this one replaces it.
+    /// The scheduler's pump task exports the record. The SDK awaits this
+    /// hook before the handler runs. So the hook does not wait for the
+    /// export, and the handler starts at once. A newer record that is
+    /// scheduled before the pump takes this one replaces it.
     fn on_invocation_start<'a>(&'a self, info: &'a InvocationInfo) -> HookFuture<'a> {
         if self.env.emit_mode == EmitMode::OnChange {
-            self.slot.schedule(self.running_record(info.operations()));
-            self.env.scheduler.spawn_pump(&self.slot);
+            self.env
+                .scheduler
+                .schedule(&self.slot, self.running_record(info.operations()));
         }
         Box::pin(std::future::ready(Ok(())))
     }
 
-    /// In on-change mode, schedules a `RUNNING` record. Returns the slot's
-    /// pump as the work, or no work when the slot already has a pump.
+    /// In on-change mode, schedules a `RUNNING` record. Returns no work.
     ///
     /// The SDK runs each returned work on its own task and keeps the task
-    /// until the invocation ends. The pump that already runs exports the
-    /// scheduled record. So a change that arrives during an export adds no
-    /// task.
+    /// until the invocation ends. The scheduler has one pump task for every
+    /// invocation, and that pump exports the scheduled record. So a change
+    /// adds no task. The end hook waits for the export.
     fn on_operation_change(&self, info: &OperationChangeInfo) -> HookWork {
-        if self.env.emit_mode != EmitMode::OnChange {
-            return Ok(None);
+        if self.env.emit_mode == EmitMode::OnChange {
+            self.env
+                .scheduler
+                .schedule(&self.slot, self.running_record(info.operations()));
         }
-        self.slot.schedule(self.running_record(info.operations()));
-        Ok(self.env.scheduler.pump(&self.slot).map(|pump| {
-            Box::pin(async move {
-                pump.await;
-                Ok(())
-            }) as HookFuture<'static>
-        }))
+        Ok(None)
     }
 
     /// Schedules the invocation's final record when the emit mode asks for
-    /// it, then waits until every pending record is exported and flushed.
+    /// it. Then waits until the pump has exported this invocation's record,
+    /// and then until the pump has flushed every exporter.
     ///
     /// | Emit mode | Emits on |
     /// | --- | --- |
@@ -377,10 +371,11 @@ impl Plugin for TelemetryInvocation {
                 info.execution_result().map(parse_payload),
                 info.execution_error().map(ErrorRecord::from_wire),
             );
-            self.slot.schedule(record);
+            self.env.scheduler.schedule(&self.slot, record);
         }
         Box::pin(async move {
             self.env.scheduler.drain(&self.slot).await;
+            self.env.scheduler.flush().await;
             Ok(())
         })
     }

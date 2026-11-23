@@ -6,6 +6,7 @@
 
 #![expect(clippy::expect_used, clippy::indexing_slicing)] // reason: test assertions
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,6 +46,32 @@ struct Failing;
 impl TelemetryExporter for Failing {
     fn export<'a>(&'a self, _record: &'a TelemetryRecord) -> ExportFuture<'a> {
         Box::pin(std::future::ready(Err("export failed".into())))
+    }
+}
+
+/// Takes one millisecond per export. Keeps each record's status and the
+/// largest number of live tokio tasks that an export observed.
+#[derive(Clone, Default)]
+struct Slow {
+    statuses: Arc<Mutex<Vec<Value>>>,
+    peak_tasks: Arc<AtomicUsize>,
+}
+
+impl TelemetryExporter for Slow {
+    fn export<'a>(&'a self, record: &'a TelemetryRecord) -> ExportFuture<'a> {
+        Box::pin(async move {
+            let alive = tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks();
+            self.peak_tasks.fetch_max(alive, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let value = render_value(record, OperationsFormat::ByName).expect("render");
+            self.statuses
+                .lock()
+                .expect("lock")
+                .push(value["status"].clone());
+            Ok(())
+        })
     }
 }
 
@@ -280,11 +307,46 @@ async fn on_change_emits_a_running_record_for_an_operation_change() {
 }
 
 #[tokio::test]
+async fn on_change_with_a_slow_exporter_keeps_the_task_count_bounded() {
+    const STEPS: usize = 500;
+    let slow = Slow::default();
+    let telemetry = DurableExecutionTelemetry::builder()
+        .emit_mode(EmitMode::OnChange)
+        .exporter(slow.clone())
+        .build();
+    let many_steps = |_event: Value, ctx: DurableContext| async move {
+        for n in 0..STEPS {
+            ctx.step(move |_| async move { Ok(n) })
+                .name("count")
+                .await?;
+        }
+        Ok::<_, BoxError>(Value::Null)
+    };
+    runner(telemetry)
+        .run(many_steps, json!({}))
+        .await
+        .expect("runner");
+
+    // Each step changes its operation at least once, and each export takes
+    // longer than a step. One pump task exports for the whole scheduler.
+    // So the number of live tasks does not grow with the number of steps.
+    // The observed peak is 3 tasks. The limit of 10 leaves room for tasks
+    // that the runner may add.
+    let peak = slow.peak_tasks.load(Ordering::Relaxed);
+    assert!(peak <= 10, "{peak} live tasks");
+
+    let statuses = slow.statuses.lock().expect("lock").clone();
+    let (last, earlier) = statuses.split_last().expect("records");
+    assert_eq!(last, "SUCCEEDED");
+    assert!(earlier.iter().all(|status| status == "RUNNING"));
+}
+
+#[tokio::test]
 async fn on_change_emits_a_running_record_when_the_invocation_starts() {
     let (telemetry, recording) =
         recorded(DurableExecutionTelemetry::builder().emit_mode(EmitMode::OnChange));
-    // The export of the invocation-start record runs on its own task. The
-    // handler yields before its first operation, so that task runs first.
+    // The scheduler's pump task exports the invocation-start record. The
+    // handler yields before its first operation, so the pump runs first.
     let yields_then_steps = |event: Value, ctx: DurableContext| async move {
         tokio::task::yield_now().await;
         one_step(event, ctx).await
