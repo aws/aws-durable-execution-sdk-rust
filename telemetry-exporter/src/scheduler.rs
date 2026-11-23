@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::Poll;
 
 use crate::exporter::{ExportFuture, TelemetryExporter};
@@ -20,19 +20,65 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 ///
 /// A record is a complete snapshot of the execution. So a newer record
 /// replaces a pending older one, and the older one is never exported.
+///
+/// A pump is a future that exports the slot's pending records until the
+/// slot is empty. A slot has at most one pump at a time. So the number of
+/// export tasks of an invocation does not grow with the number of records
+/// it schedules.
 #[derive(Debug, Default)]
 pub(crate) struct Slot {
-    pending: Mutex<Option<TelemetryRecord>>,
+    state: Mutex<SlotState>,
 }
+
+#[derive(Debug, Default)]
+struct SlotState {
+    pending: Option<TelemetryRecord>,
+    /// The token of the slot's pump. It is dead when the slot has no pump.
+    pump: Weak<()>,
+}
+
+/// The pump of a slot holds this token. Dropping the token ends the
+/// slot's claim. So a pump that is dropped before it finishes, or that
+/// panics, does not keep the slot claimed.
+type PumpToken = Arc<()>;
 
 impl Slot {
     /// Replaces the pending record.
     pub(crate) fn schedule(&self, record: TelemetryRecord) {
-        *lock(&self.pending) = Some(record);
+        lock(&self.state).pending = Some(record);
     }
 
     fn take(&self) -> Option<TelemetryRecord> {
-        lock(&self.pending).take()
+        lock(&self.state).pending.take()
+    }
+
+    /// Returns a token when the slot has no pump, and `None` when it has
+    /// one.
+    fn claim_pump(&self) -> Option<PumpToken> {
+        let mut state = lock(&self.state);
+        if state.pump.strong_count() > 0 {
+            return None;
+        }
+        let token = PumpToken::default();
+        state.pump = Arc::downgrade(&token);
+        Some(token)
+    }
+
+    /// Takes the pending record for the slot's pump. Without a pending
+    /// record, it ends the pump's claim and returns `None`.
+    ///
+    /// The check and the end of the claim hold one lock. A record that is
+    /// scheduled later then finds the slot unclaimed, and its caller
+    /// starts a new pump. If the claim ended only when the pump dropped
+    /// its token, a record scheduled between the check and the drop would
+    /// find the slot claimed, and no pump would export it.
+    fn take_for_pump(&self) -> Option<TelemetryRecord> {
+        let mut state = lock(&self.state);
+        let record = state.pending.take();
+        if record.is_none() {
+            state.pump = Weak::new();
+        }
+        record
     }
 }
 
@@ -116,15 +162,19 @@ impl Scheduler {
     /// turn comes. Another task may have exported it in the meantime.
     pub(crate) async fn export_pending(&self, slot: &Slot) {
         let _turn = self.turn.lock().await;
-        let Some(record) = slot.take() else {
-            return;
-        };
+        if let Some(record) = slot.take() {
+            self.export(&record).await;
+        }
+    }
+
+    /// Hands `record` to every exporter. The caller holds the lock.
+    async fn export(&self, record: &TelemetryRecord) {
         let records: Vec<Cow<'_, TelemetryRecord>> = self
             .exporters
             .iter()
             .map(|exporter| {
                 truncate_record(
-                    &record,
+                    record,
                     exporter.max_record_size_bytes(),
                     exporter.operations_format(),
                 )
@@ -168,28 +218,44 @@ impl Scheduler {
         self.flush().await;
     }
 
-    /// A `'static` future that exports the slot's pending record.
-    pub(crate) fn export_pending_owned(
+    /// The pump of `slot`: a `'static` future that exports the slot's
+    /// pending record, then every record that is scheduled before the slot
+    /// is empty. Returns `None` when the slot already has a pump, which
+    /// then exports the pending record.
+    ///
+    /// The pump releases the lock after each record. So other invocations
+    /// and [`Self::drain`] take their turn between two records.
+    pub(crate) fn pump(
         self: &Arc<Self>,
         slot: &Arc<Slot>,
-    ) -> impl Future<Output = ()> + Send + 'static {
-        let scheduler = Arc::clone(self);
-        let slot = Arc::clone(slot);
-        async move { scheduler.export_pending(&slot).await }
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let token = slot.claim_pump()?;
+        Some(Arc::clone(self).run_pump(Arc::clone(slot), token))
     }
 
-    /// Starts a task that exports the slot's pending record, and does not
-    /// wait for it.
+    /// Exports the slot's records until the slot is empty. The future
+    /// owns the token, so dropping the future ends the slot's claim.
+    async fn run_pump(self: Arc<Self>, slot: Arc<Slot>, _token: PumpToken) {
+        loop {
+            let _turn = self.turn.lock().await;
+            let Some(record) = slot.take_for_pump() else {
+                return;
+            };
+            self.export(&record).await;
+        }
+    }
+
+    /// Starts the slot's pump on its own task, unless the slot already has
+    /// a pump, and does not wait for it.
     ///
-    /// The task takes the same lock as every other export. So
-    /// [`Self::drain`] waits for an export that this task has started. A
-    /// task that gets the lock after the record was taken exports nothing.
+    /// The pump takes the same lock as every other export. So
+    /// [`Self::drain`] waits for an export that the pump has started.
     #[expect(
         clippy::disallowed_methods,
         reason = "the SDK's task gateway is private to the SDK crate; this task creates no durable operation, and drain waits for its export through the lock"
     )]
-    pub(crate) fn spawn_export(self: &Arc<Self>, slot: &Arc<Slot>) {
-        drop(tokio::spawn(self.export_pending_owned(slot)));
+    pub(crate) fn spawn_pump(self: &Arc<Self>, slot: &Arc<Slot>) {
+        drop(self.pump(slot).map(tokio::spawn));
     }
 }
 
@@ -251,6 +317,42 @@ mod tests {
         fn flush(&self) -> ExportFuture<'_> {
             Box::pin(async { panic!("flush panicked") })
         }
+    }
+
+    /// An exporter whose every export waits for one permit of `gate`.
+    struct Gated {
+        recorder: Recorder,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl Gated {
+        fn closed() -> Arc<Self> {
+            Arc::new(Self {
+                recorder: Recorder::default(),
+                gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+    }
+
+    impl TelemetryExporter for Gated {
+        fn export<'a>(&'a self, record: &'a TelemetryRecord) -> ExportFuture<'a> {
+            Box::pin(async move {
+                self.gate.acquire().await?.forget();
+                self.recorder.export(record).await
+            })
+        }
+
+        fn flush(&self) -> ExportFuture<'_> {
+            self.recorder.flush()
+        }
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "the test fails when the slot already has a pump"
+    )]
+    fn new_pump(scheduler: &Arc<Scheduler>, slot: &Arc<Slot>) -> impl Future<Output = ()> {
+        scheduler.pump(slot).expect("the slot has no pump")
     }
 
     fn stamped(emitted_at: &str) -> TelemetryRecord {
@@ -332,23 +434,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_owned_future_exports_the_pending_record() {
+    async fn the_pump_exports_the_pending_record() {
         let recorder = Arc::new(Recorder::default());
         let scheduler = Arc::new(Scheduler::new(vec![recorder.clone()]));
         let slot = Arc::new(Slot::default());
         slot.schedule(stamped("1"));
-        scheduler.export_pending_owned(&slot).await;
+        new_pump(&scheduler, &slot).await;
         assert_eq!(*lock(&recorder.exported), ["1"]);
         assert!(format!("{scheduler:?}").contains("exporters: 1"));
     }
 
     #[tokio::test]
-    async fn spawn_export_exports_without_being_awaited() {
+    async fn records_scheduled_during_an_export_start_no_second_pump() {
+        let gated = Gated::closed();
+        let scheduler = Arc::new(Scheduler::new(vec![gated.clone()]));
+        let slot = Arc::new(Slot::default());
+        slot.schedule(stamped("0"));
+        let pump = new_pump(&scheduler, &slot);
+        // `join!` polls the pump first. The pump takes record 0 and waits
+        // for the gate. The second future then runs to its end.
+        tokio::join!(pump, async {
+            for n in 1..=500 {
+                slot.schedule(stamped(&n.to_string()));
+                assert!(scheduler.pump(&slot).is_none(), "record {n}");
+            }
+            gated.gate.add_permits(2);
+        });
+        assert_eq!(*lock(&gated.recorder.exported), ["0", "500"]);
+    }
+
+    #[tokio::test]
+    async fn a_record_scheduled_after_the_pump_finished_starts_a_new_pump() {
         let recorder = Arc::new(Recorder::default());
         let scheduler = Arc::new(Scheduler::new(vec![recorder.clone()]));
         let slot = Arc::new(Slot::default());
         slot.schedule(stamped("1"));
-        scheduler.spawn_export(&slot);
+        new_pump(&scheduler, &slot).await;
+        slot.schedule(stamped("2"));
+        new_pump(&scheduler, &slot).await;
+        assert_eq!(*lock(&recorder.exported), ["1", "2"]);
+    }
+
+    #[test]
+    fn an_empty_slot_ends_the_claim_while_the_pump_still_holds_its_token() {
+        let slot = Slot::default();
+        let token = slot.claim_pump();
+        assert!(token.is_some());
+        assert!(slot.claim_pump().is_none());
+        assert!(slot.take_for_pump().is_none());
+        assert!(slot.claim_pump().is_some());
+        drop(token);
+    }
+
+    #[test]
+    fn a_pump_dropped_before_it_ran_does_not_keep_the_slot_claimed() {
+        let scheduler = Arc::new(Scheduler::new(Vec::new()));
+        let slot = Arc::new(Slot::default());
+        drop(new_pump(&scheduler, &slot));
+        assert!(scheduler.pump(&slot).is_some());
+    }
+
+    #[tokio::test]
+    async fn drain_exports_a_record_scheduled_while_the_pump_exports() {
+        let gated = Gated::closed();
+        let scheduler = Arc::new(Scheduler::new(vec![gated.clone()]));
+        let slot = Arc::new(Slot::default());
+        slot.schedule(stamped("1"));
+        let pump = new_pump(&scheduler, &slot);
+        tokio::join!(pump, async {
+            slot.schedule(stamped("2"));
+            gated.gate.add_permits(2);
+            scheduler.drain(&slot).await;
+        });
+        assert_eq!(*lock(&gated.recorder.exported), ["1", "2"]);
+        assert_eq!(gated.recorder.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_pump_exports_without_being_awaited() {
+        let recorder = Arc::new(Recorder::default());
+        let scheduler = Arc::new(Scheduler::new(vec![recorder.clone()]));
+        let slot = Arc::new(Slot::default());
+        slot.schedule(stamped("1"));
+        scheduler.spawn_pump(&slot);
         assert!(lock(&recorder.exported).is_empty());
         tokio::task::yield_now().await;
         assert_eq!(*lock(&recorder.exported), ["1"]);

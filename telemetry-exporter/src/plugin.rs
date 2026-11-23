@@ -317,35 +317,41 @@ impl Plugin for TelemetryInvocation {
         "DurableExecutionTelemetry"
     }
 
-    /// In on-change mode, schedules a `RUNNING` record and starts a task
-    /// that exports it.
+    /// In on-change mode, schedules a `RUNNING` record and starts the
+    /// slot's pump on its own task.
     ///
     /// Every later hook schedules a newer record before it exports. A
     /// record that only waited in the slot would always be replaced. So
     /// this hook starts the export itself. The SDK awaits this hook before
     /// the handler runs. So the hook does not wait for the export, and the
     /// handler starts at once. A newer record that is scheduled before the
-    /// task runs replaces this one.
+    /// pump takes this one replaces it.
     fn on_invocation_start<'a>(&'a self, info: &'a InvocationInfo) -> HookFuture<'a> {
         if self.env.emit_mode == EmitMode::OnChange {
             self.slot.schedule(self.running_record(info.operations()));
-            self.env.scheduler.spawn_export(&self.slot);
+            self.env.scheduler.spawn_pump(&self.slot);
         }
         Box::pin(std::future::ready(Ok(())))
     }
 
-    /// In on-change mode, schedules a `RUNNING` record and returns the work
-    /// that exports it.
+    /// In on-change mode, schedules a `RUNNING` record. Returns the slot's
+    /// pump as the work, or no work when the slot already has a pump.
+    ///
+    /// The SDK runs each returned work on its own task and keeps the task
+    /// until the invocation ends. The pump that already runs exports the
+    /// scheduled record. So a change that arrives during an export adds no
+    /// task.
     fn on_operation_change(&self, info: &OperationChangeInfo) -> HookWork {
         if self.env.emit_mode != EmitMode::OnChange {
             return Ok(None);
         }
         self.slot.schedule(self.running_record(info.operations()));
-        let work = self.env.scheduler.export_pending_owned(&self.slot);
-        Ok(Some(Box::pin(async move {
-            work.await;
-            Ok(())
-        })))
+        Ok(self.env.scheduler.pump(&self.slot).map(|pump| {
+            Box::pin(async move {
+                pump.await;
+                Ok(())
+            }) as HookFuture<'static>
+        }))
     }
 
     /// Schedules the invocation's final record when the emit mode asks for
