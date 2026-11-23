@@ -8,14 +8,15 @@ on:
   schedule:
     - cron: '0 6 * * 1'
 
-permissions:
-  actions: read
-  contents: read
-  security-events: write
+permissions: {}
 
 jobs:
   analyze:
     name: Analyze Rust
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
     # Same routing as ci.yml: pushes, the weekly schedule and
     # same-repository pull requests run on the CodeBuild-hosted runner (the
     # CodeBuild project github-actions-runner, 60-minute build limit; the
