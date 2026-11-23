@@ -1,6 +1,8 @@
 //! The JSON forms of a record: the `operations` array, the
 //! `operationsByName` index, or both.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 use serde_json::Value;
@@ -109,28 +111,39 @@ where
     I: IntoIterator<Item = &'a OperationRecord>,
 {
     let mut groups: Vec<(String, OperationSummary)> = Vec::new();
+    // Truncation builds this index once per size check. A scan of `groups`
+    // for each operation would cost the operation count times the number
+    // of distinct names. So this map gives each name's position in
+    // `groups`, and `groups` alone keeps the first-occurrence order.
+    let mut positions: HashMap<&'a str, usize> = HashMap::new();
     for op in operations {
         let Some(name) = op.name.as_deref().filter(|name| !name.is_empty()) else {
             continue;
         };
         let failed = u64::from(op.status == "FAILED");
-        match groups.iter_mut().find(|(key, _)| key == name) {
-            None => groups.push((
-                name.to_owned(),
-                OperationSummary {
-                    operation_type: op.operation_type.clone(),
-                    count: 1,
-                    failed_count: failed,
-                    status: op.status.clone(),
-                    sub_type: op.sub_type.clone(),
-                    min_duration_ms: op.duration_ms,
-                    max_duration_ms: op.duration_ms,
-                    total_duration_ms: op.duration_ms,
-                    max_attempt: op.attempt,
-                    result: op.result.clone(),
-                    error: op.error.clone(),
-                },
-            )),
+        let existing = positions
+            .get(name)
+            .and_then(|&position| groups.get_mut(position));
+        match existing {
+            None => {
+                positions.insert(name, groups.len());
+                groups.push((
+                    name.to_owned(),
+                    OperationSummary {
+                        operation_type: op.operation_type.clone(),
+                        count: 1,
+                        failed_count: failed,
+                        status: op.status.clone(),
+                        sub_type: op.sub_type.clone(),
+                        min_duration_ms: op.duration_ms,
+                        max_duration_ms: op.duration_ms,
+                        total_duration_ms: op.duration_ms,
+                        max_attempt: op.attempt,
+                        result: op.result.clone(),
+                        error: op.error.clone(),
+                    },
+                ));
+            }
             Some((_, summary)) => {
                 summary.count += 1;
                 summary.failed_count += failed;
