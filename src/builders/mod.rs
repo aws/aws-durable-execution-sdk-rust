@@ -384,6 +384,9 @@ pub struct RetryStrategyConfig {
     /// Error filter: when set, only the errors for which it returns `true`
     /// are retried.
     retry_if: Option<RetryPredicate>,
+    /// When set, a retry after a failed attempt that is a multiple of this
+    /// value pauses the execution (experimental).
+    pause_every: Option<u32>,
 }
 
 /// The error filter that [`RetryStrategyConfigBuilder::retry_if`] stores.
@@ -398,6 +401,7 @@ impl fmt::Debug for RetryStrategyConfig {
             .field("backoff", &self.backoff)
             .field("jitter", &self.jitter)
             .field("retry_if", &self.retry_if.is_some())
+            .field("pause_every", &self.pause_every)
             .finish()
     }
 }
@@ -430,6 +434,7 @@ impl RetryStrategyConfig {
             backoff: Backoff::exponential(2.0),
             jitter: JitterStrategy::Full,
             retry_if: None,
+            pause_every: None,
         }
     }
 
@@ -507,6 +512,7 @@ impl RetryStrategyConfig {
             backoff: Backoff::linear(Duration::from_secs(1)),
             jitter: JitterStrategy::None,
             retry_if: None,
+            pause_every: None,
         }
     }
 
@@ -533,6 +539,7 @@ impl RetryStrategyConfig {
             backoff: Backoff::exponential(2.0),
             jitter: JitterStrategy::Full,
             retry_if: None,
+            pause_every: None,
         }
     }
 
@@ -560,6 +567,12 @@ impl RetryStrategyConfig {
     /// Returns the jitter applied to each computed delay.
     pub fn jitter(&self) -> JitterStrategy {
         self.jitter
+    }
+
+    /// Returns the [`pause_every`](RetryStrategyConfigBuilder::pause_every)
+    /// value, if one is set. Experimental.
+    pub fn pause_every(&self) -> Option<u32> {
+        self.pause_every
     }
 
     /// Returns the error filter, if one is set (internal).
@@ -626,6 +639,7 @@ pub struct RetryStrategyConfigBuilder {
     backoff: Option<Backoff>,
     jitter: Option<JitterStrategy>,
     retry_if: Option<RetryPredicate>,
+    pause_every: Option<u32>,
 }
 
 impl fmt::Debug for RetryStrategyConfigBuilder {
@@ -637,6 +651,7 @@ impl fmt::Debug for RetryStrategyConfigBuilder {
             .field("backoff", &self.backoff)
             .field("jitter", &self.jitter)
             .field("retry_if", &self.retry_if.is_some())
+            .field("pause_every", &self.pause_every)
             .finish()
     }
 }
@@ -777,6 +792,42 @@ impl RetryStrategyConfigBuilder {
         self
     }
 
+    /// Pauses the durable execution on every `n`-th failed attempt.
+    /// Experimental: this option may change or be removed in a future
+    /// release.
+    ///
+    /// When the strategy retries after a failed attempt `a` and `a % n` is
+    /// 0, its decision has [`pause`](crate::RetryDecision::Retry::pause)
+    /// set. So `pause_every(5)` pauses after attempts 5, 10, 15 and so on.
+    /// The delay and the jitter of that attempt are the same as without
+    /// this option, and a decision that stops never pauses. See
+    /// [`RetryDecision::Retry::pause`](crate::RetryDecision::Retry::pause)
+    /// for what a pause does, the IAM permissions it needs, and when the
+    /// SDK ignores it: a [`WithRetryBuilder`] block, for example, never
+    /// pauses.
+    ///
+    /// The SDK does not validate `n`. Pass a value of 1 or more:
+    /// `pause_every(0)` never pauses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use aws_durable_execution_sdk::builders::RetryStrategyConfig;
+    ///
+    /// let config = RetryStrategyConfig::builder()
+    ///     .max_attempts(20)
+    ///     .initial_delay(Duration::from_secs(60))
+    ///     .pause_every(5)
+    ///     .build();
+    /// assert_eq!(config.pause_every(), Some(5));
+    /// ```
+    pub fn pause_every(mut self, n: u32) -> Self {
+        self.pause_every = Some(n);
+        self
+    }
+
     /// Builds the [`RetryStrategyConfig`], filling each unset field from
     /// the backoff the builder holds: the JS `createRetryStrategy` values
     /// for an unset or exponential backoff, and the JS
@@ -796,6 +847,7 @@ impl RetryStrategyConfigBuilder {
             backoff,
             jitter: self.jitter.unwrap_or(JitterStrategy::Full),
             retry_if: self.retry_if,
+            pause_every: self.pause_every,
         }
     }
 }

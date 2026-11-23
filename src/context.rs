@@ -1373,6 +1373,23 @@ impl DurableContext {
         output
     }
 
+    /// Asks the service to pause the execution through
+    /// [`ExecutionClient::pause_execution`], holding an activity permit so
+    /// the invocation does not suspend during the call. `None` when the
+    /// transport cannot pause.
+    pub(crate) async fn pause_execution(
+        &self,
+        client_token: &str,
+        reason: &str,
+    ) -> Option<Result<(), ExecutionClientError>> {
+        let call = self.inner.execution_client.as_ref()?.pause_execution(
+            &self.inner.execution_arn,
+            client_token,
+            reason,
+        )?;
+        Some(self.hold_activity(call).await)
+    }
+
     /// Resolves when the record of `wire_id` satisfies `ready`.
     ///
     /// Registers a wait on its first poll, then reads the record. A missing
