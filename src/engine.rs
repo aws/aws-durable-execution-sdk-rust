@@ -5,6 +5,7 @@
 //! public API surface.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -390,11 +391,49 @@ pub(crate) struct CheckpointLog {
     /// Records keyed by wire operation ID for fast lookup during replay.
     /// Uses interior mutability so that checkpoint responses can merge
     /// backend-assigned fields (e.g. `callback_id`) into the live log.
-    records: RwLock<HashMap<String, CheckpointRecord>>,
+    records: RwLock<Records>,
     /// Written while a checkpoint response is merged and its change set is
     /// queued (see [`Self::publish`]), and read by
     /// [`Self::published_status_view`].
     publication: RwLock<()>,
+}
+
+/// The records of a [`CheckpointLog`], each with its sequence.
+///
+/// The map has no order, and a wire ID is a hash that carries none. The
+/// service reports operations in a stable order. So each wire ID gets the
+/// next sequence when the log first stores a record of it, and keeps that
+/// sequence when a later record replaces the first.
+#[derive(Debug, Default)]
+struct Records {
+    by_wire_id: HashMap<String, SequencedRecord>,
+    /// The sequence of the last wire ID added. The first one gets 1.
+    last_sequence: u64,
+}
+
+#[derive(Debug)]
+struct SequencedRecord {
+    sequence: u64,
+    record: CheckpointRecord,
+}
+
+impl Records {
+    /// Stores `record` under `wire_id` and returns the record it replaced.
+    fn insert(&mut self, wire_id: String, record: CheckpointRecord) -> Option<CheckpointRecord> {
+        match self.by_wire_id.entry(wire_id) {
+            Entry::Occupied(mut stored) => {
+                Some(std::mem::replace(&mut stored.get_mut().record, record))
+            }
+            Entry::Vacant(vacant) => {
+                self.last_sequence += 1;
+                vacant.insert(SequencedRecord {
+                    sequence: self.last_sequence,
+                    record,
+                });
+                None
+            }
+        }
+    }
 }
 
 impl CheckpointLog {
@@ -402,7 +441,7 @@ impl CheckpointLog {
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
-            records: RwLock::new(HashMap::new()),
+            records: RwLock::new(Records::default()),
             publication: RwLock::new(()),
         }
     }
@@ -411,10 +450,15 @@ impl CheckpointLog {
     ///
     /// Records are stored keyed by their wire ID. The caller must provide
     /// the wire-ID → record mapping (the inline parser uses the `Id` field
-    /// from the backend directly as the key).
+    /// from the backend directly as the key). The sequences follow the
+    /// order of `records`.
     pub(crate) fn from_records(records: Vec<(String, CheckpointRecord)>) -> Self {
+        let mut stored = Records::default();
+        for (wire_id, record) in records {
+            stored.insert(wire_id, record);
+        }
         Self {
-            records: RwLock::new(records.into_iter().collect()),
+            records: RwLock::new(stored),
             publication: RwLock::new(()),
         }
     }
@@ -446,11 +490,25 @@ impl CheckpointLog {
         wire_id: &str,
         f: impl FnOnce(&CheckpointRecord) -> R,
     ) -> Option<R> {
+        self.with_sequenced_record(wire_id, |_sequence, record| f(record))
+    }
+
+    /// [`Self::with_record`], where `f` also gets the record's sequence:
+    /// the position of its wire ID among the wire IDs in the order the log
+    /// first stored them, from 1.
+    pub(crate) fn with_sequenced_record<R>(
+        &self,
+        wire_id: &str,
+        f: impl FnOnce(u64, &CheckpointRecord) -> R,
+    ) -> Option<R> {
         let guard = self
             .records
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get(wire_id).map(f)
+        guard
+            .by_wire_id
+            .get(wire_id)
+            .map(|stored| f(stored.sequence, &stored.record))
     }
 
     /// Returns a compact view (status, attempt, `replay_children`) of the
@@ -493,7 +551,7 @@ impl CheckpointLog {
             .records
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.contains_key(wire_id)
+        guard.by_wire_id.contains_key(wire_id)
     }
 
     /// Applies `f` to the stored record of `wire_id` under the write guard.
@@ -503,8 +561,8 @@ impl CheckpointLog {
             .records
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(record) = guard.get_mut(wire_id) {
-            f(record);
+        if let Some(stored) = guard.by_wire_id.get_mut(wire_id) {
+            f(&mut stored.record);
         }
     }
 
@@ -515,7 +573,9 @@ impl CheckpointLog {
     /// in the same invocation observe the updated state.
     ///
     /// Returns the status of the record it replaced, or `None` when the log
-    /// held no record of `wire_id`.
+    /// held no record of `wire_id`. The new record keeps the sequence of
+    /// the one it replaced. A wire ID the log did not hold gets the next
+    /// sequence.
     pub(crate) fn insert(
         &self,
         wire_id: String,
@@ -530,8 +590,9 @@ impl CheckpointLog {
             .map(|previous| previous.status)
     }
 
-    /// Applies `f` to every record under one read guard and returns the
-    /// results, in no particular order.
+    /// Applies `f` to every record and its sequence (see
+    /// [`Self::with_sequenced_record`]) under one read guard and returns
+    /// the results, in no particular order.
     ///
     /// `f` borrows each record, so no record is cloned. Plugin hooks build
     /// their operations maps with this one call per hook event, which keeps
@@ -540,7 +601,7 @@ impl CheckpointLog {
     /// it runs.
     pub(crate) fn project_records<R>(
         &self,
-        mut f: impl FnMut(&str, &CheckpointRecord) -> R,
+        mut f: impl FnMut(&str, u64, &CheckpointRecord) -> R,
     ) -> Vec<R> {
         #[cfg(test)]
         PROJECTIONS.with(|count| count.set(count.get() + 1));
@@ -548,7 +609,11 @@ impl CheckpointLog {
             .records
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.iter().map(|(id, record)| f(id, record)).collect()
+        guard
+            .by_wire_id
+            .iter()
+            .map(|(id, stored)| f(id, stored.sequence, &stored.record))
+            .collect()
     }
 
     /// Returns true if the log has any records at all.
@@ -557,7 +622,7 @@ impl CheckpointLog {
             .records
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !guard.is_empty()
+        !guard.by_wire_id.is_empty()
     }
 }
 
@@ -697,6 +762,54 @@ mod tests {
             ),
             Some(CheckpointStatus::Started)
         );
+    }
+
+    /// The sequence the log holds for `wire_id`.
+    fn sequence_of(log: &CheckpointLog, wire_id: &str) -> Option<u64> {
+        log.with_sequenced_record(wire_id, |sequence, _| sequence)
+    }
+
+    fn started(wire_id: &str) -> (String, CheckpointRecord) {
+        (
+            wire_id.to_owned(),
+            CheckpointRecord::with_status(wire_id, CheckpointStatus::Started),
+        )
+    }
+
+    /// `from_records` numbers the records from 1 in the order of the list,
+    /// which is not the order of the wire IDs.
+    #[test]
+    fn from_records_numbers_records_in_list_order() {
+        let log = CheckpointLog::from_records(vec![started("c"), started("a"), started("b")]);
+        assert_eq!(sequence_of(&log, "c"), Some(1));
+        assert_eq!(sequence_of(&log, "a"), Some(2));
+        assert_eq!(sequence_of(&log, "b"), Some(3));
+        assert_eq!(sequence_of(&log, "absent"), None);
+    }
+
+    /// A wire ID the log does not hold gets the next sequence. A record
+    /// that replaces another keeps the sequence, and does not advance the
+    /// sequence the next new wire ID gets.
+    #[test]
+    fn insert_keeps_sequence_of_replaced_record() {
+        let log = CheckpointLog::from_records(vec![started("c"), started("a")]);
+        log.insert(
+            "c".to_owned(),
+            CheckpointRecord::with_status("c", CheckpointStatus::Succeeded),
+        );
+        assert_eq!(sequence_of(&log, "c"), Some(1));
+        let (id, record) = started("b");
+        log.insert(id, record);
+        assert_eq!(sequence_of(&log, "b"), Some(3));
+    }
+
+    /// `project_records` passes each record's sequence to the closure.
+    #[test]
+    fn project_records_passes_each_sequence() {
+        let log = CheckpointLog::from_records(vec![started("c"), started("a")]);
+        let mut projected = log.project_records(|id, sequence, _| (id.to_owned(), sequence));
+        projected.sort();
+        assert_eq!(projected, [("a".to_owned(), 2), ("c".to_owned(), 1)]);
     }
 
     // Counter basics
