@@ -43,6 +43,7 @@ mod readme_doctests {}
 
 mod arn;
 mod config;
+mod contain;
 mod exporter;
 mod exporters;
 mod plugin;

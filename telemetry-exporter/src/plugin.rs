@@ -356,6 +356,12 @@ impl Plugin for TelemetryInvocation {
     /// | on-change | every invocation end |
     /// | on-complete | `SUCCEEDED` and `FAILED` |
     /// | on-failure | `FAILED` |
+    ///
+    /// A panic while the final record is built schedules no record. The
+    /// hook still waits for the drain and the flush. So the records that
+    /// were scheduled earlier are exported and flushed before the
+    /// invocation returns. The hook then returns an error, which the SDK
+    /// logs at WARN.
     fn on_invocation_end<'a>(&'a self, info: &'a InvocationEndInfo) -> HookFuture<'a> {
         let status = ExecutionStatus::from_invocation(info.status());
         let emit = match self.env.emit_mode {
@@ -363,20 +369,23 @@ impl Plugin for TelemetryInvocation {
             EmitMode::OnFailure => status == ExecutionStatus::Failed,
             EmitMode::OnComplete => status.is_terminal(),
         };
-        if emit {
-            let record = self.build_record(
-                status,
-                info.operations(),
-                Some(now_ms()),
-                info.execution_result().map(parse_payload),
-                info.execution_error().map(ErrorRecord::from_wire),
-            );
-            self.env.scheduler.schedule(&self.slot, record);
-        }
+        let built = if emit {
+            self.env.scheduler.schedule_with(&self.slot, || {
+                self.build_record(
+                    status,
+                    info.operations(),
+                    Some(now_ms()),
+                    info.execution_result().map(parse_payload),
+                    info.execution_error().map(ErrorRecord::from_wire),
+                )
+            })
+        } else {
+            Ok(())
+        };
         Box::pin(async move {
             self.env.scheduler.drain(&self.slot).await;
             self.env.scheduler.flush().await;
-            Ok(())
+            built.map_err(|error| format!("telemetry record was not built: {error}").into())
         })
     }
 }

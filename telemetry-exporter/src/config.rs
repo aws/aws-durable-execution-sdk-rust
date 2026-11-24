@@ -2,11 +2,12 @@
 //! and which payloads a record carries.
 
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use aws_durable_execution_sdk::BoxError;
 use serde_json::Value;
+
+use crate::contain::contained;
 
 /// When the plugin emits a record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -55,18 +56,22 @@ pub type Transform = Arc<dyn Fn(Value) -> Result<Value, BoxError> + Send + Sync>
 
 /// Applies a transform. Returns `None` when the transform returns an error
 /// or panics.
+///
+/// The error that a transform returns is the transform's value. Formatting
+/// it and dropping it run the transform author's code, and either can
+/// panic. So both run inside the catch, with the call itself.
 pub(crate) fn apply_transform(transform: &Transform, value: Value) -> Option<Value> {
-    match catch_unwind(AssertUnwindSafe(|| transform(value))) {
-        Ok(Ok(value)) => Some(value),
-        Ok(Err(error)) => {
+    let applied = contained(|| match transform(value) {
+        Ok(value) => Some(value),
+        Err(error) => {
             tracing::debug!(target: crate::TARGET, %error, "telemetry transform failed; omitting the value");
             None
         }
-        Err(_) => {
-            tracing::debug!(target: crate::TARGET, "telemetry transform panicked; omitting the value");
-            None
-        }
-    }
+    });
+    applied.unwrap_or_else(|_| {
+        tracing::debug!(target: crate::TARGET, "telemetry transform panicked; omitting the value");
+        None
+    })
 }
 
 /// Whether a record carries the execution input or output, and in which
@@ -246,6 +251,7 @@ impl ContentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contain::tests::{PanicsOnDisplay, PanicsOnDrop};
     use serde_json::json;
 
     #[test]
@@ -286,6 +292,30 @@ mod tests {
     )]
     fn a_panicking_transform_omits_the_value() {
         let setting = ContentSetting::transform(|_| panic!("redaction panicked"));
+        assert_eq!(setting.apply(Some(json!("secret"))), None);
+    }
+
+    #[test]
+    fn an_error_whose_formatting_panics_omits_the_value() {
+        // The subscriber formats the logged error, which runs its `Display`.
+        let _subscriber = test_tracing::install_test_subscriber(test_tracing::FormatsFields);
+        let setting = ContentSetting::transform(|_| Err(PanicsOnDisplay.into()));
+        assert_eq!(setting.apply(Some(json!("secret"))), None);
+    }
+
+    #[test]
+    fn an_error_whose_drop_panics_omits_the_value() {
+        let setting = ContentSetting::transform(|_| Err(PanicsOnDrop.into()));
+        assert_eq!(setting.apply(Some(json!("secret"))), None);
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "the test checks that a panicking payload drop is contained"
+    )]
+    fn a_panic_payload_whose_drop_panics_omits_the_value() {
+        let setting = ContentSetting::transform(|_| std::panic::panic_any(PanicsOnDrop));
         assert_eq!(setting.apply(Some(json!("secret"))), None);
     }
 

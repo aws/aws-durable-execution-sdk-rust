@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 #[derive(Clone, Default)]
 struct Recording {
     records: Arc<Mutex<Vec<Value>>>,
+    flushes: Arc<AtomicUsize>,
 }
 
 impl Recording {
@@ -36,6 +37,11 @@ impl TelemetryExporter for Recording {
     fn export<'a>(&'a self, record: &'a TelemetryRecord) -> ExportFuture<'a> {
         let value = render_value(record, OperationsFormat::Both).expect("render");
         self.records.lock().expect("lock").push(value);
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn flush(&self) -> ExportFuture<'_> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::ready(Ok(())))
     }
 }
@@ -452,6 +458,108 @@ async fn content_settings_shape_the_payloads() {
     assert_eq!(record["output"], json!({ "kept": 4 }));
     assert_eq!(record["operationsByName"]["double"]["result"], 4);
     assert_eq!(record["operations"][0]["result"], 4);
+}
+
+/// An error whose formatting panics.
+#[derive(Debug)]
+struct PanicsOnDisplay;
+
+impl std::fmt::Display for PanicsOnDisplay {
+    #[expect(
+        clippy::panic,
+        reason = "the test checks that a panicking error is contained"
+    )]
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        panic!("display panicked")
+    }
+}
+
+impl std::error::Error for PanicsOnDisplay {}
+
+#[tokio::test]
+async fn a_transform_error_whose_formatting_panics_omits_the_output_and_keeps_the_record() {
+    // The subscriber formats the logged error, which runs its `Display`.
+    let _subscriber = test_tracing::install_test_subscriber(test_tracing::FormatsFields);
+    let content =
+        ContentConfig::new().output(ContentSetting::transform(|_| Err(PanicsOnDisplay.into())));
+    let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder().content(content));
+    let result = runner(telemetry)
+        .run(one_step, json!({ "n": 2 }))
+        .await
+        .expect("runner");
+    assert!(result.is_success());
+    let records = recording.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "SUCCEEDED");
+    assert!(records[0].get("output").is_none());
+    assert_eq!(recording.flushes.load(Ordering::SeqCst), 1);
+}
+
+/// A subscriber that panics on every event of the telemetry exporter. It
+/// keeps the `error` field of every other event.
+#[derive(Clone, Default)]
+struct PanicsOnExporterEvent {
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
+impl tracing::field::Visit for PanicsOnExporterEvent {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "error" {
+            self.errors.lock().expect("lock").push(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing::Subscriber for PanicsOnExporterEvent {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let target = event.metadata().target();
+        assert_ne!(
+            target, "aws_durable_execution_sdk_telemetry_exporter",
+            "subscriber panicked"
+        );
+        event.record(&mut self.clone());
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+#[tokio::test]
+async fn a_final_record_whose_build_panics_keeps_the_flush() {
+    // The transform fails, and the plugin logs the failure. The subscriber
+    // panics on that log, which is a panic while the record is built.
+    let subscriber = PanicsOnExporterEvent::default();
+    let _subscriber = test_tracing::install_test_subscriber(subscriber.clone());
+    let content =
+        ContentConfig::new().output(ContentSetting::transform(
+            |_| Err("redaction failed".into()),
+        ));
+    let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder().content(content));
+    let result = runner(telemetry)
+        .run(one_step, json!({ "n": 2 }))
+        .await
+        .expect("runner");
+    assert!(result.is_success());
+    assert_eq!(recording.records(), Vec::<Value>::new());
+    assert_eq!(recording.flushes.load(Ordering::SeqCst), 1);
+    // The SDK logs the error that the end hook returned.
+    assert_eq!(
+        *subscriber.errors.lock().expect("lock"),
+        ["telemetry record was not built: panicked"]
+    );
 }
 
 #[tokio::test]

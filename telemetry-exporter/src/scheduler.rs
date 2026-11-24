@@ -3,12 +3,12 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::future::poll_fn;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::Poll;
 
 use tokio::sync::oneshot;
 
+use crate::contain::contained;
 use crate::exporter::{ExportFuture, TelemetryExporter};
 use crate::record::TelemetryRecord;
 use crate::truncation::truncate_record;
@@ -128,24 +128,6 @@ impl std::fmt::Debug for Scheduler {
     }
 }
 
-/// Runs `f` and returns its value. A panic in `f` becomes an error.
-///
-/// The scheduler runs every call into an exporter through it. An exporter
-/// is code that this crate did not write. Without the catch, a panic in it
-/// would end the pump, and the other exporters would not get the record.
-///
-/// The panic payload is also the exporter's value, and its drop can panic.
-/// So the payload is dropped inside a second catch. That drop's own
-/// payload is not dropped at all: its drop could panic in turn.
-fn contained<T>(f: impl FnOnce() -> T) -> Result<T, String> {
-    catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
-        if let Err(second) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
-            std::mem::forget(second);
-        }
-        "panicked".to_owned()
-    })
-}
-
 /// Polls `future` to completion. A panic while polling or dropping the
 /// future becomes an error.
 async fn contained_future(future: impl Future<Output = ()>) -> Result<(), String> {
@@ -252,6 +234,21 @@ impl Scheduler {
             queue.slots.push_back(Arc::clone(slot));
         }
         self.ensure_pump(&mut queue);
+    }
+
+    /// Builds a record and schedules it. A panic in `build` schedules
+    /// nothing and becomes the returned error.
+    ///
+    /// The caller then still reaches its drain and its flush. So the
+    /// records that were scheduled earlier are exported and flushed.
+    pub(crate) fn schedule_with(
+        self: &Arc<Self>,
+        slot: &Arc<Slot>,
+        build: impl FnOnce() -> TelemetryRecord,
+    ) -> Result<(), String> {
+        let record = contained(build)?;
+        self.schedule(slot, record);
+        Ok(())
     }
 
     /// Waits until the slot's latest record was handed to every exporter.
@@ -476,6 +473,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contain::tests::{PanicsOnDisplay, PanicsOnDrop};
     use crate::render::OperationsFormat;
     use crate::render::tests::record;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -530,56 +528,6 @@ mod tests {
 
         fn flush(&self) -> ExportFuture<'_> {
             Box::pin(async { panic!("flush panicked") })
-        }
-    }
-
-    /// An error whose formatting panics.
-    #[derive(Debug)]
-    struct PanicsOnDisplay;
-
-    impl std::fmt::Display for PanicsOnDisplay {
-        #[expect(
-            clippy::panic,
-            reason = "the tests check that a panicking error is contained"
-        )]
-        fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            panic!("display panicked")
-        }
-    }
-
-    impl std::error::Error for PanicsOnDisplay {}
-
-    /// A value whose drop panics. It is an error, a future and a panic
-    /// payload.
-    #[derive(Debug)]
-    struct PanicsOnDrop;
-
-    impl Drop for PanicsOnDrop {
-        #[expect(
-            clippy::panic,
-            reason = "the tests check that a panicking drop is contained"
-        )]
-        fn drop(&mut self) {
-            panic!("drop panicked")
-        }
-    }
-
-    impl std::fmt::Display for PanicsOnDrop {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("drop panics")
-        }
-    }
-
-    impl std::error::Error for PanicsOnDrop {}
-
-    impl Future for PanicsOnDrop {
-        type Output = Result<(), aws_durable_execution_sdk::BoxError>;
-
-        fn poll(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> Poll<Self::Output> {
-            Poll::Ready(Ok(()))
         }
     }
 
@@ -856,14 +804,22 @@ mod tests {
         assert_eq!(events.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         clippy::panic,
-        reason = "the test checks that a panicking payload drop is contained"
+        reason = "the test checks that a panicking build is contained"
     )]
-    fn a_panic_payload_whose_drop_panics_is_contained() {
-        let result = contained(|| std::panic::panic_any(PanicsOnDrop));
-        assert_eq!(result, Err::<(), _>("panicked".to_owned()));
+    async fn a_build_that_panics_schedules_nothing_and_keeps_the_earlier_record() {
+        let recorder = Arc::new(Recorder::default());
+        let scheduler = scheduler_of(recorder.clone());
+        let slot = Arc::new(Slot::default());
+        assert_eq!(scheduler.schedule_with(&slot, || stamped("a")), Ok(()));
+        let failed = scheduler.schedule_with(&slot, || panic!("build panicked"));
+        assert_eq!(failed, Err("panicked".to_owned()));
+        scheduler.drain(&slot).await;
+        scheduler.flush().await;
+        assert_eq!(*lock(&recorder.exported), ["a"]);
+        assert_eq!(recorder.flushes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
