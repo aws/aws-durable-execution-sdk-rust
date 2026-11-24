@@ -320,6 +320,7 @@ pub(crate) mod tests {
             result: None,
             truncated: false,
             start_ms: None,
+            sequence: None,
         }
     }
 

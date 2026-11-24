@@ -155,6 +155,10 @@ pub struct OperationRecord {
     /// truncation.
     #[serde(skip)]
     pub(crate) start_ms: Option<i64>,
+    /// The operation's [`OperationInfo::sequence`]. It orders operations
+    /// that have the same start time.
+    #[serde(skip)]
+    pub(crate) sequence: Option<u64>,
 }
 
 #[expect(
@@ -191,6 +195,7 @@ impl OperationRecord {
             result: None,
             truncated: false,
             start_ms: None,
+            sequence: None,
         }
     }
 
@@ -232,6 +237,7 @@ impl OperationRecord {
             result: None,
             truncated: false,
             start_ms,
+            sequence: op.sequence(),
         }
     }
 }
@@ -259,11 +265,14 @@ pub(crate) fn parse_payload(raw: &str) -> Value {
 /// 3. In top-level mode, an operation with a parent is skipped.
 /// 4. An operation whose override excludes it is skipped.
 ///
-/// The SDK reports operations keyed by wire ID, which carries no time
-/// order. The records are sorted by start time, oldest first, and an
-/// operation without a start time comes last. Equal start times keep the
-/// wire ID order. So a repeated name's summary reports its latest
-/// occurrence, as the service's own order would.
+/// The SDK reports operations keyed by wire ID. A wire ID is a hash, so
+/// the wire ID order is unrelated to the order the operations ran in. The
+/// records are therefore sorted by start time, oldest first, and an
+/// operation without a start time comes last. Two operations can have the
+/// same start time. Those are sorted by [`OperationInfo::sequence`], which
+/// follows the order the service created them in. So the last record of a
+/// repeated name is its latest occurrence, and the name's summary reports
+/// the status of that occurrence.
 pub(crate) fn operation_records(
     operations: &BTreeMap<String, OperationInfo>,
     opts: &OperationContentOptions,
@@ -272,7 +281,7 @@ pub(crate) fn operation_records(
         .values()
         .filter_map(|op| operation_record(op, opts))
         .collect();
-    records.sort_by_key(|record| (record.start_ms.is_none(), record.start_ms));
+    records.sort_by_key(|record| (record.start_ms.is_none(), record.start_ms, record.sequence));
     records
 }
 

@@ -498,6 +498,59 @@ async fn flaky(_event: Value, ctx: DurableContext) -> Result<u32, BoxError> {
     Ok(attempt)
 }
 
+/// Runs the name `work` twice with the step `other` between the two runs.
+/// The first `work` fails and the second succeeds.
+async fn repeated_name(_event: Value, ctx: DurableContext) -> Result<u32, BoxError> {
+    let first = ctx
+        .step(|_| async move { Err::<u32, BoxError>("first run fails".into()) })
+        .name("work")
+        .retry_strategy(|_err, _attempt| durable::RetryDecision::Stop)
+        .await;
+    assert!(first.is_err());
+    ctx.step(|_| async move { Ok(1_u32) }).name("other").await?;
+    let second = ctx.step(|_| async move { Ok(2_u32) }).name("work").await?;
+    Ok(second)
+}
+
+/// The three steps run in one invocation. The local runner's virtual clock
+/// does not move during an invocation. So the three steps have the same
+/// start time, and the start time alone does not order them. The record
+/// lists them in the order they ran, and the summary of the repeated name
+/// reports its last run.
+#[tokio::test]
+async fn operations_with_equal_start_times_keep_the_order_they_ran_in() {
+    let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder());
+    let result = runner(telemetry)
+        .run(repeated_name, json!({}))
+        .await
+        .expect("runner");
+    assert!(result.is_success());
+    let records = recording.records();
+    assert_eq!(records.len(), 1);
+    let operations = records[0]["operations"].as_array().expect("array");
+    let starts: Vec<_> = operations.iter().map(|op| &op["startTime"]).collect();
+    assert!(starts[0].is_string());
+    assert!(
+        starts.iter().all(|start| *start == starts[0]),
+        "the test needs equal start times: {starts:?}"
+    );
+    let ran: Vec<_> = operations
+        .iter()
+        .map(|op| (op["name"].as_str(), op["status"].as_str()))
+        .collect();
+    assert_eq!(
+        ran,
+        [
+            (Some("work"), Some("FAILED")),
+            (Some("other"), Some("SUCCEEDED")),
+            (Some("work"), Some("SUCCEEDED")),
+        ]
+    );
+    let work = &records[0]["operationsByName"]["work"];
+    assert_eq!(work["count"], 2);
+    assert_eq!(work["status"], "SUCCEEDED");
+}
+
 #[tokio::test]
 async fn a_retried_step_reports_its_highest_attempt() {
     let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder());
