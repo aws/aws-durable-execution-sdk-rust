@@ -53,10 +53,10 @@ results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
 dropped.
 
-Implement the `TelemetryExporter` trait to send records anywhere else. Every
-export and every flush holds one lock that the plugin factory owns. So an
-exporter never receives two calls at once. An exporter error is logged as a
-warning. It never fails the execution.
+Implement the `TelemetryExporter` trait to send records anywhere else. One
+task that the plugin factory owns makes every export and every flush, one at
+a time. So an exporter never receives two calls at once. An exporter error is
+logged as a warning. It never fails the execution.
 
 To unit test an exporter, build a record with `TelemetryRecord::new` and
 `OperationRecord::new`, then assign the fields the test needs.
