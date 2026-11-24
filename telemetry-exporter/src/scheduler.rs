@@ -128,37 +128,87 @@ impl std::fmt::Debug for Scheduler {
     }
 }
 
-/// Polls every future to completion and returns each outcome in order. A
-/// panic while creating or polling a future becomes that future's error.
-async fn settle_all<'a>(
-    futures: Vec<std::thread::Result<ExportFuture<'a>>>,
-) -> Vec<Result<(), String>> {
+/// Runs `f` and returns its value. A panic in `f` becomes an error.
+///
+/// The scheduler runs every call into an exporter through it. An exporter
+/// is code that this crate did not write. Without the catch, a panic in it
+/// would end the pump, and the other exporters would not get the record.
+///
+/// The panic payload is also the exporter's value, and its drop can panic.
+/// So the payload is dropped inside a second catch. That drop's own
+/// payload is not dropped at all: its drop could panic in turn.
+fn contained<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
+        if let Err(second) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+            std::mem::forget(second);
+        }
+        "panicked".to_owned()
+    })
+}
+
+/// Polls `future` to completion. A panic while polling or dropping the
+/// future becomes an error.
+async fn contained_future(future: impl Future<Output = ()>) -> Result<(), String> {
+    let mut future = Some(Box::pin(future));
+    poll_fn(|cx| {
+        let polled = match future.as_mut() {
+            Some(active) => contained(|| active.as_mut().poll(cx)),
+            None => Err("polled after completion".to_owned()),
+        };
+        if matches!(polled, Ok(Poll::Pending)) {
+            return Poll::Pending;
+        }
+        // A future that panicked is not polled again. Dropping it runs
+        // the drop guards of the code that panicked.
+        let dropped = contained(|| drop(future.take()));
+        Poll::Ready(polled.and(dropped))
+    })
+    .await
+}
+
+/// Polls every future to completion and returns each outcome in order.
+///
+/// Every step that runs an exporter's code is contained: the poll, the
+/// formatting and the drop of the error it returned, and the drop of the
+/// future. A panic in one of them becomes that future's error. So the
+/// other futures are still polled to completion.
+async fn settle_all<'a>(futures: Vec<Result<ExportFuture<'a>, String>>) -> Vec<Result<(), String>> {
     let mut results: Vec<Option<Result<(), String>>> = Vec::with_capacity(futures.len());
     let mut running: Vec<Option<ExportFuture<'a>>> = Vec::with_capacity(futures.len());
     for future in futures {
-        if let Ok(future) = future {
-            running.push(Some(future));
-            results.push(None);
-        } else {
-            running.push(None);
-            results.push(Some(Err("panicked".to_owned())));
+        match future {
+            Ok(future) => {
+                running.push(Some(future));
+                results.push(None);
+            }
+            Err(error) => {
+                running.push(None);
+                results.push(Some(Err(error)));
+            }
         }
     }
     poll_fn(|cx| {
         let mut waiting = false;
         for (future, result) in running.iter_mut().zip(results.iter_mut()) {
             let Some(active) = future else { continue };
-            match catch_unwind(AssertUnwindSafe(|| active.as_mut().poll(cx))) {
-                Ok(Poll::Pending) => waiting = true,
-                Ok(Poll::Ready(outcome)) => {
-                    *result = Some(outcome.map_err(|error| error.to_string()));
-                    *future = None;
+            // The closure owns the error that the future returned. So the
+            // error is formatted and dropped inside the catch.
+            let polled = contained(|| {
+                active
+                    .as_mut()
+                    .poll(cx)
+                    .map(|outcome| outcome.map_err(|error| error.to_string()))
+            });
+            let outcome = match polled {
+                Ok(Poll::Pending) => {
+                    waiting = true;
+                    continue;
                 }
-                Err(_) => {
-                    *result = Some(Err("panicked".to_owned()));
-                    *future = None;
-                }
-            }
+                Ok(Poll::Ready(outcome)) => outcome,
+                Err(error) => Err(error),
+            };
+            let dropped = contained(|| drop(future.take()));
+            *result = Some(outcome.and(dropped));
         }
         if waiting {
             Poll::Pending
@@ -275,38 +325,62 @@ impl Scheduler {
         Turn::Work(queue.slots.pop_front())
     }
 
-    /// Exports one record, then serves the flush requests, until nothing
-    /// waits. The future owns the token, so dropping the future ends the
-    /// claim.
+    /// Runs one turn after another until nothing waits. The future owns
+    /// the token, so dropping the future ends the claim.
+    ///
+    /// A panic in a turn ends that turn only, and the pump takes the next
+    /// turn. The exporters' code is already contained, so such a panic
+    /// comes from elsewhere, such as the application's log subscriber.
+    /// If the panic ended the pump, the drains that wait for the queued
+    /// slots would wait until a later call starts a new pump.
+    ///
+    /// The loop still ends after such a panic. `begin_turn` removed the
+    /// turn's slot from the queue, and the turn takes the flush requests
+    /// before it calls other code. So a turn that panics leaves less work
+    /// than it found. Dropping the turn releases the slot's drains and
+    /// drops the flush requests it took, which those requesters treat like
+    /// a failed flush.
+    async fn run_pump(self: Arc<Self>, _token: PumpToken) {
+        while let Turn::Work(slot) = self.begin_turn() {
+            if let Err(error) = contained_future(self.run_turn(slot)).await {
+                // The log calls the application's subscriber, which may be
+                // the code that panicked. So it has its own catch.
+                let _ = contained(|| {
+                    tracing::warn!(target: crate::TARGET, %error, "telemetry pump turn failed");
+                });
+            }
+        }
+    }
+
+    /// Exports the record of `slot`, if any, then serves the flush
+    /// requests.
     ///
     /// A flush therefore waits for at most one export that no drain waits
     /// for, however many records are queued.
-    async fn run_pump(self: Arc<Self>, _token: PumpToken) {
-        while let Turn::Work(slot) = self.begin_turn() {
-            if let Some(slot) = slot {
-                self.export_slot(&slot).await;
-            }
-            let mut flushers = std::mem::take(&mut lock(&self.queue).flush_waiters);
-            if flushers.is_empty() {
-                continue;
-            }
-            // A drain that waits belongs to an invocation end, which asks
-            // for its flush only after the drain returns. So these records
-            // are exported before the flush, and the ends that have asked
-            // by then share it. The count bounds the pass: a slot that is
-            // scheduled again during the pass cannot hold the flush back.
-            for _ in 0..self.awaited_slots() {
-                let Some(slot) = self.pop_awaited_slot() else {
-                    break;
-                };
-                self.export_slot(&slot).await;
-            }
-            flushers.append(&mut lock(&self.queue).flush_waiters);
-            self.flush_all().await;
-            for flusher in flushers {
-                // The requester may have been dropped. Nobody waits then.
-                let _ = flusher.send(());
-            }
+    async fn run_turn(&self, slot: Option<Arc<Slot>>) {
+        if let Some(slot) = slot {
+            self.export_slot(&slot).await;
+        }
+        let mut flushers = std::mem::take(&mut lock(&self.queue).flush_waiters);
+        if flushers.is_empty() {
+            return;
+        }
+        // A drain that waits belongs to an invocation end, which asks
+        // for its flush only after the drain returns. So these records
+        // are exported before the flush, and the ends that have asked
+        // by then share it. The count bounds the pass: a slot that is
+        // scheduled again during the pass cannot hold the flush back.
+        for _ in 0..self.awaited_slots() {
+            let Some(slot) = self.pop_awaited_slot() else {
+                break;
+            };
+            self.export_slot(&slot).await;
+        }
+        flushers.append(&mut lock(&self.queue).flush_waiters);
+        self.flush_all().await;
+        for flusher in flushers {
+            // The requester may have been dropped. Nobody waits then.
+            let _ = flusher.send(());
         }
     }
 
@@ -351,23 +425,31 @@ impl Scheduler {
     }
 
     /// Hands `record` to every exporter. Only the pump calls it.
+    ///
+    /// An exporter whose limit query panics gets no `export` call: the
+    /// size it accepts is unknown.
     async fn export(&self, record: &TelemetryRecord) {
-        let records: Vec<Cow<'_, TelemetryRecord>> = self
+        let records: Vec<Result<Cow<'_, TelemetryRecord>, String>> = self
             .exporters
             .iter()
             .map(|exporter| {
-                truncate_record(
-                    record,
-                    exporter.max_record_size_bytes(),
-                    exporter.operations_format(),
-                )
+                contained(|| {
+                    (
+                        exporter.max_record_size_bytes(),
+                        exporter.operations_format(),
+                    )
+                })
+                .map(|(max_bytes, format)| truncate_record(record, max_bytes, format))
             })
             .collect();
         let futures = self
             .exporters
             .iter()
             .zip(&records)
-            .map(|(exporter, record)| catch_unwind(AssertUnwindSafe(|| exporter.export(record))))
+            .map(|(exporter, record)| match record {
+                Ok(record) => contained(|| exporter.export(record)),
+                Err(error) => Err(error.clone()),
+            })
             .collect();
         for (index, result) in settle_all(futures).await.into_iter().enumerate() {
             if let Err(error) = result {
@@ -381,7 +463,7 @@ impl Scheduler {
         let futures = self
             .exporters
             .iter()
-            .map(|exporter| catch_unwind(AssertUnwindSafe(|| exporter.flush())))
+            .map(|exporter| contained(|| exporter.flush()))
             .collect();
         for (index, result) in settle_all(futures).await.into_iter().enumerate() {
             if let Err(error) = result {
@@ -449,6 +531,161 @@ mod tests {
         fn flush(&self) -> ExportFuture<'_> {
             Box::pin(async { panic!("flush panicked") })
         }
+    }
+
+    /// An error whose formatting panics.
+    #[derive(Debug)]
+    struct PanicsOnDisplay;
+
+    impl std::fmt::Display for PanicsOnDisplay {
+        #[expect(
+            clippy::panic,
+            reason = "the tests check that a panicking error is contained"
+        )]
+        fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("display panicked")
+        }
+    }
+
+    impl std::error::Error for PanicsOnDisplay {}
+
+    /// A value whose drop panics. It is an error, a future and a panic
+    /// payload.
+    #[derive(Debug)]
+    struct PanicsOnDrop;
+
+    impl Drop for PanicsOnDrop {
+        #[expect(
+            clippy::panic,
+            reason = "the tests check that a panicking drop is contained"
+        )]
+        fn drop(&mut self) {
+            panic!("drop panicked")
+        }
+    }
+
+    impl std::fmt::Display for PanicsOnDrop {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("drop panics")
+        }
+    }
+
+    impl std::error::Error for PanicsOnDrop {}
+
+    impl Future for PanicsOnDrop {
+        type Output = Result<(), aws_durable_execution_sdk::BoxError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An exporter whose every step fails in a way that runs its code after
+    /// the poll returned: `export` returns an error whose formatting
+    /// panics, and `flush` returns an error whose drop panics.
+    struct FailsWithPanickingError;
+
+    impl TelemetryExporter for FailsWithPanickingError {
+        fn export<'a>(&'a self, _record: &'a TelemetryRecord) -> ExportFuture<'a> {
+            Box::pin(std::future::ready(Err(PanicsOnDisplay.into())))
+        }
+
+        fn flush(&self) -> ExportFuture<'_> {
+            Box::pin(std::future::ready(Err(PanicsOnDrop.into())))
+        }
+    }
+
+    /// An exporter whose futures panic when they are dropped.
+    struct ReturnsFuturesThatPanicOnDrop;
+
+    impl TelemetryExporter for ReturnsFuturesThatPanicOnDrop {
+        fn export<'a>(&'a self, _record: &'a TelemetryRecord) -> ExportFuture<'a> {
+            Box::pin(PanicsOnDrop)
+        }
+
+        fn flush(&self) -> ExportFuture<'_> {
+            Box::pin(PanicsOnDrop)
+        }
+    }
+
+    /// An exporter whose size limit query panics.
+    struct PanicsOnLimit;
+
+    #[expect(
+        clippy::panic,
+        reason = "the tests check that a panicking exporter is contained"
+    )]
+    impl TelemetryExporter for PanicsOnLimit {
+        fn export<'a>(&'a self, _record: &'a TelemetryRecord) -> ExportFuture<'a> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn max_record_size_bytes(&self) -> Option<usize> {
+            panic!("limit panicked")
+        }
+    }
+
+    /// A subscriber that counts every event and panics on it.
+    #[derive(Default)]
+    struct PanicsOnEvent(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for PanicsOnEvent {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        #[expect(
+            clippy::panic,
+            reason = "the test checks that a panicking subscriber is contained"
+        )]
+        fn event(&self, _event: &tracing::Event<'_>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("subscriber panicked")
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// A waker that panics when it is woken.
+    struct PanicsOnWake;
+
+    impl std::task::Wake for PanicsOnWake {
+        #[expect(
+            clippy::panic,
+            reason = "the test checks that a panic in a turn is contained"
+        )]
+        fn wake(self: Arc<Self>) {
+            panic!("wake panicked")
+        }
+    }
+
+    /// Schedules one record on each of two slots, then waits for both
+    /// drains at once and for a flush. Both drains are registered before
+    /// the pump's first turn. So the second drain completes only when the
+    /// pump that exported the first record also exports the second.
+    async fn export_two_slots(scheduler: &Arc<Scheduler>) {
+        let (a, b) = (Arc::new(Slot::default()), Arc::new(Slot::default()));
+        scheduler.schedule(&a, stamped("a"));
+        scheduler.schedule(&b, stamped("b"));
+        let work = async {
+            tokio::join!(scheduler.drain(&a), scheduler.drain(&b));
+            scheduler.flush().await;
+        };
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), work).await;
+        assert!(finished.is_ok(), "the drains and the flush completed");
     }
 
     /// An exporter whose every export waits for one permit of `gate`.
@@ -550,6 +787,83 @@ mod tests {
         scheduler.flush().await;
         assert_eq!(*lock(&recorder.exported), ["1"]);
         assert_eq!(recorder.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_error_whose_formatting_or_drop_panics_stops_neither_the_other_exporter_nor_the_pump()
+     {
+        let recorder = Arc::new(Recorder::default());
+        let scheduler = Arc::new(Scheduler::new(vec![
+            Arc::new(FailsWithPanickingError),
+            recorder.clone(),
+        ]));
+        export_two_slots(&scheduler).await;
+        assert_eq!(*lock(&recorder.exported), ["a", "b"]);
+        assert_eq!(recorder.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_future_whose_drop_panics_stops_neither_the_other_exporter_nor_the_pump() {
+        let recorder = Arc::new(Recorder::default());
+        let scheduler = Arc::new(Scheduler::new(vec![
+            Arc::new(ReturnsFuturesThatPanicOnDrop),
+            recorder.clone(),
+        ]));
+        export_two_slots(&scheduler).await;
+        assert_eq!(*lock(&recorder.exported), ["a", "b"]);
+        assert_eq!(recorder.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_limit_query_that_panics_stops_neither_the_other_exporter_nor_the_pump() {
+        let recorder = Arc::new(Recorder::default());
+        let scheduler = Arc::new(Scheduler::new(vec![
+            Arc::new(PanicsOnLimit),
+            recorder.clone(),
+        ]));
+        export_two_slots(&scheduler).await;
+        assert_eq!(*lock(&recorder.exported), ["a", "b"]);
+        assert_eq!(recorder.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_panics_outside_the_exporters_does_not_stop_the_pump() {
+        // The subscriber panics on the pump's log of the failed turn.
+        let events = Arc::new(AtomicUsize::new(0));
+        let _subscriber = test_tracing::install_test_subscriber(PanicsOnEvent(events.clone()));
+        let recorder = Arc::new(Recorder::default());
+        let scheduler = scheduler_of(recorder.clone());
+        let (a, b) = (Arc::new(Slot::default()), Arc::new(Slot::default()));
+        scheduler.schedule(&a, stamped("a"));
+        scheduler.schedule(&b, stamped("b"));
+        // The pump wakes this drain after it exported record `a`. The
+        // waker panics, which is a panic in the turn and outside every
+        // exporter.
+        let waker = std::task::Waker::from(Arc::new(PanicsOnWake));
+        let mut drain_a = Box::pin(scheduler.drain(&a));
+        let polled = drain_a
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        // This drain and this flush are requested before the pump's first
+        // turn, and no call after the panic starts a pump. So they complete
+        // only when the pump that panicked also takes the next turn.
+        let waits = async { tokio::join!(scheduler.drain(&b), scheduler.flush()) };
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), waits).await;
+        assert!(finished.is_ok(), "the second drain and the flush completed");
+        assert_eq!(*lock(&recorder.exported), ["a", "b"]);
+        assert_eq!(recorder.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(events.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "the test checks that a panicking payload drop is contained"
+    )]
+    fn a_panic_payload_whose_drop_panics_is_contained() {
+        let result = contained(|| std::panic::panic_any(PanicsOnDrop));
+        assert_eq!(result, Err::<(), _>("panicked".to_owned()));
     }
 
     #[tokio::test]
