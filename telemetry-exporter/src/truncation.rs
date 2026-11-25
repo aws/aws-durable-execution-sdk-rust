@@ -20,8 +20,16 @@ impl io::Write for ByteCounter {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many records this thread has rendered to measure them.
+    static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The UTF-8 size of a view's JSON, or `None` when it does not serialize.
 fn json_size(view: &RecordView<'_>) -> Option<usize> {
+    #[cfg(test)]
+    RENDERS.with(|count| count.set(count.get() + 1));
     let mut counter = ByteCounter(0);
     serde_json::to_writer(&mut counter, view).ok()?;
     Some(counter.0)
@@ -374,6 +382,40 @@ mod tests {
         ));
         let out = truncate_record(&r, Some(limit), OperationsFormat::ByName);
         assert_eq!(out.dropped_operations, 1);
+    }
+
+    /// `count` operations named `step-0`, `step-1` and so on, started in
+    /// that order, each with a duration and an attempt.
+    fn steps(count: i64) -> TelemetryRecord {
+        let operations = (0..count)
+            .map(|i| {
+                let mut o = timed(&format!("step-{i}"), Some(i), None);
+                o.duration_ms = Some(3);
+                o.attempt = Some(1);
+                o
+            })
+            .collect();
+        record(operations)
+    }
+
+    /// The number of renders `truncate_record` makes for one call.
+    fn renders(r: &TelemetryRecord, limit: usize, format: OperationsFormat) -> usize {
+        RENDERS.with(|count| count.set(0));
+        let out = truncate_record(r, Some(limit), format);
+        assert!(out.dropped_operations > 0);
+        RENDERS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn many_dropped_operations_take_a_few_renders() {
+        let r = steps(2_000);
+        // The CloudWatch Logs limit and the by-name form.
+        let by_name = renders(&r, 256_000, OperationsFormat::ByName);
+        assert!(by_name < 40, "by name: {by_name} renders");
+        for format in [OperationsFormat::Array, OperationsFormat::Both] {
+            let count = renders(&r, size(&r, format) / 2, format);
+            assert!(count < 40, "{format:?}: {count} renders");
+        }
     }
 
     #[test]
