@@ -2,6 +2,8 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use aws_durable_execution_sdk::BoxError;
+
 /// Runs `f` and returns its value. A panic in `f` becomes an error.
 ///
 /// Every call into an exporter or a transform goes through it. Both are
@@ -22,9 +24,37 @@ pub(crate) fn contained<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     })
 }
 
+/// Formats `error`, drops it, and returns the text.
+///
+/// Formatting and dropping both run code that this crate did not write,
+/// and either can panic. A panic unwinds the closure it starts in, and
+/// the unwind drops what that closure owns. A second panic during an
+/// unwind aborts the process. So the first catch only borrows the error:
+/// a panic in its formatting drops nothing. The second catch then owns
+/// the error and drops it.
+///
+/// The text is `"panicked"` when the formatting panics.
+pub(crate) fn describe_error(error: BoxError) -> String {
+    let message = contained(|| error.to_string());
+    let _ = contained(move || drop(error));
+    message.unwrap_or_else(|panicked| panicked)
+}
+
+/// Emits one log event. A panic in the application's `tracing` subscriber
+/// is caught and ignored.
+///
+/// A log call runs the application's subscriber, which is code that this
+/// crate did not write. Without the catch, a panic there would end the
+/// hook or the pump turn that logs.
+pub(crate) fn log_contained(emit: impl FnOnce()) {
+    let _ = contained(emit);
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Poll;
 
     /// An error whose formatting panics.
@@ -67,7 +97,7 @@ pub(crate) mod tests {
     impl std::error::Error for PanicsOnDrop {}
 
     impl Future for PanicsOnDrop {
-        type Output = Result<(), aws_durable_execution_sdk::BoxError>;
+        type Output = Result<(), BoxError>;
 
         fn poll(
             self: std::pin::Pin<&mut Self>,
@@ -75,6 +105,63 @@ pub(crate) mod tests {
         ) -> Poll<Self::Output> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// An error whose formatting panics and whose drop panics.
+    #[derive(Debug)]
+    pub(crate) struct PanicsOnDisplayAndDrop;
+
+    impl std::fmt::Display for PanicsOnDisplayAndDrop {
+        #[expect(
+            clippy::panic,
+            reason = "the tests check that a panicking error is contained"
+        )]
+        fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("display panicked")
+        }
+    }
+
+    impl Drop for PanicsOnDisplayAndDrop {
+        #[expect(
+            clippy::panic,
+            reason = "the tests check that a panicking drop is contained"
+        )]
+        fn drop(&mut self) {
+            panic!("drop panicked")
+        }
+    }
+
+    impl std::error::Error for PanicsOnDisplayAndDrop {}
+
+    /// A subscriber that counts every event and panics on it.
+    #[derive(Default)]
+    pub(crate) struct PanicsOnEvent(pub(crate) Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for PanicsOnEvent {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        #[expect(
+            clippy::panic,
+            reason = "the test checks that a panicking subscriber is contained"
+        )]
+        fn event(&self, _event: &tracing::Event<'_>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("subscriber panicked")
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use aws_durable_execution_sdk::BoxError;
 use serde_json::Value;
 
-use crate::contain::contained;
+use crate::contain::{contained, describe_error, log_contained};
 
 /// When the plugin emits a record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -59,19 +59,25 @@ pub type Transform = Arc<dyn Fn(Value) -> Result<Value, BoxError> + Send + Sync>
 ///
 /// The error that a transform returns is the transform's value. Formatting
 /// it and dropping it run the transform author's code, and either can
-/// panic. So both run inside the catch, with the call itself.
+/// panic. So the catch covers the call only, and `describe_error` formats
+/// the error and drops it in two separate catches.
 pub(crate) fn apply_transform(transform: &Transform, value: Value) -> Option<Value> {
-    let applied = contained(|| match transform(value) {
-        Ok(value) => Some(value),
-        Err(error) => {
-            tracing::debug!(target: crate::TARGET, %error, "telemetry transform failed; omitting the value");
+    match contained(|| transform(value)) {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(error)) => {
+            let error = describe_error(error);
+            log_contained(|| {
+                tracing::debug!(target: crate::TARGET, %error, "telemetry transform failed; omitting the value");
+            });
             None
         }
-    });
-    applied.unwrap_or_else(|_| {
-        tracing::debug!(target: crate::TARGET, "telemetry transform panicked; omitting the value");
-        None
-    })
+        Err(_) => {
+            log_contained(|| {
+                tracing::debug!(target: crate::TARGET, "telemetry transform panicked; omitting the value");
+            });
+            None
+        }
+    }
 }
 
 /// Whether a record carries the execution input or output, and in which
@@ -251,8 +257,11 @@ impl ContentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contain::tests::{PanicsOnDisplay, PanicsOnDrop};
+    use crate::contain::tests::{
+        PanicsOnDisplay, PanicsOnDisplayAndDrop, PanicsOnDrop, PanicsOnEvent,
+    };
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn include_keeps_the_value() {
@@ -317,6 +326,28 @@ mod tests {
     fn a_panic_payload_whose_drop_panics_omits_the_value() {
         let setting = ContentSetting::transform(|_| std::panic::panic_any(PanicsOnDrop));
         assert_eq!(setting.apply(Some(json!("secret"))), None);
+    }
+
+    #[test]
+    fn an_error_whose_formatting_and_drop_panic_omits_the_value() {
+        // The subscriber formats the logged error. So code that passes the
+        // error itself to the log also runs its `Display`.
+        let _subscriber = test_tracing::install_test_subscriber(test_tracing::FormatsFields);
+        let setting = ContentSetting::transform(|_| Err(PanicsOnDisplayAndDrop.into()));
+        assert_eq!(setting.apply(Some(json!("secret"))), None);
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "the test checks that a panicking transform is contained"
+    )]
+    fn a_subscriber_that_panics_on_the_log_of_a_panicking_transform_omits_the_value() {
+        let events = Arc::new(AtomicUsize::new(0));
+        let _subscriber = test_tracing::install_test_subscriber(PanicsOnEvent(events.clone()));
+        let setting = ContentSetting::transform(|_| panic!("redaction panicked"));
+        assert_eq!(setting.apply(Some(json!("secret"))), None);
+        assert_eq!(events.load(Ordering::SeqCst), 1);
     }
 
     #[test]

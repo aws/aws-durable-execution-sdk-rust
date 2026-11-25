@@ -538,9 +538,9 @@ impl tracing::Subscriber for PanicsOnExporterEvent {
 }
 
 #[tokio::test]
-async fn a_final_record_whose_build_panics_keeps_the_flush() {
-    // The transform fails, and the plugin logs the failure. The subscriber
-    // panics on that log, which is a panic while the record is built.
+async fn a_subscriber_that_panics_on_a_failed_transform_keeps_the_record_and_the_flush() {
+    // The transform fails, and the plugin logs the failure while it builds
+    // the final record. The subscriber panics on that log.
     let subscriber = PanicsOnExporterEvent::default();
     let _subscriber = test_tracing::install_test_subscriber(subscriber.clone());
     let content =
@@ -553,12 +553,15 @@ async fn a_final_record_whose_build_panics_keeps_the_flush() {
         .await
         .expect("runner");
     assert!(result.is_success());
-    assert_eq!(recording.records(), Vec::<Value>::new());
+    let records = recording.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "SUCCEEDED");
+    assert!(records[0].get("output").is_none());
     assert_eq!(recording.flushes.load(Ordering::SeqCst), 1);
-    // The SDK logs the error that the end hook returned.
+    // The end hook returned no error for the SDK to log.
     assert_eq!(
         *subscriber.errors.lock().expect("lock"),
-        ["telemetry record was not built: panicked"]
+        Vec::<String>::new()
     );
 }
 
