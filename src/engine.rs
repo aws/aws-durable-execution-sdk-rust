@@ -401,9 +401,11 @@ pub(crate) struct CheckpointLog {
 /// The records of a [`CheckpointLog`], each with its sequence.
 ///
 /// The map has no order, and a wire ID is a hash that carries none. The
-/// service reports operations in a stable order. So each wire ID gets the
-/// next sequence when the log first stores a record of it, and keeps that
-/// sequence when a later record replaces the first.
+/// log receives records in the order the service reports them. So each
+/// wire ID gets the next sequence when the log first stores a record of
+/// it, and keeps that sequence when a later record replaces the first.
+/// The sequences order operations as they ran only if the service reports
+/// operations in the order it created them, which the log assumes.
 #[derive(Debug, Default)]
 struct Records {
     by_wire_id: HashMap<String, SequencedRecord>,

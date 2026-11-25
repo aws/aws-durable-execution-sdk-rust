@@ -270,7 +270,7 @@ pub(crate) fn parse_payload(raw: &str) -> Value {
 /// records are therefore sorted by start time, oldest first, and an
 /// operation without a start time comes last. Two operations can have the
 /// same start time. Those are sorted by [`OperationInfo::sequence`], which
-/// follows the order the service created them in. So the last record of a
+/// follows the order the service reported them in. So the last record of a
 /// repeated name is its latest occurrence, and the name's summary reports
 /// the status of that occurrence.
 pub(crate) fn operation_records(

@@ -1763,14 +1763,20 @@ impl OperationInfo {
         self.end_timestamp
     }
 
-    /// The operation's position in the order in which the service first
-    /// reported the execution's operations.
+    /// The operation's position in the order in which the SDK first
+    /// received the execution's operations from the service.
     ///
-    /// The service reports operations in the order it created them, and in
-    /// the same order in every invocation. So this orders two operations
-    /// of one execution, such as two that share a start timestamp. The
-    /// wire ID is a hash and gives no such order. A later update to the
-    /// operation keeps its sequence. The `EXECUTION` operation has 0.
+    /// The SDK numbers an operation when it first receives it. A later
+    /// update to the operation keeps its sequence. So this orders two
+    /// operations of one execution, such as two that share a start
+    /// timestamp. The wire ID is a hash and gives no such order. The
+    /// `EXECUTION` operation has 0.
+    ///
+    /// The sequence follows the order of the service's responses. The SDK
+    /// assumes that the service lists operations in the order it created
+    /// them, and that two operations keep their relative order in every
+    /// invocation. If the service lists them in another order, the
+    /// sequence follows that order.
     ///
     /// `None` when the service has not yet reported the operation: an
     /// operation hook can run before the operation's first checkpoint.
