@@ -38,6 +38,43 @@ where
     tracing::subscriber::set_default(subscriber)
 }
 
+/// A subscriber that enables every event and formats every field of it.
+///
+/// An event field such as `%error` holds a reference to the value. The
+/// value's `Display` runs only when a subscriber formats the field. So a
+/// test installs this subscriber to run the `Display` of the values that
+/// the code under test logs.
+#[derive(Debug)]
+pub struct FormatsFields;
+
+impl tracing::field::Visit for FormatsFields {
+    fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let _ = format!("{value:?}");
+    }
+}
+
+impl Subscriber for FormatsFields {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        event.record(&mut FormatsFields);
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
 /// A subscriber that leaves every callsite undecided and enables nothing.
 #[derive(Debug)]
 struct UndecidedSubscriber;
@@ -148,6 +185,22 @@ mod tests {
             );
             assert!(!UndecidedSubscriber.enabled(metadata));
         }
+    }
+
+    #[test]
+    fn formats_fields_runs_the_display_of_a_logged_value() {
+        struct Counts<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl std::fmt::Display for Counts<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                f.write_str("counted")
+            }
+        }
+        let formatted = std::sync::atomic::AtomicUsize::new(0);
+        let _guard = install_test_subscriber(FormatsFields);
+        let value = Counts(&formatted);
+        tracing::debug!(%value, "probe");
+        assert_eq!(formatted.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

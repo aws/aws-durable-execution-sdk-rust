@@ -6,6 +6,7 @@
 
 #![expect(clippy::expect_used, clippy::indexing_slicing)] // reason: test assertions
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use serde_json::{Value, json};
 #[derive(Clone, Default)]
 struct Recording {
     records: Arc<Mutex<Vec<Value>>>,
+    flushes: Arc<AtomicUsize>,
 }
 
 impl Recording {
@@ -37,6 +39,11 @@ impl TelemetryExporter for Recording {
         self.records.lock().expect("lock").push(value);
         Box::pin(std::future::ready(Ok(())))
     }
+
+    fn flush(&self) -> ExportFuture<'_> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 /// Fails every export.
@@ -45,6 +52,32 @@ struct Failing;
 impl TelemetryExporter for Failing {
     fn export<'a>(&'a self, _record: &'a TelemetryRecord) -> ExportFuture<'a> {
         Box::pin(std::future::ready(Err("export failed".into())))
+    }
+}
+
+/// Takes one millisecond per export. Keeps each record's status and the
+/// largest number of live tokio tasks that an export observed.
+#[derive(Clone, Default)]
+struct Slow {
+    statuses: Arc<Mutex<Vec<Value>>>,
+    peak_tasks: Arc<AtomicUsize>,
+}
+
+impl TelemetryExporter for Slow {
+    fn export<'a>(&'a self, record: &'a TelemetryRecord) -> ExportFuture<'a> {
+        Box::pin(async move {
+            let alive = tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks();
+            self.peak_tasks.fetch_max(alive, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let value = render_value(record, OperationsFormat::ByName).expect("render");
+            self.statuses
+                .lock()
+                .expect("lock")
+                .push(value["status"].clone());
+            Ok(())
+        })
     }
 }
 
@@ -189,6 +222,28 @@ async fn a_failed_execution_carries_the_error_and_no_output() {
 }
 
 #[tokio::test]
+async fn include_errors_false_omits_the_operation_error_and_keeps_the_execution_error() {
+    let content = ContentConfig::new().include_errors(false);
+    let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder().content(content));
+    let result = runner(telemetry)
+        .run(failing_step, json!({}))
+        .await
+        .expect("runner");
+    assert!(!result.is_success());
+
+    let records = recording.records();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    let message = record["error"]["message"].as_str().expect("message");
+    assert!(message.contains("step boom"), "{message}");
+    assert_eq!(record["operations"][0]["status"], "FAILED");
+    assert!(record["operations"][0].get("error").is_none());
+    let explode = &record["operationsByName"]["explode"];
+    assert_eq!(explode["status"], "FAILED");
+    assert!(explode.get("error").is_none());
+}
+
+#[tokio::test]
 async fn on_complete_skips_the_pending_invocations() {
     let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder());
     let result = runner(telemetry)
@@ -258,11 +313,46 @@ async fn on_change_emits_a_running_record_for_an_operation_change() {
 }
 
 #[tokio::test]
+async fn on_change_with_a_slow_exporter_keeps_the_task_count_bounded() {
+    const STEPS: usize = 500;
+    let slow = Slow::default();
+    let telemetry = DurableExecutionTelemetry::builder()
+        .emit_mode(EmitMode::OnChange)
+        .exporter(slow.clone())
+        .build();
+    let many_steps = |_event: Value, ctx: DurableContext| async move {
+        for n in 0..STEPS {
+            ctx.step(move |_| async move { Ok(n) })
+                .name("count")
+                .await?;
+        }
+        Ok::<_, BoxError>(Value::Null)
+    };
+    runner(telemetry)
+        .run(many_steps, json!({}))
+        .await
+        .expect("runner");
+
+    // Each step changes its operation at least once, and each export takes
+    // longer than a step. One pump task exports for the whole scheduler.
+    // So the number of live tasks does not grow with the number of steps.
+    // The observed peak is 3 tasks. The limit of 10 leaves room for tasks
+    // that the runner may add.
+    let peak = slow.peak_tasks.load(Ordering::Relaxed);
+    assert!(peak <= 10, "{peak} live tasks");
+
+    let statuses = slow.statuses.lock().expect("lock").clone();
+    let (last, earlier) = statuses.split_last().expect("records");
+    assert_eq!(last, "SUCCEEDED");
+    assert!(earlier.iter().all(|status| status == "RUNNING"));
+}
+
+#[tokio::test]
 async fn on_change_emits_a_running_record_when_the_invocation_starts() {
     let (telemetry, recording) =
         recorded(DurableExecutionTelemetry::builder().emit_mode(EmitMode::OnChange));
-    // The export of the invocation-start record runs on its own task. The
-    // handler yields before its first operation, so that task runs first.
+    // The scheduler's pump task exports the invocation-start record. The
+    // handler yields before its first operation, so the pump runs first.
     let yields_then_steps = |event: Value, ctx: DurableContext| async move {
         tokio::task::yield_now().await;
         one_step(event, ctx).await
@@ -370,6 +460,111 @@ async fn content_settings_shape_the_payloads() {
     assert_eq!(record["operations"][0]["result"], 4);
 }
 
+/// An error whose formatting panics.
+#[derive(Debug)]
+struct PanicsOnDisplay;
+
+impl std::fmt::Display for PanicsOnDisplay {
+    #[expect(
+        clippy::panic,
+        reason = "the test checks that a panicking error is contained"
+    )]
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        panic!("display panicked")
+    }
+}
+
+impl std::error::Error for PanicsOnDisplay {}
+
+#[tokio::test]
+async fn a_transform_error_whose_formatting_panics_omits_the_output_and_keeps_the_record() {
+    // The subscriber formats the logged error, which runs its `Display`.
+    let _subscriber = test_tracing::install_test_subscriber(test_tracing::FormatsFields);
+    let content =
+        ContentConfig::new().output(ContentSetting::transform(|_| Err(PanicsOnDisplay.into())));
+    let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder().content(content));
+    let result = runner(telemetry)
+        .run(one_step, json!({ "n": 2 }))
+        .await
+        .expect("runner");
+    assert!(result.is_success());
+    let records = recording.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "SUCCEEDED");
+    assert!(records[0].get("output").is_none());
+    assert_eq!(recording.flushes.load(Ordering::SeqCst), 1);
+}
+
+/// A subscriber that panics on every event of the telemetry exporter. It
+/// keeps the `error` field of every other event.
+#[derive(Clone, Default)]
+struct PanicsOnExporterEvent {
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
+impl tracing::field::Visit for PanicsOnExporterEvent {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "error" {
+            self.errors.lock().expect("lock").push(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing::Subscriber for PanicsOnExporterEvent {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let target = event.metadata().target();
+        assert_ne!(
+            target, "aws_durable_execution_sdk_telemetry_exporter",
+            "subscriber panicked"
+        );
+        event.record(&mut self.clone());
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+#[tokio::test]
+async fn a_subscriber_that_panics_on_a_failed_transform_keeps_the_record_and_the_flush() {
+    // The transform fails, and the plugin logs the failure while it builds
+    // the final record. The subscriber panics on that log.
+    let subscriber = PanicsOnExporterEvent::default();
+    let _subscriber = test_tracing::install_test_subscriber(subscriber.clone());
+    let content =
+        ContentConfig::new().output(ContentSetting::transform(
+            |_| Err("redaction failed".into()),
+        ));
+    let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder().content(content));
+    let result = runner(telemetry)
+        .run(one_step, json!({ "n": 2 }))
+        .await
+        .expect("runner");
+    assert!(result.is_success());
+    let records = recording.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "SUCCEEDED");
+    assert!(records[0].get("output").is_none());
+    assert_eq!(recording.flushes.load(Ordering::SeqCst), 1);
+    // The end hook returned no error for the SDK to log.
+    assert_eq!(
+        *subscriber.errors.lock().expect("lock"),
+        Vec::<String>::new()
+    );
+}
+
 #[tokio::test]
 async fn an_excluded_operation_is_absent() {
     let content =
@@ -412,6 +607,59 @@ async fn flaky(_event: Value, ctx: DurableContext) -> Result<u32, BoxError> {
         .retry_strategy(|_err, _attempt| durable::RetryDecision::retry(Duration::from_secs(1)))
         .await?;
     Ok(attempt)
+}
+
+/// Runs the name `work` twice with the step `other` between the two runs.
+/// The first `work` fails and the second succeeds.
+async fn repeated_name(_event: Value, ctx: DurableContext) -> Result<u32, BoxError> {
+    let first = ctx
+        .step(|_| async move { Err::<u32, BoxError>("first run fails".into()) })
+        .name("work")
+        .retry_strategy(|_err, _attempt| durable::RetryDecision::Stop)
+        .await;
+    assert!(first.is_err());
+    ctx.step(|_| async move { Ok(1_u32) }).name("other").await?;
+    let second = ctx.step(|_| async move { Ok(2_u32) }).name("work").await?;
+    Ok(second)
+}
+
+/// The three steps run in one invocation. The local runner's virtual clock
+/// does not move during an invocation. So the three steps have the same
+/// start time, and the start time alone does not order them. The record
+/// lists them in the order they ran, and the summary of the repeated name
+/// reports its last run.
+#[tokio::test]
+async fn operations_with_equal_start_times_keep_the_order_they_ran_in() {
+    let (telemetry, recording) = recorded(DurableExecutionTelemetry::builder());
+    let result = runner(telemetry)
+        .run(repeated_name, json!({}))
+        .await
+        .expect("runner");
+    assert!(result.is_success());
+    let records = recording.records();
+    assert_eq!(records.len(), 1);
+    let operations = records[0]["operations"].as_array().expect("array");
+    let starts: Vec<_> = operations.iter().map(|op| &op["startTime"]).collect();
+    assert!(starts[0].is_string());
+    assert!(
+        starts.iter().all(|start| *start == starts[0]),
+        "the test needs equal start times: {starts:?}"
+    );
+    let ran: Vec<_> = operations
+        .iter()
+        .map(|op| (op["name"].as_str(), op["status"].as_str()))
+        .collect();
+    assert_eq!(
+        ran,
+        [
+            (Some("work"), Some("FAILED")),
+            (Some("other"), Some("SUCCEEDED")),
+            (Some("work"), Some("SUCCEEDED")),
+        ]
+    );
+    let work = &records[0]["operationsByName"]["work"];
+    assert_eq!(work["count"], 2);
+    assert_eq!(work["status"], "SUCCEEDED");
 }
 
 #[tokio::test]

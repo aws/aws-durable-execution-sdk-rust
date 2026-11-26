@@ -238,6 +238,8 @@ struct TelemetryInvocation {
     execution_arn: String,
     arn: ParsedArn,
     start_ms: i64,
+    /// The parsed execution input. `None` when the input setting is
+    /// `Omit`: no record then carries the input, so it is not parsed.
     input: Option<Value>,
     /// The `emittedAt` of the last record, in epoch milliseconds.
     last_emitted_ms: Mutex<Option<i64>>,
@@ -245,13 +247,17 @@ struct TelemetryInvocation {
 
 impl TelemetryInvocation {
     fn new(env: Arc<Environment>, info: &InvocationInfo) -> Self {
+        let input = match env.input {
+            ContentSetting::Omit => None,
+            _ => Some(parse_payload(info.execution_input())),
+        };
         Self {
             env,
             slot: Arc::new(Slot::default()),
             execution_arn: info.execution_arn().to_owned(),
             arn: ParsedArn::parse(info.execution_arn()),
             start_ms: execution_start_ms(info),
-            input: Some(parse_payload(info.execution_input())),
+            input,
             last_emitted_ms: Mutex::new(None),
         }
     }
@@ -311,45 +317,49 @@ impl Plugin for TelemetryInvocation {
         "DurableExecutionTelemetry"
     }
 
-    /// In on-change mode, schedules a `RUNNING` record and starts a task
-    /// that exports it.
+    /// In on-change mode, schedules a `RUNNING` record.
     ///
-    /// Every later hook schedules a newer record before it exports. A
-    /// record that only waited in the slot would always be replaced. So
-    /// this hook starts the export itself. The SDK awaits this hook before
-    /// the handler runs. So the hook does not wait for the export, and the
-    /// handler starts at once. A newer record that is scheduled before the
-    /// task runs replaces this one.
+    /// The scheduler's pump task exports the record. The SDK awaits this
+    /// hook before the handler runs. So the hook does not wait for the
+    /// export, and the handler starts at once. A newer record that is
+    /// scheduled before the pump takes this one replaces it.
     fn on_invocation_start<'a>(&'a self, info: &'a InvocationInfo) -> HookFuture<'a> {
         if self.env.emit_mode == EmitMode::OnChange {
-            self.slot.schedule(self.running_record(info.operations()));
-            self.env.scheduler.spawn_export(&self.slot);
+            self.env
+                .scheduler
+                .schedule(&self.slot, self.running_record(info.operations()));
         }
         Box::pin(std::future::ready(Ok(())))
     }
 
-    /// In on-change mode, schedules a `RUNNING` record and returns the work
-    /// that exports it.
+    /// In on-change mode, schedules a `RUNNING` record. Returns no work.
+    ///
+    /// The SDK runs each returned work on its own task and keeps the task
+    /// until the invocation ends. The scheduler has one pump task for every
+    /// invocation, and that pump exports the scheduled record. So a change
+    /// adds no task. The end hook waits for the export.
     fn on_operation_change(&self, info: &OperationChangeInfo) -> HookWork {
-        if self.env.emit_mode != EmitMode::OnChange {
-            return Ok(None);
+        if self.env.emit_mode == EmitMode::OnChange {
+            self.env
+                .scheduler
+                .schedule(&self.slot, self.running_record(info.operations()));
         }
-        self.slot.schedule(self.running_record(info.operations()));
-        let work = self.env.scheduler.export_pending_owned(&self.slot);
-        Ok(Some(Box::pin(async move {
-            work.await;
-            Ok(())
-        })))
+        Ok(None)
     }
 
     /// Schedules the invocation's final record when the emit mode asks for
-    /// it, then waits until every pending record is exported and flushed.
+    /// it. Then waits until the pump has exported this invocation's record,
+    /// and then until the pump has flushed every exporter.
     ///
     /// | Emit mode | Emits on |
     /// | --- | --- |
     /// | on-change | every invocation end |
     /// | on-complete | `SUCCEEDED` and `FAILED` |
     /// | on-failure | `FAILED` |
+    ///
+    /// A panic while the final record is built schedules no record. The
+    /// hook still waits for the drain and the flush, and then returns an
+    /// error, which the SDK logs at WARN. See [`Scheduler::finish`].
     fn on_invocation_end<'a>(&'a self, info: &'a InvocationEndInfo) -> HookFuture<'a> {
         let status = ExecutionStatus::from_invocation(info.status());
         let emit = match self.env.emit_mode {
@@ -357,20 +367,17 @@ impl Plugin for TelemetryInvocation {
             EmitMode::OnFailure => status == ExecutionStatus::Failed,
             EmitMode::OnComplete => status.is_terminal(),
         };
-        if emit {
-            let record = self.build_record(
+        let build = emit.then_some(|| {
+            self.build_record(
                 status,
                 info.operations(),
                 Some(now_ms()),
                 info.execution_result().map(parse_payload),
                 info.execution_error().map(ErrorRecord::from_wire),
-            );
-            self.slot.schedule(record);
-        }
-        Box::pin(async move {
-            self.env.scheduler.drain(&self.slot).await;
-            Ok(())
-        })
+            )
+        });
+        let finished = self.env.scheduler.finish(&self.slot, build);
+        Box::pin(async move { finished.await.map_err(Into::into) })
     }
 }
 

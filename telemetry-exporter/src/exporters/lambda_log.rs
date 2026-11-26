@@ -2,12 +2,14 @@
 //! log group.
 
 use std::io::Write;
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 use super::DEFAULT_MAX_RECORD_SIZE_BYTES;
 use crate::exporter::{ExportFuture, TelemetryExporter};
 use crate::record::TelemetryRecord;
 use crate::render::{OperationsFormat, render_json};
+#[cfg(test)]
 use crate::scheduler::lock;
 
 /// Where the exporter writes its lines.
@@ -29,8 +31,6 @@ enum Sink {
 pub struct LambdaLogExporter {
     max_record_size_bytes: usize,
     sink: Sink,
-    /// Serializes writes, so two lines never interleave.
-    write_lock: Arc<Mutex<()>>,
 }
 
 impl Default for LambdaLogExporter {
@@ -45,7 +45,6 @@ impl LambdaLogExporter {
         Self {
             max_record_size_bytes: DEFAULT_MAX_RECORD_SIZE_BYTES,
             sink: Sink::Stdout,
-            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -65,9 +64,10 @@ impl LambdaLogExporter {
     }
 
     fn write_line(&self, line: &str) -> std::io::Result<()> {
-        let _guard = lock(&self.write_lock);
         match &self.sink {
             Sink::Stdout => {
+                // The standard output lock is process-wide. It is held for
+                // the write and the flush. So two lines never interleave.
                 let mut out = std::io::stdout().lock();
                 writeln!(out, "{line}")?;
                 out.flush()

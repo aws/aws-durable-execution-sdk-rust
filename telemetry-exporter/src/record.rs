@@ -1,12 +1,14 @@
 //! The telemetry record and the operation records it lists.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::SystemTime;
 
 use aws_durable_execution_sdk::plugin::OperationInfo;
 use aws_durable_execution_sdk::{InvocationStatus, OperationKind, WireError};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::arn::ParsedArn;
 use crate::config::{OperationOverride, apply_transform};
 use crate::timestamp::{epoch_ms, format_iso_ms};
 
@@ -67,6 +69,17 @@ pub struct ErrorRecord {
 }
 
 impl ErrorRecord {
+    /// An error record with the given name and message.
+    ///
+    /// The strings are stored as given. The plugin shortens the errors it
+    /// reports to 8,192 code points. This constructor does not.
+    pub fn new(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            message: message.into(),
+        }
+    }
+
     /// The record of an error the SDK reports.
     ///
     /// The SDK's error carries no cause chain. So the record never has a
@@ -142,6 +155,10 @@ pub struct OperationRecord {
     /// truncation.
     #[serde(skip)]
     pub(crate) start_ms: Option<i64>,
+    /// The operation's [`OperationInfo::sequence`]. It orders operations
+    /// that have the same start time.
+    #[serde(skip)]
+    pub(crate) sequence: Option<u64>,
 }
 
 #[expect(
@@ -153,6 +170,50 @@ pub(crate) fn is_false(value: &bool) -> bool {
 }
 
 impl OperationRecord {
+    /// An operation record with the given wire ID and status.
+    ///
+    /// Every other field is unset. The fields are public, so the caller
+    /// assigns the ones it needs. The start time is the exception: set it
+    /// with [`with_start_time`](Self::with_start_time).
+    ///
+    /// The plugin builds the records it exports. This constructor is for
+    /// code that needs a record without a plugin run, such as the unit
+    /// test of a [`TelemetryExporter`](crate::TelemetryExporter).
+    pub fn new(id: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: None,
+            operation_type: None,
+            sub_type: None,
+            parent_id: None,
+            status: status.into(),
+            start_time: None,
+            end_time: None,
+            duration_ms: None,
+            attempt: None,
+            error: None,
+            result: None,
+            truncated: false,
+            start_ms: None,
+            sequence: None,
+        }
+    }
+
+    /// Sets when the operation started.
+    ///
+    /// [`truncate_record`](crate::truncate_record) drops the operations
+    /// with the oldest start first. It reads the start from a private
+    /// field, not from the `start_time` string. So assigning `start_time`
+    /// alone leaves the operation without a start for truncation, and it
+    /// is dropped last. This method sets both.
+    #[must_use]
+    pub fn with_start_time(mut self, start: SystemTime) -> Self {
+        let start_ms = epoch_ms(start);
+        self.start_time = Some(format_iso_ms(start_ms));
+        self.start_ms = Some(start_ms);
+        self
+    }
+
     /// The record of one operation the SDK reports.
     pub(crate) fn from_info(op: &OperationInfo) -> Self {
         let start_ms = op.start_timestamp().map(epoch_ms);
@@ -176,6 +237,7 @@ impl OperationRecord {
             result: None,
             truncated: false,
             start_ms,
+            sequence: op.sequence(),
         }
     }
 }
@@ -203,11 +265,14 @@ pub(crate) fn parse_payload(raw: &str) -> Value {
 /// 3. In top-level mode, an operation with a parent is skipped.
 /// 4. An operation whose override excludes it is skipped.
 ///
-/// The SDK reports operations keyed by wire ID, which carries no time
-/// order. The records are sorted by start time, oldest first, and an
-/// operation without a start time comes last. Equal start times keep the
-/// wire ID order. So a repeated name's summary reports its latest
-/// occurrence, as the service's own order would.
+/// The SDK reports operations keyed by wire ID. A wire ID is a hash, so
+/// the wire ID order is unrelated to the order the operations ran in. The
+/// records are therefore sorted by start time, oldest first, and an
+/// operation without a start time comes last. Two operations can have the
+/// same start time. Those are sorted by [`OperationInfo::sequence`], which
+/// follows the order the service reported them in. So the last record of a
+/// repeated name is its latest occurrence, and the name's summary reports
+/// the status of that occurrence.
 pub(crate) fn operation_records(
     operations: &BTreeMap<String, OperationInfo>,
     opts: &OperationContentOptions,
@@ -216,7 +281,7 @@ pub(crate) fn operation_records(
         .values()
         .filter_map(|op| operation_record(op, opts))
         .collect();
-    records.sort_by_key(|record| (record.start_ms.is_none(), record.start_ms));
+    records.sort_by_key(|record| (record.start_ms.is_none(), record.start_ms, record.sequence));
     records
 }
 
@@ -301,9 +366,88 @@ pub struct TelemetryRecord {
     pub dropped_output: bool,
 }
 
+impl TelemetryRecord {
+    /// A record of the execution `execution_arn`.
+    ///
+    /// The function name, qualifier, region, account ID and execution
+    /// name come from the ARN, as in a record the plugin builds. A part
+    /// the ARN lacks is the empty string, and a missing execution name is
+    /// `None`. Both times are written as `YYYY-MM-DDTHH:MM:SS.sssZ`.
+    ///
+    /// Every other field is unset: no end time, duration, input, output,
+    /// error or operation, and nothing truncated. The fields are public,
+    /// so the caller assigns the ones it needs.
+    ///
+    /// The plugin builds the records it exports. This constructor is for
+    /// code that needs a record without a plugin run, such as the unit
+    /// test of a [`TelemetryExporter`](crate::TelemetryExporter).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// use aws_durable_execution_sdk_telemetry_exporter::{
+    ///     ErrorRecord, ExecutionStatus, OperationRecord, TelemetryRecord,
+    /// };
+    ///
+    /// let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    /// let mut step = OperationRecord::new("1", "FAILED").with_start_time(start);
+    /// step.name = Some("charge".to_owned());
+    /// step.error = Some(ErrorRecord::new("CardDeclined", "insufficient funds"));
+    ///
+    /// let mut record = TelemetryRecord::new(
+    ///     "arn:aws:lambda:us-west-2:123456789012:function:orders:$LATEST/durable-execution/order-1/inv-1",
+    ///     ExecutionStatus::Failed,
+    ///     start,
+    ///     start + Duration::from_secs(5),
+    /// );
+    /// record.operations.push(step);
+    ///
+    /// assert_eq!(record.function_name, "orders");
+    /// assert_eq!(record.execution_name.as_deref(), Some("order-1"));
+    /// assert_eq!(record.start_time, "2027-01-15T08:00:00.000Z");
+    /// ```
+    pub fn new(
+        execution_arn: impl Into<String>,
+        status: ExecutionStatus,
+        start_time: SystemTime,
+        emitted_at: SystemTime,
+    ) -> Self {
+        let execution_arn = execution_arn.into();
+        let arn = ParsedArn::parse(&execution_arn);
+        Self {
+            record_type: RECORD_TYPE,
+            schema_version: SCHEMA_VERSION,
+            emitted_at: format_iso_ms(epoch_ms(emitted_at)),
+            execution_arn,
+            execution_name: Some(arn.execution_name).filter(|name| !name.is_empty()),
+            function_name: arn.function_name,
+            function_qualifier: arn.qualifier,
+            region: arn.region,
+            account_id: arn.account_id,
+            status,
+            start_time: format_iso_ms(epoch_ms(start_time)),
+            end_time: None,
+            duration_ms: None,
+            input: None,
+            output: None,
+            error: None,
+            operations: Vec::new(),
+            truncated: false,
+            dropped_operations: 0,
+            dropped_input: false,
+            dropped_output: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::{OperationsFormat, render_json, render_value};
+    use crate::timestamp::system_time;
+    use crate::truncation::truncate_record;
 
     #[test]
     fn status_maps_every_invocation_status() {
@@ -370,6 +514,104 @@ mod tests {
         let record = ErrorRecord::from_parts(Some("ValidationError"), Some("bad input"));
         assert_eq!(record.name, "ValidationError");
         assert_eq!(record.message, "bad input");
+    }
+
+    #[test]
+    fn a_new_error_stores_its_strings_as_given() {
+        let long = "a".repeat(MAX_TEXT_LENGTH + 5);
+        let record = ErrorRecord::new("ValidationError", long.clone());
+        assert_eq!(record.name, "ValidationError");
+        assert_eq!(record.message, long);
+    }
+
+    #[test]
+    fn a_new_operation_has_only_its_id_and_status() {
+        let op = OperationRecord::new("1", "SUCCEEDED");
+        assert_eq!(
+            serde_json::to_value(&op).ok(),
+            Some(serde_json::json!({"id": "1", "status": "SUCCEEDED"}))
+        );
+        assert_eq!(op.start_ms, None);
+    }
+
+    #[test]
+    fn with_start_time_sets_the_text_and_the_truncation_start() {
+        let op = OperationRecord::new("1", "STARTED").with_start_time(system_time(1_500));
+        assert_eq!(op.start_time.as_deref(), Some("1970-01-01T00:00:01.500Z"));
+        assert_eq!(op.start_ms, Some(1_500));
+    }
+
+    const ARN: &str = "arn:aws:lambda:us-west-2:123456789012:function:orders:$LATEST/durable-execution/exec-1/inv-1";
+
+    #[test]
+    fn a_new_record_takes_its_identity_from_the_arn() {
+        let record = TelemetryRecord::new(
+            ARN,
+            ExecutionStatus::Running,
+            system_time(1_000),
+            system_time(2_500),
+        );
+        assert_eq!(
+            render_value(&record, OperationsFormat::Array).ok(),
+            Some(serde_json::json!({
+                "recordType": "DurableExecutionTelemetry",
+                "schemaVersion": "1.0",
+                "emittedAt": "1970-01-01T00:00:02.500Z",
+                "executionArn": ARN,
+                "executionName": "exec-1",
+                "functionName": "orders",
+                "functionQualifier": "$LATEST",
+                "region": "us-west-2",
+                "accountId": "123456789012",
+                "status": "RUNNING",
+                "startTime": "1970-01-01T00:00:01.000Z",
+                "operations": [],
+            }))
+        );
+    }
+
+    #[test]
+    fn a_new_record_of_an_arn_without_an_execution_name_has_none() {
+        let record = TelemetryRecord::new(
+            "arn:aws:lambda:us-west-2:123456789012:function:orders",
+            ExecutionStatus::Succeeded,
+            system_time(0),
+            system_time(0),
+        );
+        assert_eq!(record.execution_name, None);
+        assert_eq!(record.function_name, "orders");
+        assert_eq!(record.function_qualifier, "");
+    }
+
+    #[test]
+    fn truncation_drops_the_result_of_the_oldest_constructed_operation() {
+        let result = serde_json::json!("r".repeat(200));
+        let mut late =
+            OperationRecord::new("late", "SUCCEEDED").with_start_time(system_time(2_000));
+        late.name = Some("late".to_owned());
+        late.result = Some(result.clone());
+        let mut early =
+            OperationRecord::new("early", "SUCCEEDED").with_start_time(system_time(1_000));
+        early.name = Some("early".to_owned());
+        early.result = Some(result.clone());
+        let mut record = TelemetryRecord::new(
+            ARN,
+            ExecutionStatus::Succeeded,
+            system_time(0),
+            system_time(3_000),
+        );
+        record.operations = vec![late, early];
+
+        let format = OperationsFormat::Array;
+        let full = render_json(&record, format).map_or(0, |json| json.len());
+        let truncated = truncate_record(&record, Some(full.saturating_sub(100)), format);
+
+        let results: Vec<(&str, bool)> = truncated
+            .operations
+            .iter()
+            .map(|op| (op.id.as_str(), op.result.is_some()))
+            .collect();
+        assert_eq!(results, [("late", true), ("early", false)]);
     }
 
     #[test]

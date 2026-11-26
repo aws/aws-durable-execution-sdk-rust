@@ -1585,6 +1585,7 @@ pub struct OperationInfo {
     attempt: Option<u32>,
     is_replay: bool,
     is_virtual: bool,
+    sequence: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1645,13 +1646,28 @@ impl OperationInfo {
             attempt: (record.attempt > 0).then_some(record.attempt),
             is_replay: false,
             is_virtual: false,
+            sequence: None,
         }
+    }
+
+    /// [`Self::from_record`] with the record's sequence in the checkpoint
+    /// log.
+    pub(crate) fn from_sequenced_record(
+        id: &str,
+        sequence: u64,
+        record: &CheckpointRecord,
+    ) -> Self {
+        let mut info = Self::from_record(id, record);
+        info.sequence = Some(sequence);
+        info
     }
 
     /// Builds the info of an `EXECUTION` operation from its wire fields.
     ///
-    /// Returns `None` unless `type_str` names the `EXECUTION` type. Every
-    /// field not listed is `None` or `false`.
+    /// Returns `None` unless `type_str` names the `EXECUTION` type. The
+    /// sequence is 0: the service reports the `EXECUTION` operation before
+    /// every other operation. Every other field not listed is `None` or
+    /// `false`.
     pub(crate) fn execution(
         id: &str,
         type_str: &str,
@@ -1681,6 +1697,7 @@ impl OperationInfo {
             attempt: None,
             is_replay: false,
             is_virtual: false,
+            sequence: Some(0),
         })
     }
 
@@ -1744,6 +1761,27 @@ impl OperationInfo {
     /// When the operation ended.
     pub fn end_timestamp(&self) -> Option<SystemTime> {
         self.end_timestamp
+    }
+
+    /// The operation's position in the order in which the SDK first
+    /// received the execution's operations from the service.
+    ///
+    /// The SDK numbers an operation when it first receives it. A later
+    /// update to the operation keeps its sequence. So this orders two
+    /// operations of one execution, such as two that share a start
+    /// timestamp. The wire ID is a hash and gives no such order. The
+    /// `EXECUTION` operation has 0.
+    ///
+    /// The sequence follows the order of the service's responses. The SDK
+    /// assumes that the service lists operations in the order it created
+    /// them, and that two operations keep their relative order in every
+    /// invocation. If the service lists them in another order, the
+    /// sequence follows that order.
+    ///
+    /// `None` when the service has not yet reported the operation: an
+    /// operation hook can run before the operation's first checkpoint.
+    pub fn sequence(&self) -> Option<u64> {
+        self.sequence
     }
 
     /// The raw serialized result payload, as recorded.
@@ -1871,7 +1909,9 @@ impl OperationInfo {
         name: Option<&str>,
     ) -> Self {
         let mut info = ctx
-            .with_checkpoint_record_by_wire(wire_id, |record| Self::from_record(wire_id, record))
+            .with_sequenced_checkpoint_record_by_wire(wire_id, |sequence, record| {
+                Self::from_sequenced_record(wire_id, sequence, record)
+            })
             .unwrap_or_else(|| Self {
                 id: wire_id.to_owned(),
                 name: None,
@@ -1888,6 +1928,7 @@ impl OperationInfo {
                 attempt: None,
                 is_replay: false,
                 is_virtual: false,
+                sequence: None,
             });
         info.kind = info.kind.or(Some(kind));
         if info.sub_type.is_none() {
@@ -2235,7 +2276,7 @@ fn wire_error_from_fields(
 /// checkpoint-response merge both skip it. The `EXECUTION` slot of an
 /// operations map comes from the plugins' own slot instead.
 pub(crate) fn operation_infos(log: &CheckpointLog) -> BTreeMap<String, OperationInfo> {
-    log.project_records(OperationInfo::from_record)
+    log.project_records(OperationInfo::from_sequenced_record)
         .into_iter()
         .map(|info| (info.id.clone(), info))
         .collect()
@@ -3711,6 +3752,7 @@ impl OperationInfo {
             attempt: None,
             is_replay: false,
             is_virtual: false,
+            sequence: None,
         }
     }
 }
@@ -5817,6 +5859,48 @@ mod tests {
         );
         let map = operations_map(&log, execution.as_ref());
         assert_eq!(map.keys().collect::<Vec<_>>(), ["e", "s"]);
+    }
+
+    /// Each info of an operations map reports the sequence the log holds
+    /// for its record. The `EXECUTION` info reports 0.
+    #[test]
+    fn operations_map_infos_report_sequences() {
+        let log = CheckpointLog::from_records(vec![
+            ("z".to_owned(), record("STEP", CheckpointStatus::Succeeded)),
+            ("a".to_owned(), record("STEP", CheckpointStatus::Started)),
+        ]);
+        let execution = OperationInfo::execution(
+            "e",
+            "EXECUTION",
+            &CheckpointStatus::Started,
+            None,
+            None,
+            None,
+        );
+        let map = operations_map(&log, execution.as_ref());
+        let sequences: Vec<_> = map
+            .iter()
+            .map(|(id, info)| (id.as_str(), info.sequence()))
+            .collect();
+        assert_eq!(sequences, [("a", Some(2)), ("e", Some(0)), ("z", Some(1))]);
+    }
+
+    /// `for_operation` reports the sequence of the operation's record, and
+    /// `None` for an operation that has no record.
+    #[test]
+    fn for_operation_reports_record_sequence() {
+        let ctx = DurableContext::new_root(
+            String::from("arn"),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(vec![
+                ("v".to_owned(), record("STEP", CheckpointStatus::Started)),
+                ("w".to_owned(), record("STEP", CheckpointStatus::Started)),
+            ])),
+        );
+        let info = |id| OperationInfo::for_operation(&ctx, id, OperationKind::Step, "Pay", None);
+        assert_eq!(info("w").sequence(), Some(2));
+        assert_eq!(info("absent").sequence(), None);
+        assert_eq!(bare_info().sequence(), None);
     }
 
     #[test]
