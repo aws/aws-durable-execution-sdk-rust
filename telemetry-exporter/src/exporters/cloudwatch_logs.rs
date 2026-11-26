@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use aws_durable_execution_sdk::BoxError;
 use aws_sdk_cloudwatchlogs::Client;
-use aws_sdk_cloudwatchlogs::error::SdkError;
+use aws_sdk_cloudwatchlogs::error::{DisplayErrorContext, SdkError};
 use aws_sdk_cloudwatchlogs::operation::create_log_stream::CreateLogStreamError;
 use aws_sdk_cloudwatchlogs::operation::put_log_events::PutLogEventsError;
 use aws_sdk_cloudwatchlogs::types::InputLogEvent;
@@ -104,7 +104,7 @@ impl CloudWatchLogsExporter {
                 .as_service_error()
                 .is_some_and(CreateLogStreamError::is_resource_already_exists_exception);
             if !exists {
-                return Err(error.into());
+                return Err(call_error("CreateLogStream", &error));
             }
         }
         lock(&self.created_streams).insert(stream.to_owned());
@@ -139,10 +139,11 @@ impl CloudWatchLogsExporter {
                 // stream is created again, and the event is resent once.
                 lock(&self.created_streams).remove(&stream);
                 self.ensure_stream(client, &stream).await?;
-                self.put_event(client, &stream, event).await?;
-                Ok(())
+                self.put_event(client, &stream, event)
+                    .await
+                    .map_err(|error| call_error("PutLogEvents", &error))
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(call_error("PutLogEvents", &error)),
         }
     }
 
@@ -166,6 +167,19 @@ impl CloudWatchLogsExporter {
             .map_err(Box::new)?;
         Ok(())
     }
+}
+
+/// The export error for a failed call of `operation`.
+///
+/// The `Display` text of an `SdkError` is a fixed string for each variant,
+/// such as "service error". The service's error code and message are in
+/// the error's sources. The scheduler logs only the `Display` text of an
+/// export error. So the text here includes the sources.
+fn call_error<E>(operation: &str, error: &SdkError<E>) -> BoxError
+where
+    E: std::error::Error + 'static,
+{
+    format!("{operation} failed: {}", DisplayErrorContext(error)).into()
 }
 
 /// Whether `PutLogEvents` failed because the log stream does not exist.
@@ -378,10 +392,21 @@ mod tests {
             .build();
 
         let r = record(Vec::new());
-        assert!(exporter.export(&r).await.is_err());
+        let error = error_text(exporter.export(&r).await);
+        assert!(error.starts_with("CreateLogStream failed: "), "{error}");
+        assert!(error.contains("InvalidParameterException"), "{error}");
         assert!(exporter.export(&r).await.is_err());
         assert_eq!(create.num_calls(), 2);
         assert_eq!(put.num_calls(), 0);
+    }
+
+    /// The text of a failed export's error. A successful export gives an
+    /// empty text, which fails the caller's assertion on the text.
+    fn error_text(result: Result<(), BoxError>) -> String {
+        result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default()
     }
 
     fn stream_not_found() -> PutLogEventsError {
@@ -450,7 +475,9 @@ mod tests {
             .client(client)
             .build();
 
-        assert!(exporter.export(&record(Vec::new())).await.is_err());
+        let error = error_text(exporter.export(&record(Vec::new())).await);
+        assert!(error.starts_with("PutLogEvents failed: "), "{error}");
+        assert!(error.contains("ResourceNotFoundException"), "{error}");
         assert_eq!(create.num_calls(), 2);
         assert_eq!(put.num_calls(), 2);
     }
@@ -469,7 +496,9 @@ mod tests {
             .client(client)
             .build();
 
-        assert!(exporter.export(&record(Vec::new())).await.is_err());
+        let error = error_text(exporter.export(&record(Vec::new())).await);
+        assert!(error.starts_with("PutLogEvents failed: "), "{error}");
+        assert!(error.contains("InvalidParameterException"), "{error}");
         assert_eq!(create.num_calls(), 1);
         assert_eq!(put.num_calls(), 1);
     }
