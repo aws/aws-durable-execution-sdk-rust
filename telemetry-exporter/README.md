@@ -54,6 +54,22 @@ results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
 dropped.
 
+Each size check serializes the whole record. So truncation does not check
+the size after every drop. Each phase binary searches the number of
+results, then the number of operations, to drop. So one truncation
+serializes the record about 2 × log2(n) times for n operations.
+Truncation accepts a size only after it serialized that record. So the
+record never goes over the limit, as long as dropping everything that can
+be dropped makes it fit.
+
+The search assumes that dropping more never makes the record larger. Some
+records break this. So truncation can drop more results and operations
+than the fewest that fit. For example, in the array form, clearing a short
+result such as `true` adds `"truncated":true`, so the record grows. A
+record with one old result of 2,000 bytes and 1,999 results of `true`,
+`1`, `"ok"` or `null` is 1 byte over the limit. Clearing the old result
+alone fits. Truncation clears all 2,000 results and drops 53 operations.
+
 Implement the `TelemetryExporter` trait to send records anywhere else. One
 task that the plugin factory owns makes every export and every flush, one at
 a time. So an exporter never receives two calls at once. An exporter error is
