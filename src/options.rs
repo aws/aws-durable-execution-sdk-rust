@@ -508,6 +508,11 @@ impl OptionsBuilder {
     /// `wait_for_callback`. A step's own semantics wins. The default is
     /// [`StepSemantics::AtLeastOnce`](crate::StepSemantics::AtLeastOnce).
     ///
+    /// Before you set
+    /// [`AtLeastOnceAsync`](crate::StepSemantics::AtLeastOnceAsync) here,
+    /// read its documentation. A step whose result becomes an idempotency
+    /// key for a later step needs its own `AtLeastOnce`.
+    ///
     /// # Examples
     ///
     /// ```

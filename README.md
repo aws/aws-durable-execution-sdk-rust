@@ -593,6 +593,30 @@ not written and the invocation fails.
 retry strategy, so a non-idempotent body never runs twice for the same
 attempt. The strategy sees `StepErrorKind::Interrupted`, and the recorded
 failure carries the error type `StepInterruptedError`.
+`AtLeastOnceAsync` is like `AtLeastOnce`, but the step returns without
+waiting for the service to save its result. So the step has lower latency.
+The SDK sends checkpoints in order and writes every pending checkpoint
+before the invocation ends. If the invocation ends before the save, the step
+runs again on replay. Later steps then run again too, and the step can return
+a different value. So do not use it for a step whose result becomes an
+idempotency key for a later step.
+
+The deprecated names `AtLeastOncePerRetry` and `AtMostOncePerRetry` behave as
+`AtLeastOnce` and `AtMostOnce` and compare equal to them with `==`.
+
+To change the default for every step in the execution, set
+`default_step_semantics`. A step's own `.semantics(...)` still wins:
+
+```rust no_run
+use aws_durable_execution_sdk::{Options, StepSemantics};
+
+let options = Options::builder()
+    .default_step_semantics(StepSemantics::AtLeastOnceAsync)
+    .build()
+    .expect("valid options");
+```
+
+Pass the options to `durable::run_with_options` or `durable::wrap`.
 
 #### Pause after repeated failures (experimental)
 

@@ -212,6 +212,15 @@ pub enum StepSemantics {
     /// and the step runs again on replay, as under
     /// `AtLeastOnce`.
     ///
+    /// On that replay the step can return a different value. The code
+    /// after the step then runs again with the new value, and its earlier
+    /// side effects used the old one. So do not use this mode for a step
+    /// whose result becomes an idempotency key or a client token for a
+    /// later step.
+    ///
+    /// The step still waits for its `START` response before it submits
+    /// `SUCCEED`, as under `AtLeastOnce`.
+    ///
     /// Only the success checkpoint is not awaited. A failed attempt waits
     /// for its `RETRY` or `FAIL` checkpoint, as under
     /// `AtLeastOnce`.

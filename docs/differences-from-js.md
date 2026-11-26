@@ -250,6 +250,30 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Rust language and Decision (2026-10-26): call a fresh clone of the closure for each attempt.
 - **Where:** `src/step.rs`, `StepExecution::run`.
 
+### Deprecated step semantics names
+
+- **JavaScript:** `AtLeastOncePerRetry` and `AtMostOncePerRetry` are deprecated aliases with the same enum values as `AtLeastOnce` and `AtMostOnce`.
+- **Rust:** They are deprecated variants. `==` treats each as equal to its new name, and the SDK compares semantics with `==`. A `match` arm and the `Debug` output still tell them apart.
+- **Why:** A Rust enum cannot give one variant two names.
+- **Decision:** Rust language.
+- **Where:** `src/step.rs`, `StepSemantics` and its `PartialEq`.
+
+### `AtLeastOnceAsync` and the `START` response
+
+- **JavaScript:** An `AtLeastOnceAsync` step awaits neither its `START` nor its `SUCCEED` checkpoint.
+- **Rust:** An `AtLeastOnceAsync` step awaits its `START` response before it submits `SUCCEED`, as every Rust `AtLeastOnce` outcome does. It does not await `SUCCEED`.
+- **Why:** The Rust `AtLeastOnce` step writes its outcome only after `START` is acknowledged. The async mode changes only the `SUCCEED` wait.
+- **Decision:** Same capability in Rust form.
+- **Where:** `src/step.rs`, `StepCore::await_start` and `handle_success`.
+
+### Async steps in an abandoned batch item
+
+- **JavaScript:** An abandoned `map` item or `parallel` branch keeps running new `AtLeastOnceAsync` steps after the batch completes, with no record in the history.
+- **Rust:** The SDK aborts the abandoned item's task and rejects its writes, so an async step does not keep the item running.
+- **Why:** Rust stops an abandoned item whatever the step semantics (see "Items running at early completion").
+- **Decision:** Same capability in Rust form.
+- **Where:** `src/map_parallel.rs`, `produce_batch`; `src/checkpoint_coalescer.rs`, `Admission`.
+
 ### `pause_every` and the backoff
 
 - **JavaScript:** `pauseEvery` is an option of the exponential retry helper only.
