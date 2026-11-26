@@ -804,12 +804,15 @@ impl std::fmt::Display for ExecutionStatus {
 }
 
 impl ExecutionStatus {
-    /// Converts the service's status. A status this enum does not list
+    /// Converts the service's status. A pausing or paused execution has
+    /// not ended, so it maps to `Running`. A status this enum does not list
     /// ended the execution in a way the runner cannot name, so it maps to
     /// `Failed`.
     fn from_wire(status: &WireExecutionStatus) -> Self {
         match status {
-            WireExecutionStatus::Running => Self::Running,
+            WireExecutionStatus::Running
+            | WireExecutionStatus::Pausing
+            | WireExecutionStatus::Paused => Self::Running,
             WireExecutionStatus::Succeeded => Self::Succeeded,
             WireExecutionStatus::TimedOut => Self::TimedOut,
             WireExecutionStatus::Stopped => Self::Stopped,
@@ -2364,6 +2367,11 @@ impl LocalRunner {
     ///   handler's wire error: its type, message, error data and stack
     ///   trace. One that suspends, for example on a callback no reply
     ///   answers, leaves the invoke `Started`.
+    /// - A step of the nested execution can pause it (see
+    ///   [`RetryDecision::with_pause`](crate::RetryDecision::with_pause)).
+    ///   The nested execution then ends suspended, and its next attempt
+    ///   does not run. [`RunHandle::resume`] resumes only the caller's
+    ///   run, so the invoke stays `Started`.
     /// - When the caller's run then ends suspended, because nothing can
     ///   advance, and at least one chained invoke is still `Started`, the
     ///   result's [`error_message`](TestResult::error_message) ends with
@@ -3633,7 +3641,7 @@ impl CloudRunner {
                     let out = with_read_retries(|| api.send_get_durable_execution(&execution_arn))
                         .await
                         .map_err(aws_error)?;
-                    if !matches!(out.status(), WireExecutionStatus::Running) {
+                    if ExecutionStatus::from_wire(out.status()) != ExecutionStatus::Running {
                         break out;
                     }
                     continue;
@@ -4386,6 +4394,15 @@ struct Backend {
     /// Set when a request was answered without a token, and taken by the
     /// runner after the invocation answered `PENDING`.
     withdrew: std::sync::atomic::AtomicBool,
+    /// Set when a backend with its own records accepted a pause. Such a
+    /// backend has no `resume`, so its run ends suspended at the next
+    /// decision between invocations. A top-level run keeps its pause in
+    /// the run state instead.
+    paused: std::sync::atomic::AtomicBool,
+    /// Set by an accepted pause of a backend with its own records, and
+    /// taken by the next checkpoint request, which is answered without a
+    /// token.
+    pause_tokenless: std::sync::atomic::AtomicBool,
     /// Per-call checkpoint plan (in-crate test seam): while non-empty,
     /// each `checkpoint` call pops and obeys the front entry instead of
     /// the counter-based injection (see
@@ -4443,6 +4460,8 @@ impl Backend {
             registered_functions: BTreeSet::new(),
             withdraw_at: None,
             withdrew: std::sync::atomic::AtomicBool::new(false),
+            paused: std::sync::atomic::AtomicBool::new(false),
+            pause_tokenless: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             checkpoint_plan: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -5465,11 +5484,14 @@ impl Backend {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .saturating_add(1);
         let answer = self.checkpoint_counted(updates, records);
-        if self.withdraw_at != Some(number) {
+        let paused = self
+            .pause_tokenless
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if self.withdraw_at != Some(number) && !paused {
             return answer;
         }
-        // `LocalRunner::withdraw_checkpoints_after`: the request is applied,
-        // and its answer carries no token.
+        // `LocalRunner::withdraw_checkpoints_after` or an accepted pause:
+        // the request is applied, and its answer carries no token.
         Box::pin(async move {
             let output = answer.await?;
             self.withdrew
@@ -5537,6 +5559,11 @@ impl Backend {
     /// nested run has no run state and no hold rule, so it never waits.
     async fn between_step(&self, start: &mut bool, invokes_tried: bool) -> BetweenStep {
         let Some(live) = self.live() else {
+            // A paused nested run has no `resume`, so nothing starts its
+            // next invocation.
+            if self.paused.load(std::sync::atomic::Ordering::SeqCst) {
+                return BetweenStep::Stuck;
+            }
             return progress_decision(*start, invokes_tried, || self.advance());
         };
         loop {
@@ -5810,6 +5837,37 @@ impl ExecutionClient for Backend {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let operations = self.build_pruned_operations();
         Box::pin(async move { Ok(GetStateOutput::new(operations, None)) })
+    }
+
+    /// Pauses the run as [`RunHandle::pause`] does, without waiting for
+    /// the calling invocation to end: the next checkpoint of the
+    /// invocation is answered without a token, and the next invocation
+    /// waits for [`RunHandle::resume`]. A nested durable target has no
+    /// `resume`: its next checkpoint is also answered without a token, and
+    /// its run ends suspended, so the caller's invoke stays `Started`.
+    fn pause_execution(
+        &self,
+        _execution_arn: &str,
+        _client_token: &str,
+        _reason: &str,
+    ) -> Option<crate::client::PauseFuture<'_>> {
+        let Some(live) = self.live() else {
+            self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.pause_tokenless
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Some(Box::pin(async { Ok(()) }));
+        };
+        {
+            let mut state = live.lock();
+            state.local.paused = true;
+            if let LocalPhase::Invoking {
+                tokenless_requested,
+            } = &mut state.local.phase
+            {
+                *tokenless_requested = true;
+            }
+        }
+        Some(Box::pin(async { Ok(()) }))
     }
 }
 
@@ -9275,6 +9333,21 @@ mod tests {
                 ExecutionStatus::Stopped,
                 "Stopped",
             ),
+            (
+                WireExecutionStatus::Pausing,
+                ExecutionStatus::Running,
+                "Running",
+            ),
+            (
+                WireExecutionStatus::Paused,
+                ExecutionStatus::Running,
+                "Running",
+            ),
+            (
+                WireExecutionStatus::Deleting,
+                ExecutionStatus::Failed,
+                "Failed",
+            ),
         ];
         for (wire, status, text) in rows {
             assert_eq!(ExecutionStatus::from_wire(&wire), status, "{wire:?}");
@@ -9284,10 +9357,13 @@ mod tests {
             event_family_op_type(Some(&EventType::ChainedInvokeSucceeded)),
             Some(RunnerKind::ChainedInvoke)
         );
-        assert_eq!(
-            event_family_op_type(Some(&EventType::ExecutionStarted)),
-            None
-        );
+        for execution_event in [
+            EventType::ExecutionStarted,
+            EventType::ExecutionPaused,
+            EventType::ExecutionResumed,
+        ] {
+            assert_eq!(event_family_op_type(Some(&execution_event)), None);
+        }
         assert_eq!(event_family_op_type(None), None);
     }
 
@@ -14890,6 +14966,27 @@ mod tests {
                 (4450, m1)
             ]
         );
+    }
+
+    /// A pausing or paused execution has not ended, so the runner keeps
+    /// polling it.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_keeps_polling_a_paused_execution() {
+        let api = Arc::new(
+            FakeApi::new()
+                .with_execution(Ok(execution_output(WireExecutionStatus::Pausing, None)))
+                .with_execution(Ok(execution_output(WireExecutionStatus::Paused, None)))
+                .with_execution(Ok(execution_output(
+                    WireExecutionStatus::Succeeded,
+                    Some("5"),
+                ))),
+        );
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(Arc::clone(&api), Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(api.execution_call_count(), 3);
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
     }
 
     /// A status poll that retries counts once against the poll budget.

@@ -1373,6 +1373,23 @@ impl DurableContext {
         output
     }
 
+    /// Asks the service to pause the execution through
+    /// [`ExecutionClient::pause_execution`], holding an activity permit so
+    /// the invocation does not suspend during the call. `None` when the
+    /// transport cannot pause.
+    pub(crate) async fn pause_execution(
+        &self,
+        client_token: &str,
+        reason: &str,
+    ) -> Option<Result<(), ExecutionClientError>> {
+        let call = self.inner.execution_client.as_ref()?.pause_execution(
+            &self.inner.execution_arn,
+            client_token,
+            reason,
+        )?;
+        Some(self.hold_activity(call).await)
+    }
+
     /// Resolves when the record of `wire_id` satisfies `ready`.
     ///
     /// Registers a wait on its first poll, then reads the record. A missing
@@ -1537,6 +1554,19 @@ impl DurableContext {
         f: impl FnOnce(&CheckpointRecord) -> R,
     ) -> Option<R> {
         self.inner.engine.checkpoint_log.with_record(wire_id, f)
+    }
+
+    /// [`Self::with_checkpoint_record_by_wire`], where `f` also gets the
+    /// record's sequence in the checkpoint log.
+    pub(crate) fn with_sequenced_checkpoint_record_by_wire<R>(
+        &self,
+        wire_id: &str,
+        f: impl FnOnce(u64, &CheckpointRecord) -> R,
+    ) -> Option<R> {
+        self.inner
+            .engine
+            .checkpoint_log
+            .with_sequenced_record(wire_id, f)
     }
 
     /// Returns the compact view (status, attempt,
@@ -2675,8 +2705,8 @@ impl DurableContext {
             .ids
             .iter()
             .filter_map(|id| {
-                log.with_record(id, |record| {
-                    crate::plugin::OperationInfo::from_record(id, record)
+                log.with_sequenced_record(id, |sequence, record| {
+                    crate::plugin::OperationInfo::from_sequenced_record(id, sequence, record)
                 })
             })
             .collect();

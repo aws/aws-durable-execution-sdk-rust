@@ -221,6 +221,24 @@ type GetStateSdkError = aws_sdk_lambda::error::SdkError<
     aws_sdk_lambda::config::http::HttpResponse,
 >;
 
+/// The final error of a `PauseDurableExecution` call.
+type PauseSdkError = aws_sdk_lambda::error::SdkError<
+    aws_sdk_lambda::operation::pause_durable_execution::PauseDurableExecutionError,
+    aws_sdk_lambda::config::http::HttpResponse,
+>;
+
+/// Whether `err` is the `ResourceConflictException` of a
+/// `PauseDurableExecution` call: the execution has closed or is already
+/// paused.
+pub(crate) fn is_pause_conflict(err: &ExecutionClientError) -> bool {
+    use std::error::Error as _;
+
+    err.source()
+        .and_then(|s| s.downcast_ref::<PauseSdkError>())
+        .and_then(aws_sdk_lambda::error::SdkError::as_service_error)
+        .is_some_and(aws_sdk_lambda::operation::pause_durable_execution::PauseDurableExecutionError::is_resource_conflict_exception)
+}
+
 /// The output of a successful [`ExecutionClient::checkpoint`] call.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -287,7 +305,7 @@ impl GetStateOutput {
     }
 }
 
-/// The transport for the two durable execution service calls.
+/// The transport for the durable execution service calls.
 ///
 /// The SDK uses [`LambdaExecutionClient`] unless
 /// [`OptionsBuilder::execution_client`](crate::OptionsBuilder::execution_client)
@@ -341,7 +359,39 @@ pub trait ExecutionClient: Send + Sync {
         checkpoint_token: &str,
         marker: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>;
+
+    /// Asks the service to pause the execution, or returns `None` when this
+    /// transport cannot pause. Experimental: this method may change or be
+    /// removed in a future release.
+    ///
+    /// A step calls it after it saved a `RETRY` whose decision has
+    /// [`pause`](crate::RetryDecision::Retry::pause) set. The call sends
+    /// `PauseDurableExecution` with the execution ARN, `client_token` and
+    /// `reason`, and returns once the service accepted the request.
+    /// `client_token` is 64 lowercase hex characters, the same when an
+    /// attempt runs again and different for every execution and attempt.
+    ///
+    /// The default implementation returns `None`, so the step retries as
+    /// usual. When the call fails, the step logs a warning and retries as
+    /// usual. The warning names a `ResourceConflictException` when the
+    /// error's [`source`](std::error::Error::source) is that AWS SDK error,
+    /// as [`LambdaExecutionClient`] returns it.
+    fn pause_execution(
+        &self,
+        execution_arn: &str,
+        client_token: &str,
+        reason: &str,
+    ) -> Option<PauseFuture<'_>> {
+        let _ = (execution_arn, client_token, reason);
+        None
+    }
 }
+
+/// The future [`ExecutionClient::pause_execution`] returns. A type alias
+/// expands in the trait's signature, so an implementation outside the
+/// crate writes the full type.
+pub(crate) type PauseFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), ExecutionClientError>> + Send + 'a>>;
 
 /// The page size of a `GetDurableExecutionState` request, as in JS.
 const GET_STATE_MAX_ITEMS: i32 = 1000;
@@ -534,6 +584,39 @@ impl ExecutionClient for LambdaExecutionClient {
                 output.next_marker.filter(|m| !m.is_empty()),
             ))
         })
+    }
+
+    /// Sends one `PauseDurableExecution` request. `ExecutionTimeoutPaused`
+    /// keeps the API default. Every final error is `Invocation`-scoped,
+    /// and carries the final `SdkError` as its source.
+    fn pause_execution(
+        &self,
+        execution_arn: &str,
+        client_token: &str,
+        reason: &str,
+    ) -> Option<PauseFuture<'_>> {
+        let request = self
+            .client
+            .pause_durable_execution()
+            .durable_execution_arn(execution_arn)
+            .client_token(client_token)
+            .reason(reason);
+        Some(Box::pin(async move {
+            request
+                .customize()
+                .interceptor(UserAgentTokenInterceptor)
+                .send()
+                .await
+                .map(drop)
+                .map_err(|err| {
+                    let message = format!("{}", aws_sdk_lambda::error::DisplayErrorContext(&err));
+                    ExecutionClientError::with_source(
+                        ExecutionClientErrorScope::Invocation,
+                        message,
+                        err,
+                    )
+                })
+        }))
     }
 }
 
@@ -730,6 +813,9 @@ pub(crate) enum TestResponse {
     /// Accept the request's updates, then return a retryable failure, as
     /// when the service recorded a write whose response was lost.
     AcceptThenRetryableError(String),
+    /// Return success without a checkpoint token, as the service answers
+    /// the first checkpoint after a pause took effect.
+    Tokenless,
 }
 
 /// In-memory test double for `ExecutionClient`.
@@ -757,6 +843,25 @@ pub(crate) struct InMemoryExecutionClient {
     callback_counter: Mutex<u32>,
     /// All operation updates received across checkpoint calls.
     recorded_updates: Mutex<Vec<OperationUpdate>>,
+    /// How `pause_execution` answers. `None`: the transport cannot pause.
+    pause_answer: Mutex<Option<Result<(), ExecutionClientError>>>,
+    /// Every `pause_execution` call.
+    pause_calls: Mutex<Vec<PauseCall>>,
+    /// How long a `pause_execution` call takes, in tokio time.
+    pause_latency: Mutex<std::time::Duration>,
+    /// The number of `pause_execution` calls that returned their answer.
+    pauses_answered: Arc<Mutex<usize>>,
+}
+
+/// One `pause_execution` call that [`InMemoryExecutionClient`] recorded.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PauseCall {
+    pub(crate) execution_arn: String,
+    pub(crate) client_token: String,
+    pub(crate) reason: String,
+    /// The number of updates recorded before the call.
+    pub(crate) updates_before: usize,
 }
 
 #[cfg(test)]
@@ -772,7 +877,44 @@ impl InMemoryExecutionClient {
             token_counter: Mutex::new(0),
             callback_counter: Mutex::new(0),
             recorded_updates: Mutex::new(Vec::new()),
+            pause_answer: Mutex::new(None),
+            pause_calls: Mutex::new(Vec::new()),
+            pause_latency: Mutex::new(std::time::Duration::ZERO),
+            pauses_answered: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Makes every `pause_execution` call take `latency` in tokio time.
+    pub(crate) fn delay_pauses(&self, latency: std::time::Duration) {
+        *self
+            .pause_latency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = latency;
+    }
+
+    /// The number of `pause_execution` calls that returned their answer.
+    pub(crate) fn pauses_answered(&self) -> usize {
+        *self
+            .pauses_answered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Makes `pause_execution` supported, answering every call with
+    /// `answer`.
+    pub(crate) fn answer_pauses(&self, answer: Result<(), ExecutionClientError>) {
+        *self
+            .pause_answer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(answer);
+    }
+
+    /// Returns every `pause_execution` call, in order.
+    pub(crate) fn pause_calls(&self) -> Vec<PauseCall> {
+        self.pause_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Enqueues a response for the next checkpoint call.
@@ -882,6 +1024,7 @@ impl ExecutionClient for InMemoryExecutionClient {
                 Some(TestResponse::NonRetryableError(msg)) => {
                     Err(ExecutionClientError::non_retryable(msg))
                 }
+                Some(TestResponse::Tokenless) => Ok(CheckpointOutput::new(None, Vec::new(), None)),
                 Some(TestResponse::Success(ops)) => {
                     let mut counter = self
                         .token_counter
@@ -953,6 +1096,43 @@ impl ExecutionClient for InMemoryExecutionClient {
             .clone();
 
         Box::pin(async move { Ok(GetStateOutput::new(ops, None)) })
+    }
+
+    fn pause_execution(
+        &self,
+        execution_arn: &str,
+        client_token: &str,
+        reason: &str,
+    ) -> Option<PauseFuture<'_>> {
+        let answer = self
+            .pause_answer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let updates_before = self.recorded_updates().len();
+        self.pause_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PauseCall {
+                execution_arn: execution_arn.to_owned(),
+                client_token: client_token.to_owned(),
+                reason: reason.to_owned(),
+                updates_before,
+            });
+        let latency = *self
+            .pause_latency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let answered = Arc::clone(&self.pauses_answered);
+        Some(Box::pin(async move {
+            if !latency.is_zero() {
+                tokio::time::sleep(latency).await;
+            }
+            *answered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            answer
+        }))
     }
 }
 
@@ -1755,6 +1935,95 @@ mod tests {
             .expect_err("modeled error must fail the call");
         assert!(!err.is_retryable());
         assert_eq!(rule.num_calls(), 1, "a client fault is not retried");
+    }
+
+    /// The Lambda transport sends the ARN, the token and the reason, and
+    /// leaves `ExecutionTimeoutPaused` to the API default.
+    #[tokio::test]
+    async fn pause_sends_arn_token_and_reason() {
+        let rule = mock!(aws_sdk_lambda::Client::pause_durable_execution)
+            .match_requests(|req| {
+                req.durable_execution_arn() == Some("arn:test")
+                    && req.client_token() == Some("tok")
+                    && req.reason() == Some("why")
+                    && req.execution_timeout_paused().is_none()
+            })
+            .then_output(|| {
+                aws_sdk_lambda::operation::pause_durable_execution::PauseDurableExecutionOutput::builder()
+                    .build()
+            });
+        let client = LambdaExecutionClient::new(mock_client!(aws_sdk_lambda, [&rule]));
+        client
+            .pause_execution("arn:test", "tok", "why")
+            .expect("the Lambda transport can pause")
+            .await
+            .expect("the pause succeeds");
+        assert_eq!(rule.num_calls(), 1);
+    }
+
+    /// A failed pause keeps the `SdkError` as its source, so
+    /// `is_pause_conflict` tells a `ResourceConflictException` apart.
+    #[tokio::test]
+    async fn pause_error_keeps_the_conflict_code() {
+        use aws_sdk_lambda::operation::pause_durable_execution::PauseDurableExecutionError as E;
+        let pause_error = |make: fn() -> E| async move {
+            let rule = mock!(aws_sdk_lambda::Client::pause_durable_execution).then_error(make);
+            LambdaExecutionClient::new(mock_client!(aws_sdk_lambda, [&rule]))
+                .pause_execution("arn:test", "tok", "why")
+                .expect("the Lambda transport can pause")
+                .await
+                .expect_err("the pause fails")
+        };
+        let conflict = pause_error(|| {
+            E::ResourceConflictException(
+                aws_sdk_lambda::types::error::ResourceConflictException::builder().build(),
+            )
+        })
+        .await;
+        assert!(is_pause_conflict(&conflict));
+        assert_eq!(conflict.scope(), ExecutionClientErrorScope::Invocation);
+        let other = pause_error(|| {
+            E::InvalidParameterValueException(
+                aws_sdk_lambda::types::error::InvalidParameterValueException::builder().build(),
+            )
+        })
+        .await;
+        assert!(!is_pause_conflict(&other));
+        assert!(!is_pause_conflict(&ExecutionClientError::new(
+            ExecutionClientErrorScope::Invocation,
+            "ResourceConflictException"
+        )));
+    }
+
+    /// A transport that does not implement `pause_execution` cannot pause.
+    #[test]
+    fn default_pause_execution_is_unsupported() {
+        struct NoPause;
+        impl ExecutionClient for NoPause {
+            fn checkpoint(
+                &self,
+                _execution_arn: &str,
+                _checkpoint_token: &str,
+                _updates: Vec<OperationUpdate>,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_,
+                >,
+            > {
+                Box::pin(async { Ok(CheckpointOutput::new(None, Vec::new(), None)) })
+            }
+            fn get_state(
+                &self,
+                _execution_arn: &str,
+                _checkpoint_token: &str,
+                _marker: Option<&str>,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(GetStateOutput::new(Vec::new(), None)) })
+            }
+        }
+        assert!(NoPause.pause_execution("arn", "tok", "why").is_none());
     }
 
     /// The backend reports stale checkpoint tokens as an
@@ -3182,14 +3451,17 @@ mod tests {
                 file: "src/types/_execution_status.rs",
                 enum_name: "ExecutionStatus",
                 variants: &[
+                    "Deleting",
                     "Failed",
+                    "Paused",
+                    "Pausing",
                     "Running",
                     "Stopped",
                     "Succeeded",
                     "TimedOut",
                     "Unknown",
                 ],
-                wildcard_sites: "execution_status_str (src/test_util.rs)",
+                wildcard_sites: "ExecutionStatus::from_wire (src/test_util.rs)",
             },
             Pin {
                 file: "src/types/_event_type.rs",
@@ -3208,6 +3480,8 @@ mod tests {
                     "ContextStarted",
                     "ContextSucceeded",
                     "ExecutionFailed",
+                    "ExecutionPaused",
+                    "ExecutionResumed",
                     "ExecutionStarted",
                     "ExecutionStopped",
                     "ExecutionSucceeded",
@@ -3221,7 +3495,7 @@ mod tests {
                     "WaitStarted",
                     "WaitSucceeded",
                 ],
-                wildcard_sites: "apply_event_to_op and event_op_type (src/test_util.rs)",
+                wildcard_sites: "event_family_op_type (src/test_util.rs)",
             },
         ];
 
@@ -3439,6 +3713,22 @@ mod tests {
             .expect("replayed checkpoint succeeds");
         assert_eq!(output.checkpoint_token(), Some("t-1"));
 
+        let attempts = user_agent_headers(&http);
+        assert_eq!(attempts.len(), 1);
+        for headers in &attempts {
+            assert_one_token(headers);
+        }
+    }
+
+    #[tokio::test]
+    async fn user_agent_token_on_pause() {
+        let http = StaticReplayClient::new(vec![replay_event(200, "{}")]);
+        let client = replay_lambda_client(&http, None);
+        client
+            .pause_execution("arn:test", "tok", "why")
+            .expect("the Lambda transport can pause")
+            .await
+            .expect("replayed pause succeeds");
         let attempts = user_agent_headers(&http);
         assert_eq!(attempts.len(), 1);
         for headers in &attempts {
