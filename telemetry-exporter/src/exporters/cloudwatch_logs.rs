@@ -111,16 +111,24 @@ impl CloudWatchLogsExporter {
         Ok(())
     }
 
-    async fn put(&self, record: &TelemetryRecord) -> Result<(), BoxError> {
-        let message = render_json(record, OperationsFormat::ByName)?;
-        let now = now_ms();
+    /// Writes `record` as a log event with the timestamp `now`, in epoch
+    /// milliseconds. `now` also selects the day's log stream.
+    async fn put(&self, record: &TelemetryRecord, now: i64) -> Result<(), BoxError> {
+        // The scheduler truncated the record to the size of the
+        // `operations_format` rendering. So the same format is rendered here.
+        let message = render_json(record, self.operations_format())?;
         let stream = self.stream_name(now);
         let client = self.client().await;
         self.ensure_stream(client, &stream).await?;
+        #[expect(
+            clippy::expect_used,
+            reason = "build fails only when timestamp or message is missing, and both are set"
+        )]
         let event = InputLogEvent::builder()
             .timestamp(now)
             .message(message)
-            .build()?;
+            .build()
+            .expect("timestamp and message are set");
         match self.put_event(client, &stream, event.clone()).await {
             Ok(()) => Ok(()),
             Err(error) if is_stream_missing(&error) => {
@@ -212,7 +220,7 @@ impl CloudWatchLogsExporterBuilder {
 
 impl TelemetryExporter for CloudWatchLogsExporter {
     fn export<'a>(&'a self, record: &'a TelemetryRecord) -> ExportFuture<'a> {
-        Box::pin(self.put(record))
+        Box::pin(self.put(record, now_ms()))
     }
 
     fn max_record_size_bytes(&self) -> Option<usize> {
@@ -238,6 +246,12 @@ mod tests {
         InvalidParameterException, ResourceAlreadyExistsException, ResourceNotFoundException,
     };
     use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+    /// 2024-02-29T12:00:00Z. A test that sends two records passes this time
+    /// to `put`. With the system clock, the UTC day could change between
+    /// the two records, and the second record would go to a new stream.
+    const NOON_MS: i64 = 1_709_208_000_000;
+    const NOON_STREAM: &str = "durable-execution-telemetry/2024/02/29";
 
     fn today() -> String {
         let day = Civil::from_epoch_ms(now_ms());
@@ -276,21 +290,21 @@ mod tests {
 
     #[tokio::test]
     async fn creates_the_stream_once_and_puts_each_record() {
-        let stream = today();
-        let expected = stream.clone();
         let create = mock!(Client::create_log_stream)
-            .match_requests(move |req| {
-                req.log_group_name() == Some("group") && req.log_stream_name() == Some(&expected)
+            .match_requests(|req| {
+                req.log_group_name() == Some("group") && req.log_stream_name() == Some(NOON_STREAM)
             })
             .then_output(|| CreateLogStreamOutput::builder().build());
-        let expected = stream.clone();
         let put = mock!(Client::put_log_events)
-            .match_requests(move |req| {
-                let message = req.log_events().first().map(InputLogEvent::message);
+            .match_requests(|req| {
+                let event = req.log_events().first();
                 req.log_group_name() == Some("group")
-                    && req.log_stream_name() == Some(&expected)
+                    && req.log_stream_name() == Some(NOON_STREAM)
                     && req.log_events().len() == 1
-                    && message.is_some_and(|m| m.contains("\"operationsByName\":{\"a\""))
+                    && event.is_some_and(|e| {
+                        e.timestamp() == NOON_MS
+                            && e.message().contains("\"operationsByName\":{\"a\"")
+                    })
             })
             .then_output(|| PutLogEventsOutput::builder().build());
         let client = mock_client!(aws_sdk_cloudwatchlogs, RuleMode::MatchAny, [&create, &put]);
@@ -299,10 +313,33 @@ mod tests {
             .build();
 
         let r = record(vec![op("a", "SUCCEEDED")]);
-        assert!(exporter.export(&r).await.is_ok());
-        assert!(exporter.export(&r).await.is_ok());
+        assert!(exporter.put(&r, NOON_MS).await.is_ok());
+        assert!(exporter.put(&r, NOON_MS).await.is_ok());
         assert_eq!(create.num_calls(), 1);
         assert_eq!(put.num_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn export_writes_to_the_stream_of_the_current_utc_day() {
+        // `export` reads the clock after `before` and before the matcher
+        // runs. So its stream is the day of `before` or the day the matcher
+        // computes, also when the test runs across midnight UTC.
+        let before = today();
+        let put = mock!(Client::put_log_events)
+            .match_requests(move |req| {
+                let stream = req.log_stream_name();
+                stream == Some(&before) || stream == Some(&today())
+            })
+            .then_output(|| PutLogEventsOutput::builder().build());
+        let create = mock!(Client::create_log_stream)
+            .then_output(|| CreateLogStreamOutput::builder().build());
+        let client = mock_client!(aws_sdk_cloudwatchlogs, RuleMode::MatchAny, [&create, &put]);
+        let exporter = CloudWatchLogsExporter::builder("group")
+            .client(client)
+            .build();
+
+        assert!(exporter.export(&record(Vec::new())).await.is_ok());
+        assert_eq!(put.num_calls(), 1);
     }
 
     #[tokio::test]
@@ -320,8 +357,8 @@ mod tests {
             .build();
 
         let r = record(Vec::new());
-        assert!(exporter.export(&r).await.is_ok());
-        assert!(exporter.export(&r).await.is_ok());
+        assert!(exporter.put(&r, NOON_MS).await.is_ok());
+        assert!(exporter.put(&r, NOON_MS).await.is_ok());
         assert_eq!(create.num_calls(), 1);
         assert_eq!(put.num_calls(), 2);
     }
@@ -367,9 +404,9 @@ mod tests {
             .build();
 
         let r = record(Vec::new());
-        assert!(exporter.export(&r).await.is_ok());
+        assert!(exporter.put(&r, NOON_MS).await.is_ok());
         // The stream is cached again, so the next record makes no create call.
-        assert!(exporter.export(&r).await.is_ok());
+        assert!(exporter.put(&r, NOON_MS).await.is_ok());
         assert_eq!(create.num_calls(), 2);
         assert_eq!(put.num_calls(), 3);
     }
