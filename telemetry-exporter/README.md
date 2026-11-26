@@ -56,25 +56,25 @@ dropped.
 A result whose JSON has 7 bytes or fewer, such as `true`, `1`, `null` or
 `"ok"`, is small. In the array form, clearing a result replaces
 `"result":<json>` with `"truncated":true`. So clearing a small result
-makes the array form larger. The by-name form writes no marker for an
-operation, so clearing a small result makes it smaller. So when a record
-has small results, truncation serializes it once with every small result
-cleared. When that record is smaller, small results are cleared like the
-others. Otherwise truncation keeps the small results and clears only the
-larger ones.
+usually makes the array form larger. The by-name form writes no marker for
+an operation. So when a record has small results, truncation serializes it
+once with every small result cleared. When that record is smaller, small
+results are cleared like the others. Otherwise truncation keeps the small
+results and clears only the larger ones.
 
 Each size check serializes the whole record. So truncation does not check
-the size after every drop. Each phase binary searches the fewest results,
-then the fewest operations, to drop. So one truncation serializes the
-record about 2 × log2(n) times for n operations. The search assumes that
-dropping more never makes the record larger. The array form keeps this,
-so in the array form truncation drops the fewest parts. The by-name form
-can break this. A name's summary shows a result and an error only when
-one operation has that name. So a drop that leaves one operation with a
-name can make the record larger. So only the by-name form, and the
-by-name part of the both form, can drop a few more old operations than
-the fewest that fit. Truncation accepts a size only after it serialized
-that record. So the record never goes over the limit.
+the size after every drop. Each phase binary searches the number of
+results, then the number of operations, to drop. So one truncation
+serializes the record about 2 × log2(n) times for n operations.
+Truncation accepts a size only after it serialized that record. So the
+record never goes over the limit, as long as dropping everything that can
+be dropped makes it fit.
+
+The search assumes that dropping more never makes the record larger. Some
+records break this. So truncation can drop more results or operations than
+the fewest that fit. For example, a name's summary in the by-name form
+shows a result and an error only when one operation has that name. So a
+drop that leaves one operation with a name can make the record larger.
 
 Implement the `TelemetryExporter` trait to send records anywhere else. One
 task that the plugin factory owns makes every export and every flush, one at

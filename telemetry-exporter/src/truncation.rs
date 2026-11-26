@@ -45,7 +45,8 @@ const RESULT_KEY_SIZE: usize = r#""result":"#.len();
 /// True when the JSON of `result` has more than 7 bytes. In the array form,
 /// clearing a result replaces `"result":<json>` with `"truncated":true`.
 /// So in that form, clearing a result with 7 bytes or fewer, such as
-/// `true` or `"ok"`, makes the record larger and cannot help it fit.
+/// `true` or `"ok"`, makes the record larger, unless the operation is
+/// already marked truncated.
 fn clearing_shrinks(result: &serde_json::Value) -> bool {
     let mut counter = ByteCounter(0);
     serde_json::to_writer(&mut counter, result).is_ok()
@@ -121,14 +122,12 @@ impl Candidate {
 /// true, or `None` when no count it measured fits.
 ///
 /// The search assumes that dropping more never makes the record larger.
-/// The array form keeps this: each cleared result and each dropped
-/// operation makes it smaller. So in the array form the search finds the
-/// fewest drops. The by-name form can break this. A name's summary shows a
-/// result and an error only when one operation has that name. So a drop
-/// that leaves one operation with a name can make the record larger. Then
-/// the by-name form, and the by-name part of the both form, can drop more
-/// than the fewest drops that fit. A count is returned only after `fits`
-/// returned true for it. So the chosen record never goes over the limit.
+/// Some records break this. For example, a name's summary in the by-name
+/// form shows a result and an error only when one operation has that name.
+/// So a drop that leaves one operation with a name can make the record
+/// larger. Then the search can return more than the fewest drops that fit.
+/// A count is returned only after `fits` returned true for it. So the
+/// chosen record never goes over the limit.
 fn first_fit(low: usize, high: usize, mut fits: impl FnMut(usize) -> bool) -> Option<usize> {
     let (mut low, mut high, mut found) = (low, high.saturating_add(1), None);
     while low < high {
@@ -205,11 +204,11 @@ pub fn truncate_record(
 
     // A result with 7 bytes of JSON or fewer is small. In the array form,
     // its operation gets `"truncated":true` when it is cleared, so clearing
-    // it makes the record larger. The by-name form writes no marker for an
-    // operation, so clearing it makes the record smaller. So when small
-    // results exist, one render with all of them cleared decides. When that
-    // render is smaller than the record with none cleared, the small
-    // results are cleared like the others. Otherwise they are kept.
+    // it usually makes the record larger. The by-name form writes no marker
+    // for an operation. So when small results exist, one render with all of
+    // them cleared decides. When that render is smaller than the record with
+    // none cleared, the small results are cleared like the others. Otherwise
+    // they are kept.
     let is_large = |index: &usize| {
         record
             .operations
@@ -239,7 +238,7 @@ pub fn truncate_record(
 
     // Each size check renders the whole record. So one check per dropped
     // part costs time that grows with the square of the operation count.
-    // Each phase therefore binary searches the fewest parts to drop.
+    // Each phase therefore binary searches the number of parts to drop.
     // The search over results starts at one. With no result cleared, the
     // record is the input marked `truncated: true`. The mark does not make
     // it smaller, and the input is already too large. So a count of zero
