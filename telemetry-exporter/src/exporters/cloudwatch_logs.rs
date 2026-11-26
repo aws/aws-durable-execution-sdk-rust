@@ -214,7 +214,29 @@ impl CloudWatchLogsExporterBuilder {
     }
 
     /// Uses `client` instead of building one from the default chain.
-    pub fn client(mut self, client: Client) -> Self {
+    ///
+    /// The parameter type is re-exported at the crate root as
+    /// [`CloudWatchLogsClient`](crate::CloudWatchLogsClient), so callers can
+    /// name it without depending on `aws-sdk-cloudwatchlogs` directly.
+    ///
+    /// # Examples
+    ///
+    /// The SDK crate re-exports the configuration type. So this compiles
+    /// with no direct `aws-config` or `aws-sdk-cloudwatchlogs` dependency:
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk::SdkConfig;
+    /// use aws_durable_execution_sdk_telemetry_exporter::{
+    ///     CloudWatchLogsClient, CloudWatchLogsExporter,
+    /// };
+    ///
+    /// let config = SdkConfig::builder().build();
+    /// let exporter = CloudWatchLogsExporter::builder("my-telemetry-group")
+    ///     .client(CloudWatchLogsClient::new(&config))
+    ///     .build();
+    /// # drop(exporter);
+    /// ```
+    pub fn client(mut self, client: crate::CloudWatchLogsClient) -> Self {
         self.client = Some(client);
         self
     }
