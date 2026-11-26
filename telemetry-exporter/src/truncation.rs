@@ -35,24 +35,6 @@ fn json_size(view: &RecordView<'_>) -> Option<usize> {
     Some(counter.0)
 }
 
-/// The size of `"truncated":true`, which replaces `"result":<json>` when
-/// a result is cleared.
-const CLEARED_SIZE: usize = r#""truncated":true"#.len();
-
-/// The size of `"result":` before a result's JSON.
-const RESULT_KEY_SIZE: usize = r#""result":"#.len();
-
-/// True when the JSON of `result` has more than 7 bytes. In the array form,
-/// clearing a result replaces `"result":<json>` with `"truncated":true`.
-/// So in that form, clearing a result with 7 bytes or fewer, such as
-/// `true` or `"ok"`, makes the record larger, unless the operation is
-/// already marked truncated.
-fn clearing_shrinks(result: &serde_json::Value) -> bool {
-    let mut counter = ByteCounter(0);
-    serde_json::to_writer(&mut counter, result).is_ok()
-        && RESULT_KEY_SIZE.saturating_add(counter.0) > CLEARED_SIZE
-}
-
 /// The operation indices, oldest start time first. An operation without a
 /// start time counts as the newest, so it is dropped last. Equal start
 /// times keep the list order.
@@ -75,11 +57,6 @@ struct Candidate {
 
 impl Candidate {
     fn fits(&self) -> bool {
-        self.size().is_some_and(|size| size <= self.max_bytes)
-    }
-
-    /// The UTF-8 size of the rendered candidate.
-    fn size(&self) -> Option<usize> {
         let operations: Vec<&OperationRecord> = self
             .record
             .operations
@@ -92,7 +69,7 @@ impl Candidate {
             operations: &operations,
             format: self.format,
         };
-        json_size(&view)
+        json_size(&view).is_some_and(|size| size <= self.max_bytes)
     }
 
     /// Clears the results of the first `count` operations in
@@ -150,9 +127,7 @@ fn first_fit(low: usize, high: usize, mut fits: impl FnMut(usize) -> bool) -> Op
 /// function drops parts in this order until the record fits:
 ///
 /// 1. operation results, oldest operation first; each such operation is
-///    marked `truncated: true`. A result whose JSON has 7 bytes or fewer
-///    is kept when clearing such results makes the record larger, as in
-///    the array form;
+///    marked `truncated: true`;
 /// 2. whole operations, oldest first, counted in `droppedOperations`;
 /// 3. the execution input (`droppedInput: true`), then the output
 ///    (`droppedOutput: true`).
@@ -202,58 +177,19 @@ pub fn truncate_record(
         .collect();
     let base = record.dropped_operations;
 
-    // A result with 7 bytes of JSON or fewer is small. In the array form,
-    // its operation gets `"truncated":true` when it is cleared, so clearing
-    // it usually makes the record larger. The by-name form writes no marker
-    // for an operation. So when small results exist, one render with all of
-    // them cleared decides. When that render is smaller than the record with
-    // none cleared, the small results are cleared like the others. Otherwise
-    // they are kept.
-    let is_large = |index: &usize| {
-        record
-            .operations
-            .get(*index)
-            .and_then(|op| op.result.as_ref())
-            .is_some_and(clearing_shrinks)
-    };
-    let small: Vec<usize> = with_results
-        .iter()
-        .copied()
-        .filter(|index| !is_large(index))
-        .collect();
-    let mut fitted = false;
-    let with_results = if small.is_empty() {
-        with_results
-    } else {
-        let none_cleared = candidate.size();
-        fitted = none_cleared.is_some_and(|size| size <= max_bytes);
-        candidate.clear_results(record, &small, small.len());
-        let small_cleared = candidate.size();
-        candidate.clear_results(record, &small, 0);
-        match (small_cleared, none_cleared) {
-            (Some(cleared), Some(none)) if cleared < none => with_results,
-            _ => with_results.into_iter().filter(is_large).collect(),
-        }
-    };
-
     // Each size check renders the whole record. So one check per dropped
     // part costs time that grows with the square of the operation count.
     // Each phase therefore binary searches the number of parts to drop.
-    // The search over results starts at one. With no result cleared, the
-    // record is the input marked `truncated: true`. The mark does not make
-    // it smaller, and the input is already too large. So a count of zero
-    // never fits.
-    let mut dropped_any = false;
-    if !fitted {
-        let cleared = first_fit(1, with_results.len(), |count| {
-            candidate.clear_results(record, &with_results, count);
-            candidate.fits()
-        });
-        fitted = cleared.is_some();
-        let cleared = cleared.unwrap_or(with_results.len());
-        candidate.clear_results(record, &with_results, cleared);
-        dropped_any = cleared > 0;
-    }
+    // With no result cleared, the record is the input marked truncated,
+    // which does not fit. So the search over results starts at one.
+    let cleared = first_fit(1, with_results.len(), |count| {
+        candidate.clear_results(record, &with_results, count);
+        candidate.fits()
+    });
+    let mut fitted = cleared.is_some();
+    let cleared = cleared.unwrap_or(with_results.len());
+    candidate.clear_results(record, &with_results, cleared);
+    let mut dropped_any = cleared > 0;
 
     if !fitted {
         let dropped = first_fit(1, order.len(), |count| {
@@ -548,13 +484,11 @@ mod tests {
     }
 
     /// The truncation before the binary search: it checks the size before
-    /// each dropped part, so it finds the fewest drops in every case. With
-    /// `keep_small`, it keeps each result with 7 bytes of JSON or fewer.
+    /// each dropped part, so it finds the fewest drops in every case.
     fn one_at_a_time(
         r: &TelemetryRecord,
         max_bytes: usize,
         format: OperationsFormat,
-        keep_small: bool,
     ) -> TelemetryRecord {
         let mut candidate = Candidate {
             record: r.clone(),
@@ -569,10 +503,7 @@ mod tests {
                 break;
             }
             if let Some(op) = candidate.record.operations.get_mut(index)
-                && op
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| !keep_small || clearing_shrinks(result))
+                && op.result.is_some()
             {
                 op.result = None;
                 op.truncated = true;
@@ -628,21 +559,8 @@ mod tests {
         }
     }
 
-    /// A random result. Short results, such as `true` and `"ok"`, are common.
-    fn random_result(random: &mut Random) -> serde_json::Value {
-        match random.below(8) {
-            0 => json!(true),
-            1 => json!(1),
-            2 => json!("ok"),
-            3 => serde_json::Value::Null,
-            4 => json!(""),
-            5 => json!(random.below(100_000_000)),
-            _ => json!(random.text(0)),
-        }
-    }
-
-    /// A random record.
-    fn random_record(random: &mut Random) -> TelemetryRecord {
+    /// A random record. Every result has at least `min_result` characters.
+    fn random_record(random: &mut Random, min_result: usize) -> TelemetryRecord {
         const NAMES: [&str; 5] = ["", "same", "q\"uote", "back\\slash", "ünï"];
         let count = 1 + random.below(40);
         let operations = (0..count)
@@ -656,7 +574,7 @@ mod tests {
                 let mut o = timed(&name, start, None);
                 o.id = format!("op-{i}");
                 if random.below(2) == 0 {
-                    o.result = Some(random_result(random));
+                    o.result = Some(json!(random.text(min_result)));
                 }
                 if random.below(4) == 0 {
                     o.error = Some(ErrorRecord {
@@ -683,7 +601,7 @@ mod tests {
     fn random_records_stay_under_the_limit_and_drop_oldest_first() {
         let mut random = Random(0x5eed);
         for _ in 0..300 {
-            let r = random_record(&mut random);
+            let r = random_record(&mut random, 0);
             for format in FORMATS {
                 let full = size(&r, format);
                 let limit = 1 + random.below(full + 50);
@@ -704,25 +622,11 @@ mod tests {
                     .collect();
                 assert_eq!(ids, expected);
 
-                // The cleared results belong to the oldest operations. The
-                // small results take part only when one of them was cleared.
-                let is_cleared = |source: &OperationRecord| {
-                    out.operations
-                        .iter()
-                        .find(|o| o.id == source.id)
-                        .is_some_and(|o| o.result.is_none())
-                };
-                let small_cleared = r.operations.iter().any(|o| {
-                    o.result.as_ref().is_some_and(|v| !clearing_shrinks(v)) && is_cleared(o)
-                });
+                // The cleared results belong to the oldest operations.
                 let cleared: Vec<bool> = order
                     .iter()
                     .filter_map(|&i| r.operations.get(i))
-                    .filter(|o| {
-                        o.result
-                            .as_ref()
-                            .is_some_and(|v| small_cleared || clearing_shrinks(v))
-                    })
+                    .filter(|o| o.result.is_some())
                     .map(|source| {
                         out.operations
                             .iter()
@@ -738,66 +642,19 @@ mod tests {
     #[test]
     fn the_array_form_drops_the_same_parts_as_one_at_a_time() {
         // In the array form, each dropped part makes the record smaller,
-        // because only results that are longer than `"truncated":true` are
-        // cleared. So the binary search finds the fewest drops.
+        // because every result is longer than `"truncated":true`. So the
+        // binary search finds the fewest drops.
         let mut random = Random(0xa77a);
         for _ in 0..300 {
-            let r = random_record(&mut random);
+            let r = random_record(&mut random, 20);
             let format = OperationsFormat::Array;
             let limit = 1 + random.below(size(&r, format) + 50);
             let out = truncate_record(&r, Some(limit), format).into_owned();
-            let expected = one_at_a_time(&r, limit, format, true);
+            let expected = one_at_a_time(&r, limit, format);
             if expected.truncated && size(&r, format) > limit {
                 assert_eq!(out, expected);
             }
         }
-    }
-
-    /// One old result of 2,000 bytes, then 1,999 results of `true`, `1`,
-    /// `"ok"` and `null`.
-    fn one_large_and_many_small_results() -> TelemetryRecord {
-        let mut operations = vec![timed("old", Some(0), Some(&"x".repeat(2_000)))];
-        let small = [json!(true), json!(1), json!("ok"), serde_json::Value::Null];
-        for i in 1..2_000 {
-            let mut o = timed(&format!("step-{i}"), Some(i), None);
-            o.result = small.get(usize::try_from(i).unwrap_or(0) % 4).cloned();
-            operations.push(o);
-        }
-        record(operations)
-    }
-
-    #[test]
-    fn by_name_clears_small_results_like_one_at_a_time() {
-        // The by-name form writes no marker for a cleared result. So
-        // clearing a small result makes it smaller, and the limit needs the
-        // old result and 100 small results cleared.
-        let r = one_large_and_many_small_results();
-        let format = OperationsFormat::ByName;
-        let mut target = r.clone();
-        target.truncated = true;
-        for o in target.operations.iter_mut().take(101) {
-            o.result = None;
-            o.truncated = true;
-        }
-        let limit = size(&target, format);
-        let out = truncate_record(&r, Some(limit), format).into_owned();
-        assert_eq!(out, one_at_a_time(&r, limit, format, false));
-        assert_eq!(out.dropped_operations, 0);
-        assert!(size(&out, format) <= limit);
-    }
-
-    #[test]
-    fn a_large_old_result_is_cleared_and_small_results_are_kept() {
-        // In the array form, clearing the old result saves about 2,000
-        // bytes. Clearing 1,000 small results adds more than 3,000 bytes.
-        let r = one_large_and_many_small_results();
-        let format = OperationsFormat::Array;
-        let limit = size(&r, format) - 1;
-        let out = truncate_record(&r, Some(limit), format).into_owned();
-        assert_eq!(out, one_at_a_time(&r, limit, format, false));
-        assert_eq!(out.operations.iter().filter(|o| o.truncated).count(), 1);
-        assert_eq!(out.dropped_operations, 0);
-        assert!(size(&out, format) <= limit);
     }
 
     #[test]
@@ -841,13 +698,6 @@ mod tests {
     fn first_fit_measures_the_upper_bound() {
         assert_eq!(first_fit(1, 5, |count| count == 5), Some(5));
         assert_eq!(first_fit(1, 5, |_| false), None);
-    }
-
-    #[test]
-    fn clearing_shrinks_only_results_longer_than_seven_bytes() {
-        assert!(!clearing_shrinks(&json!(true)));
-        assert!(!clearing_shrinks(&json!("12345")));
-        assert!(clearing_shrinks(&json!("123456")));
     }
 
     #[test]

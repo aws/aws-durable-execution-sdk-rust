@@ -53,15 +53,6 @@ results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
 dropped.
 
-A result whose JSON has 7 bytes or fewer, such as `true`, `1`, `null` or
-`"ok"`, is small. In the array form, clearing a result replaces
-`"result":<json>` with `"truncated":true`. So clearing a small result
-usually makes the array form larger. The by-name form writes no marker for
-an operation. So when a record has small results, truncation serializes it
-once with every small result cleared. When that record is smaller, small
-results are cleared like the others. Otherwise truncation keeps the small
-results and clears only the larger ones.
-
 Each size check serializes the whole record. So truncation does not check
 the size after every drop. Each phase binary searches the number of
 results, then the number of operations, to drop. So one truncation
@@ -71,10 +62,12 @@ record never goes over the limit, as long as dropping everything that can
 be dropped makes it fit.
 
 The search assumes that dropping more never makes the record larger. Some
-records break this. So truncation can drop more results or operations than
-the fewest that fit. For example, a name's summary in the by-name form
-shows a result and an error only when one operation has that name. So a
-drop that leaves one operation with a name can make the record larger.
+records break this. So truncation can drop more results and operations
+than the fewest that fit. For example, in the array form, clearing a short
+result such as `true` adds `"truncated":true`, so the record grows. A
+record with one old result of 2,000 bytes and 1,999 results of `true`,
+`1`, `"ok"` or `null` is 1 byte over the limit. Clearing the old result
+alone fits. Truncation clears all 2,000 results and drops 53 operations.
 
 Implement the `TelemetryExporter` trait to send records anywhere else. One
 task that the plugin factory owns makes every export and every flush, one at
