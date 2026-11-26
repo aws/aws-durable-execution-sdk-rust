@@ -72,5 +72,12 @@ pub use render::{
 };
 pub use truncation::truncate_record;
 
+// `CloudWatchLogsExporterBuilder::client` takes this type, which another
+// crate defines. Without the re-export, a caller would need a direct
+// dependency on `aws-sdk-cloudwatchlogs` to name it. The caller's version
+// of that crate could then differ from this crate's version. The two
+// `Client` types would not match.
+pub use aws_sdk_cloudwatchlogs::Client as CloudWatchLogsClient;
+
 /// The `tracing` target of every event this crate logs.
 pub(crate) const TARGET: &str = "aws_durable_execution_sdk_telemetry_exporter";
