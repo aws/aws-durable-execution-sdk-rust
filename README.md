@@ -455,6 +455,8 @@ The SDK never installs a subscriber implicitly. `run`, `wrap` and
 
 The SDK makes two durable execution service calls: it checkpoints
 operation updates, and it reads the execution state one page at a time.
+A step whose retry decision asks to pause makes a third call,
+`PauseDurableExecution`.
 By default it makes them through `LambdaExecutionClient`, which wraps an
 `aws-sdk-lambda` client. Implement the `ExecutionClient` trait to send
 them somewhere else, for example to another compute platform or to a test
@@ -472,6 +474,9 @@ invocation.
 together with `lambda_client` or `sdk_config`. To decorate the default
 transport, for example to add metrics, build it with
 `LambdaExecutionClient::new` and wrap it in your own `ExecutionClient`.
+The trait's experimental `pause_execution` method has a default that
+returns `None`, so a wrapper forwards it to the inner transport to keep
+[pausing from a retry decision](#pause-after-repeated-failures-experimental).
 
 ```rust ignore
 let client = durable::LambdaClient::new(&sdk_config);
@@ -588,6 +593,77 @@ not written and the invocation fails.
 retry strategy, so a non-idempotent body never runs twice for the same
 attempt. The strategy sees `StepErrorKind::Interrupted`, and the recorded
 failure carries the error type `StepInterruptedError`.
+
+#### Pause after repeated failures (experimental)
+
+A retry decision can pause the durable execution. When the retry strategy
+returns a `Retry` whose `pause` field is `true`, the step saves its `RETRY`
+as usual. Then the SDK calls the Lambda `PauseDurableExecution` API, and the
+invocation ends with `PENDING`. An operator checks the cause and resumes the
+execution with the Lambda `ResumeDurableExecution` API. The next attempt
+then runs as usual.
+
+`RetryStrategyConfigBuilder::pause_every(n)` pauses on every `n`-th failed
+attempt. `pause_every(5)` pauses after attempts 5, 10, 15 and so on. The
+delay and the jitter stay as configured:
+
+```rust ignore
+let value = ctx
+    .step(|_| async { call_partner().await })
+    .name("call-partner")
+    .retry_strategy_config(
+        RetryStrategyConfig::builder()
+            .max_attempts(20)
+            .initial_delay(Duration::from_secs(60))
+            .pause_every(5)
+            .build(),
+    )
+    .await?;
+```
+
+A custom strategy sets the field with `RetryDecision::with_pause`. This one
+pauses after attempt 5 only when the body failed with `PartnerUnavailable`:
+
+```rust ignore
+let value = ctx
+    .step(|_| async { call_partner().await })
+    .name("call-partner")
+    .retry_strategy(|err, attempt| {
+        if attempt >= 20 {
+            return RetryDecision::Stop;
+        }
+        let partner_down = err
+            .source()
+            .and_then(|e| e.downcast_ref::<PartnerUnavailable>())
+            .is_some();
+        RetryDecision::retry(Duration::from_secs(60)).with_pause(attempt == 5 && partner_down)
+    })
+    .await?;
+```
+
+- The pause does not change how many attempts run. A `Stop` never pauses.
+- Only a body that failed in the current invocation pauses, including the
+  submitter of `wait_for_callback`. An interrupted `AtMostOncePerRetry`
+  attempt retries without a pause. A `with_retry` block ignores `pause`.
+- After the service accepts the pause, the step runs no further attempt in
+  the invocation, even when other work keeps the invocation running past the
+  retry delay.
+- Steps in other `map` or `parallel` branches keep running. Once the pause
+  takes effect, Lambda saves the next checkpoint of the invocation and
+  answers it without a checkpoint token. The SDK then sends no further
+  checkpoint, and the invocation ends with `PENDING`. Work whose result was
+  not saved runs again after the resume. A step in a branch that a finished
+  `map` or `parallel` no longer waits for does not pause the execution.
+- Give the function's execution role `lambda:PauseDurableExecution` on its
+  own durable executions. If the function uses a customer managed AWS KMS
+  key, the role also needs `kms:Decrypt` on that key, as the
+  [Lambda pause and resume prerequisites](https://docs.aws.amazon.com/lambda/latest/dg/durable-pause-resume.html)
+  require. If the pause call fails, the SDK logs a warning with the error and
+  the step retries as usual. A missing permission is one possible cause.
+- A custom `ExecutionClient` pauses only when it implements
+  `pause_execution`. Without it, the step retries as usual.
+- This feature is experimental. It may change or be removed in a future
+  release.
 
 A step records the error its body returns. An unwrapped error records the
 type `Error`, because Rust erases the concrete type when the error is

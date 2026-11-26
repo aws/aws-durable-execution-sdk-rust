@@ -1,5 +1,7 @@
 //! The identity fields of an execution ARN, and the sampling decision.
 
+use crate::contain::log_contained;
+
 /// The fields of a durable execution ARN that a record carries.
 ///
 /// The ARN format is
@@ -65,20 +67,29 @@ pub(crate) fn should_sample(execution_arn: &str, rate: f64) -> bool {
 ///
 /// A configuration error must not stop the telemetry. So a NaN rate becomes
 /// `1.0` and a rate outside `[0, 1]` is clamped. Each case logs a warning.
+///
+/// The builder calls this from `build()`, which the application calls in
+/// its setup code. A panic in the application's `tracing` subscriber would
+/// leave `build()` and fail that setup. So each warning is logged through
+/// `log_contained`.
 pub(crate) fn resolve_sampling_rate(rate: f64) -> f64 {
     if rate.is_nan() {
-        tracing::warn!(
-            target: crate::TARGET,
-            "samplingRate is not a number; defaulting to 1.0 (all executions)"
-        );
+        log_contained(|| {
+            tracing::warn!(
+                target: crate::TARGET,
+                "samplingRate is not a number; defaulting to 1.0 (all executions)"
+            );
+        });
         return 1.0;
     }
     if !(0.0..=1.0).contains(&rate) {
         let clamped = rate.clamp(0.0, 1.0);
-        tracing::warn!(
-            target: crate::TARGET,
-            "samplingRate {rate} is out of range [0, 1]; clamping to {clamped}"
-        );
+        log_contained(|| {
+            tracing::warn!(
+                target: crate::TARGET,
+                "samplingRate {rate} is out of range [0, 1]; clamping to {clamped}"
+            );
+        });
         return clamped;
     }
     rate
@@ -87,6 +98,9 @@ pub(crate) fn resolve_sampling_rate(rate: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contain::tests::PanicsOnEvent;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const ARN: &str = "arn:aws:lambda:us-west-2:123456789012:function:my-fn:$LATEST/durable-execution/exec-1/inv-1";
 
@@ -177,5 +191,14 @@ mod tests {
     #[test]
     fn resolve_defaults_nan_to_one() {
         assert!((resolve_sampling_rate(f64::NAN) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_subscriber_that_panics_on_the_rate_warning_keeps_the_resolved_rate() {
+        let events = Arc::new(AtomicUsize::new(0));
+        let _subscriber = test_tracing::install_test_subscriber(PanicsOnEvent(events.clone()));
+        assert!((resolve_sampling_rate(f64::NAN) - 1.0).abs() < f64::EPSILON);
+        assert!((resolve_sampling_rate(1.5) - 1.0).abs() < f64::EPSILON);
+        assert_eq!(events.load(Ordering::SeqCst), 2);
     }
 }

@@ -72,4 +72,7 @@ aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = [
     "test-util",
 ] }
 aws-smithy-mocks = "0.3"
+# Installs a test's tracing subscriber so that it receives an event
+# whichever thread reached the event's callsite first.
+test-tracing = { path = "../test-support/test-tracing" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

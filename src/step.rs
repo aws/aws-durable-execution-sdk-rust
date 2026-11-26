@@ -53,7 +53,8 @@ impl RetryStrategyConfig {
     /// capped at `max_delay`, jittered per the configured
     /// [`JitterStrategy`], and rounded to the nearest whole second with a
     /// one-second minimum for every jitter mode (see [`quantize_delay`]).
-    /// Stops once `attempt` reaches `max_attempts`.
+    /// Stops once `attempt` reaches `max_attempts`. A retry pauses when
+    /// `pause_every` is set and `attempt` is a multiple of it.
     pub(crate) fn decide(&self, err: &StepError, attempt: u32) -> RetryDecision {
         if attempt >= self.max_attempts() {
             return RetryDecision::Stop;
@@ -87,7 +88,12 @@ impl RetryStrategyConfig {
             JitterStrategy::Full => rand_full_jitter(base),
         };
 
-        RetryDecision::retry(quantize_delay(jittered))
+        // `checked_rem` makes `pause_every(0)` never pause instead of
+        // panicking.
+        let pause = self
+            .pause_every()
+            .is_some_and(|n| attempt.checked_rem(n) == Some(0));
+        RetryDecision::retry(quantize_delay(jittered)).with_pause(pause)
     }
 
     /// Converts this configuration into the boxed retry-strategy closure
@@ -338,6 +344,20 @@ where
                     match core.settle(attempt, ran).await? {
                         StepSettled::Done(value) => return Ok(value),
                         StepSettled::Retry => {}
+                        StepSettled::Paused => {
+                            // The service accepted the pause, but it can
+                            // still report the step READY until it has
+                            // processed the pause. So the step ignores
+                            // READY and waits only for a terminal status.
+                            // The wait stays registered: once no other SDK
+                            // work runs, the invocation suspends PENDING,
+                            // and the next attempt runs after the resume.
+                            core.ctx
+                                .wait_for_record(core.op_id.wire(), CheckpointStatus::is_terminal)
+                                .await;
+                            resumed = true;
+                            continue;
+                        }
                     }
                 }
             }
@@ -408,6 +428,10 @@ enum StepSettled<O> {
     Done(O),
     /// A `RETRY` was checkpointed: the next cycle waits for its timer.
     Retry,
+    /// A `RETRY` was checkpointed and the service accepted the pause: the
+    /// step waits only for a terminal status, so it runs no further
+    /// attempt in this invocation.
+    Paused,
 }
 
 impl<O, S> StepCore<O, S>
@@ -611,6 +635,8 @@ where
                     attempt,
                 )
                 .await?;
+                // An interrupted attempt never pauses, so the step waits
+                // for the retry timer as usual.
                 Ok(StepPrelude::Wait)
             }
             CheckpointStatus::Unknown(ref raw) => {
@@ -707,20 +733,21 @@ where
             )
             .await
             .map(StepSettled::Done),
-            Err((err, wire)) => {
-                handle_failure(
-                    &self.ctx,
-                    wire_id,
-                    self.name.as_deref(),
-                    self.sub_type.as_str(),
-                    self.plugin_name.as_deref(),
-                    self.retry_strategy.as_ref(),
-                    (StepError::execution_failed(err), wire),
-                    attempt,
-                )
-                .await?;
-                Ok(StepSettled::Retry)
-            }
+            Err((err, wire)) => handle_failure(
+                &self.ctx,
+                wire_id,
+                self.name.as_deref(),
+                self.sub_type.as_str(),
+                self.plugin_name.as_deref(),
+                self.retry_strategy.as_ref(),
+                (StepError::execution_failed(err), wire),
+                attempt,
+            )
+            .await
+            .map(|retry| match retry {
+                RetryRecorded::Paused => StepSettled::Paused,
+                RetryRecorded::NotPaused => StepSettled::Retry,
+            }),
         }
     }
 }
@@ -850,8 +877,9 @@ async fn handle_success<O, S: Serdes<O>>(
 /// strategy sees `step_err`, and the step returns it when the strategy
 /// stops.
 ///
-/// Returns `Ok(())` once a `RETRY` is recorded: the caller then waits for
-/// the retry timer. Returns the step error once a `FAIL` is recorded.
+/// Returns `Ok` once a `RETRY` is recorded: the caller then waits for the
+/// retry timer, or, after an accepted pause, for a terminal status only.
+/// Returns the step error once a `FAIL` is recorded.
 #[expect(clippy::too_many_arguments)] // reason: the subtype joins the inputs every outcome update needs
 async fn handle_failure(
     ctx: &DurableContext,
@@ -862,7 +890,7 @@ async fn handle_failure(
     retry_strategy: Option<&RetryStrategy>,
     (step_err, wire): (StepError, crate::error::WireError),
     attempt: u32,
-) -> Result<(), OperationError> {
+) -> Result<RetryRecorded, OperationError> {
     // `wire` is the failure record derived once for the error: by the runner
     // for a live attempt, by `interrupted_failure` for an interrupted one.
     // The RETRY or FAIL record and the attempt-end hooks all use it.
@@ -898,7 +926,7 @@ async fn handle_failure(
     };
 
     match decision {
-        RetryDecision::Retry { delay } => {
+        RetryDecision::Retry { delay, pause } => {
             // Checkpoint RETRY with delay. Round fractional delays UP so the
             // retry never fires earlier than requested (1.9s -> 2s), enforce
             // a 1-second minimum, and clamp to i32::MAX.
@@ -914,11 +942,27 @@ async fn handle_failure(
                 &wire,
                 delay_secs,
             );
+            // The RETRY is saved before the pause is requested. A RETRY
+            // that the service answers without a token, or that is dropped
+            // for a finished ancestor, never resolves, so no pause is
+            // requested.
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
                 return ctx.checkpoint_failure_unrecoverable(client_err).await;
             }
             attempt_ended(crate::OperationStatus::Pending, false);
-            Ok(())
+            // Only a body that failed in this invocation pauses. After an
+            // accepted pause, the caller waits for a terminal status only:
+            // the invocation suspends once no other SDK work runs, and the
+            // service holds the next invocation until the execution is
+            // resumed. A failed or unsupported pause waits for the retry as
+            // usual.
+            if pause
+                && !matches!(step_err.kind(), StepErrorKind::Interrupted)
+                && request_pause(ctx, wire_id, name, attempt).await
+            {
+                return Ok(RetryRecorded::Paused);
+            }
+            Ok(RetryRecorded::NotPaused)
         }
         RetryDecision::Stop => {
             // Checkpoint FAIL (permanent).
@@ -937,6 +981,74 @@ async fn handle_failure(
                     .with_wire(wire),
             )
         }
+    }
+}
+
+/// How [`handle_failure`] ended once it recorded a `RETRY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryRecorded {
+    /// The service accepted the pause request.
+    Paused,
+    /// No pause was requested, the transport cannot pause, or the pause
+    /// call failed.
+    NotPaused,
+}
+
+/// The `ClientToken` of the pause after the failed `attempt` of the step
+/// `wire_id`: the SHA-256 of `pause:<execution ARN>:<wire ID>:<attempt>`,
+/// as 64 lowercase hex characters. It is the same when the attempt runs
+/// again, and differs across executions and attempts.
+fn pause_client_token(execution_arn: &str, wire_id: &str, attempt: u32) -> String {
+    crate::engine::compute_wire_id_public(&format!("pause:{execution_arn}:{wire_id}:{attempt}"))
+}
+
+/// The message of the warning a failed pause call logs.
+fn pause_failure_warning(
+    label: &str,
+    attempt: u32,
+    err: &crate::client::ExecutionClientError,
+) -> String {
+    let cause = if crate::client::is_pause_conflict(err) {
+        "The execution has closed (for example, stopped) or is already paused."
+    } else {
+        "One possible cause is that the execution role does not allow \
+         lambda:PauseDurableExecution."
+    };
+    format!(
+        "Could not pause the execution after step \"{label}\" failed attempt {attempt}: {err}. \
+         The step retries as usual. {cause}"
+    )
+}
+
+/// Asks the service to pause the execution after the failed `attempt` of
+/// the step `wire_id`, and returns whether the service accepted it. A
+/// transport without pause support or a failed call returns `false` and
+/// leaves the normal retry in place; a failed call logs a warning.
+///
+/// The reason names the step, or its wire ID when it has no name. The
+/// service accepts a step name of at most 256 characters in the `RETRY`
+/// saved before this call, so the reason stays under the 1024-character
+/// limit.
+async fn request_pause(
+    ctx: &DurableContext,
+    wire_id: &str,
+    name: Option<&str>,
+    attempt: u32,
+) -> bool {
+    let label = name.unwrap_or(wire_id);
+    let token = pause_client_token(ctx.execution_arn(), wire_id, attempt);
+    let reason = format!("Step \"{label}\" failed attempt {attempt}");
+    match ctx.pause_execution(&token, &reason).await {
+        Some(Ok(())) => true,
+        Some(Err(err)) => {
+            tracing::warn!(
+                operation_id = %wire_id,
+                "{}",
+                pause_failure_warning(label, attempt, &err)
+            );
+            false
+        }
+        None => false,
     }
 }
 
@@ -1358,7 +1470,7 @@ mod tests {
         let err = StepError::new(StepErrorKind::ExecutionFailed, Some("fail".into()));
         let decision = strategy(&err, 1);
         match decision {
-            RetryDecision::Retry { delay } => {
+            RetryDecision::Retry { delay, .. } => {
                 // With full jitter on 5s base, delay should be 1-5s.
                 assert!(delay.as_secs() >= 1);
                 assert!(delay.as_secs() <= 5);
@@ -1375,7 +1487,7 @@ mod tests {
         let err = StepError::new(StepErrorKind::ExecutionFailed, Some("fail".into()));
         let decision = strategy(&err, 5);
         match decision {
-            RetryDecision::Retry { delay } => {
+            RetryDecision::Retry { delay, .. } => {
                 // Max possible is 60s.
                 assert!(delay.as_secs() <= 60);
                 assert!(delay.as_secs() >= 1);
@@ -2271,7 +2383,7 @@ mod tests {
     }
 
     /// Builds a step record for the first operation of a root context.
-    fn step_record(
+    pub(super) fn step_record(
         status: CheckpointStatus,
         attempt: u32,
         error: Option<&crate::error::WireError>,
@@ -3214,7 +3326,7 @@ mod tests {
     /// Extracts the retry delay in whole seconds, panicking on `Stop`.
     fn retry_secs(decision: &RetryDecision) -> u64 {
         match decision {
-            RetryDecision::Retry { delay } => delay.as_secs(),
+            RetryDecision::Retry { delay, .. } => delay.as_secs(),
             RetryDecision::Stop => panic!("expected Retry, got Stop"),
         }
     }
@@ -4135,6 +4247,95 @@ mod coordinator_tests {
             .build()
             .expect("all required fields set")
     }
+
+    /// A [`RefreshClient`] that accepts every pause call and counts them.
+    /// The service has not processed the pause yet, so it keeps answering
+    /// checkpoints with a token and reports the retried step `READY`.
+    struct PausingRefresh(RefreshClient, Mutex<u32>);
+
+    type ClientFuture<'a, T> = std::pin::Pin<
+        Box<dyn Future<Output = Result<T, crate::client::ExecutionClientError>> + Send + 'a>,
+    >;
+
+    impl crate::client::ExecutionClient for PausingRefresh {
+        fn checkpoint(
+            &self,
+            arn: &str,
+            token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> ClientFuture<'_, crate::client::CheckpointOutput> {
+            self.0.checkpoint(arn, token, updates)
+        }
+
+        fn get_state(
+            &self,
+            arn: &str,
+            token: &str,
+            marker: Option<&str>,
+        ) -> ClientFuture<'_, crate::client::GetStateOutput> {
+            self.0.get_state(arn, token, marker)
+        }
+
+        fn pause_execution(
+            &self,
+            _arn: &str,
+            _client_token: &str,
+            _reason: &str,
+        ) -> Option<crate::client::PauseFuture<'_>> {
+            *self.1.lock().expect("lock") += 1;
+            Some(Box::pin(async { Ok(()) }))
+        }
+    }
+
+    /// A step that paused runs no further attempt in the invocation, even
+    /// when another branch keeps the invocation running past the retry
+    /// delay and the service still reports the step `READY`. The other
+    /// branch runs to its checkpoint, and the invocation ends `PENDING`.
+    #[tokio::test(start_paused = true)]
+    async fn paused_step_does_not_run_again_in_the_same_invocation() {
+        let client = Arc::new(PausingRefresh(retry_client("flaky"), Mutex::new(0)));
+        let ctx = crate::DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+        );
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let body_attempts = Arc::clone(&attempts);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let mut flaky = std::pin::pin!(
+                ctx.step(move |step_ctx| {
+                    let attempts = Arc::clone(&body_attempts);
+                    async move {
+                        attempts.lock().expect("lock").push(step_ctx.attempt());
+                        if step_ctx.attempt() < 2 {
+                            return Err::<u32, crate::BoxError>("transient".into());
+                        }
+                        Ok(7)
+                    }
+                })
+                .name("flaky")
+                .retry_strategy(|_err: &crate::StepError, attempt: u32| {
+                    if attempt < 2 {
+                        crate::RetryDecision::retry(secs(1)).with_pause(true)
+                    } else {
+                        crate::RetryDecision::Stop
+                    }
+                })
+                .spawn()
+            );
+            poll_once(flaky.as_mut()).await;
+            sleeping_step(&ctx).await?;
+            let value = flaky.await.map_err(wire_err)?;
+            Ok(value.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(*client.1.lock().expect("lock"), 1, "one pause call");
+        assert_eq!(*attempts.lock().expect("lock"), vec![1]);
+        assert_eq!(outcome, InvocationOutcome::Pending);
+    }
 }
 
 /// When an attempt's body runs relative to its `START` write. Every test
@@ -4403,5 +4604,456 @@ mod start_write_tests {
         })
         .await;
         assert_start_kept(&client, &ctx, result, client.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    //! Pausing the execution from a retry decision.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aws_sdk_lambda::types::OperationAction;
+
+    use super::*;
+    use crate::client::{
+        ExecutionClientErrorScope, InMemoryExecutionClient, PauseCall, TestResponse,
+    };
+    use crate::driver::InvocationOutcome;
+    use crate::engine::CheckpointLog;
+
+    /// A root context over `client` with `records`.
+    fn context(
+        client: &Arc<InMemoryExecutionClient>,
+        records: Vec<(String, crate::engine::CheckpointRecord)>,
+    ) -> DurableContext {
+        DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(records)),
+            Arc::clone(client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        )
+    }
+
+    /// A client that answers every pause with `answer`.
+    fn pausing_client(
+        answer: Result<(), crate::client::ExecutionClientError>,
+    ) -> Arc<InMemoryExecutionClient> {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        client.answer_pauses(answer);
+        client
+    }
+
+    /// Drives one invocation of a step named `s` whose body always fails,
+    /// with `strategy`, and returns its outcome.
+    async fn drive_failing_step<R>(ctx: &DurableContext, strategy: R) -> InvocationOutcome
+    where
+        R: Fn(&StepError, u32) -> RetryDecision + Send + Sync + 'static,
+    {
+        let step = ctx
+            .step(|_| async { Err::<u32, BoxError>("down".into()) })
+            .name("s")
+            .semantics(StepSemantics::AtMostOncePerRetry)
+            .retry_strategy(strategy);
+        let signal = Arc::clone(ctx.coordinator());
+        let ownership = Arc::clone(ctx.task_ownership());
+        crate::driver::test_support::outcome_of(ctx.clone(), ownership, signal, step).await
+    }
+
+    fn pause_on(_err: &StepError, _attempt: u32) -> RetryDecision {
+        RetryDecision::retry(Duration::from_secs(1)).with_pause(true)
+    }
+
+    fn actions(client: &InMemoryExecutionClient) -> Vec<OperationAction> {
+        client
+            .recorded_updates()
+            .iter()
+            .map(|u| u.action().clone())
+            .collect()
+    }
+
+    /// A decision with `pause` set saves the RETRY, then pauses once with
+    /// the step's token and reason, and the invocation ends `PENDING`.
+    #[tokio::test]
+    async fn retry_with_pause_saves_retry_then_pauses() {
+        let client = pausing_client(Ok(()));
+        let ctx = context(&client, Vec::new());
+        assert_eq!(
+            drive_failing_step(&ctx, pause_on).await,
+            InvocationOutcome::Pending
+        );
+        assert_eq!(
+            actions(&client),
+            [OperationAction::Start, OperationAction::Retry]
+        );
+        let wire_id = crate::engine::compute_wire_id_public("1");
+        assert_eq!(
+            client.pause_calls(),
+            [PauseCall {
+                execution_arn: "arn:test".to_owned(),
+                client_token: pause_client_token("arn:test", &wire_id, 1),
+                reason: "Step \"s\" failed attempt 1".to_owned(),
+                updates_before: 2,
+            }],
+            "one pause, after START and RETRY were saved"
+        );
+    }
+
+    /// The invocation does not suspend while the pause call runs, even when
+    /// another operation waits on the service.
+    #[tokio::test(start_paused = true)]
+    async fn invocation_does_not_suspend_during_the_pause_call() {
+        let client = pausing_client(Ok(()));
+        client.delay_pauses(Duration::from_secs(5));
+        let ctx = context(&client, Vec::new());
+        let handler_ctx = ctx.clone();
+        let handler = async move {
+            let wait = handler_ctx.wait(Duration::from_secs(60)).name("w").spawn();
+            let step = handler_ctx
+                .step(|_| async { Err::<u32, BoxError>("down".into()) })
+                .name("s")
+                .semantics(StepSemantics::AtMostOncePerRetry)
+                .retry_strategy(pause_on)
+                .await;
+            wait.await?;
+            step
+        };
+        let signal = Arc::clone(ctx.coordinator());
+        let ownership = Arc::clone(ctx.task_ownership());
+        let outcome =
+            crate::driver::test_support::outcome_of(ctx.clone(), ownership, signal, handler).await;
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert_eq!(client.pause_calls().len(), 1);
+        assert_eq!(client.pauses_answered(), 1, "the pause call finished");
+    }
+
+    /// An unnamed step names its wire ID in the reason.
+    #[tokio::test]
+    async fn unnamed_step_reason_names_the_wire_id() {
+        let client = pausing_client(Ok(()));
+        let ctx = context(&client, Vec::new());
+        let step = ctx
+            .step(|_| async { Err::<u32, BoxError>("down".into()) })
+            .retry_strategy(pause_on);
+        let signal = Arc::clone(ctx.coordinator());
+        let ownership = Arc::clone(ctx.task_ownership());
+        crate::driver::test_support::outcome_of(ctx.clone(), ownership, signal, step).await;
+        let wire_id = crate::engine::compute_wire_id_public("1");
+        let reasons: Vec<String> = client.pause_calls().into_iter().map(|c| c.reason).collect();
+        assert_eq!(reasons, [format!("Step \"{wire_id}\" failed attempt 1")]);
+    }
+
+    /// The submitter step of `wait_for_callback` honors `pause`. It is
+    /// unnamed, so the reason names its wire ID.
+    #[tokio::test]
+    async fn wait_for_callback_submitter_pauses() {
+        let client = pausing_client(Ok(()));
+        let ctx = context(&client, Vec::new());
+        let callback = ctx
+            .wait_for_callback::<String>(|_step_ctx, _callback_id| async {
+                Err::<(), BoxError>("down".into())
+            })
+            .name("cb")
+            .submitter_retry(pause_on);
+        let signal = Arc::clone(ctx.coordinator());
+        let ownership = Arc::clone(ctx.task_ownership());
+        let outcome =
+            crate::driver::test_support::outcome_of(ctx.clone(), ownership, signal, callback).await;
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        let wire_id = crate::engine::compute_wire_id_public("1-2");
+        let reasons: Vec<String> = client.pause_calls().into_iter().map(|c| c.reason).collect();
+        assert_eq!(reasons, [format!("Step \"{wire_id}\" failed attempt 1")]);
+    }
+
+    /// A retry without `pause`, from `RetryDecision::retry` or the default
+    /// strategy, never pauses.
+    #[tokio::test]
+    async fn retry_without_pause_does_not_pause() {
+        let client = pausing_client(Ok(()));
+        let ctx = context(&client, Vec::new());
+        let outcome = drive_failing_step(&ctx, |_err, _attempt| {
+            RetryDecision::retry(Duration::from_secs(1)).with_pause(false)
+        })
+        .await;
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert_eq!(
+            actions(&client),
+            [OperationAction::Start, OperationAction::Retry]
+        );
+        assert_eq!(client.pause_calls(), []);
+
+        let client = pausing_client(Ok(()));
+        let ctx = context(&client, Vec::new());
+        let step = ctx
+            .step(|_| async { Err::<u32, BoxError>("down".into()) })
+            .name("s");
+        let signal = Arc::clone(ctx.coordinator());
+        let ownership = Arc::clone(ctx.task_ownership());
+        crate::driver::test_support::outcome_of(ctx.clone(), ownership, signal, step).await;
+        assert!(actions(&client).contains(&OperationAction::Retry));
+        assert_eq!(client.pause_calls(), []);
+    }
+
+    /// The interrupted at-most-once path asks the strategy, records the
+    /// RETRY, and ignores `pause`.
+    #[tokio::test]
+    async fn interrupted_attempt_ignores_pause() {
+        let client = pausing_client(Ok(()));
+        let ctx = context(
+            &client,
+            vec![tests::step_record(CheckpointStatus::Started, 0, None)],
+        );
+        assert_eq!(
+            drive_failing_step(&ctx, pause_on).await,
+            InvocationOutcome::Pending
+        );
+        assert_eq!(actions(&client), [OperationAction::Retry]);
+        assert_eq!(client.pause_calls(), []);
+    }
+
+    /// A RETRY that the service answers without a token never resolves,
+    /// so no pause is requested, and the invocation ends `PENDING`.
+    #[tokio::test]
+    async fn tokenless_retry_answer_requests_no_pause() {
+        let client = pausing_client(Ok(()));
+        client.enqueue_checkpoint_response(TestResponse::Success(Vec::new()));
+        client.enqueue_checkpoint_response(TestResponse::Tokenless);
+        let ctx = context(&client, Vec::new());
+        assert_eq!(
+            drive_failing_step(&ctx, pause_on).await,
+            InvocationOutcome::Pending
+        );
+        assert_eq!(
+            actions(&client),
+            [OperationAction::Start, OperationAction::Retry]
+        );
+        assert_eq!(client.pause_calls(), []);
+    }
+
+    /// A step of an abandoned owner (a finished map or parallel no longer
+    /// waits for it) never saves its RETRY, so it never pauses.
+    #[tokio::test]
+    async fn abandoned_step_does_not_pause() {
+        let client = pausing_client(Ok(()));
+        let root = context(&client, Vec::new());
+        let item = root.new_child("1", None);
+        root.admission()
+            .abandon(item.owners().iter().map(String::as_str));
+        let strategy: RetryStrategy = Box::new(pause_on);
+        let message: BoxError = "down".into();
+        let wire = crate::error::wire_error_for(&*message, STEP_FALLBACK_ERROR_TYPE);
+        let wire_id = crate::engine::compute_wire_id_public("1-1");
+        let failure = handle_failure(
+            &item,
+            &wire_id,
+            Some("s"),
+            STEP_SUB_TYPE,
+            None,
+            Some(&strategy),
+            (StepError::execution_failed(message), wire),
+            1,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), failure)
+                .await
+                .is_err(),
+            "the dropped RETRY never resolves"
+        );
+        assert_eq!(actions(&client), []);
+        assert_eq!(client.pause_calls(), []);
+    }
+
+    /// A failed pause call logs a warning that names the error and the
+    /// permission, and the step retries as usual.
+    #[tokio::test]
+    async fn failed_pause_warns_and_retries() {
+        let (messages, _guard) = crate::driver::test_support::EventMessages::install();
+        let client = pausing_client(Err(crate::client::ExecutionClientError::new(
+            ExecutionClientErrorScope::Invocation,
+            "AccessDeniedException: not allowed",
+        )));
+        let ctx = context(&client, Vec::new());
+        assert_eq!(
+            drive_failing_step(&ctx, pause_on).await,
+            InvocationOutcome::Pending
+        );
+        assert_eq!(client.pause_calls().len(), 1);
+        assert_eq!(
+            actions(&client),
+            [OperationAction::Start, OperationAction::Retry]
+        );
+        assert_eq!(
+            messages.at(tracing::Level::WARN),
+            [
+                "Could not pause the execution after step \"s\" failed attempt 1: durable: \
+                 client: AccessDeniedException: not allowed. The step retries as usual. One \
+                 possible cause is that the execution role does not allow \
+                 lambda:PauseDurableExecution."
+            ]
+        );
+    }
+
+    /// A `ResourceConflictException` warning says that the execution has
+    /// closed or is already paused, with no permission hint.
+    #[tokio::test]
+    async fn conflict_warning_names_a_closed_or_paused_execution() {
+        use crate::client::ExecutionClient as _;
+        use aws_sdk_lambda::operation::pause_durable_execution::PauseDurableExecutionError as E;
+        use aws_smithy_mocks::{mock, mock_client};
+        let rule = mock!(aws_sdk_lambda::Client::pause_durable_execution).then_error(|| {
+            E::ResourceConflictException(
+                aws_sdk_lambda::types::error::ResourceConflictException::builder()
+                    .message("already paused")
+                    .build(),
+            )
+        });
+        let err = crate::client::LambdaExecutionClient::new(mock_client!(aws_sdk_lambda, [&rule]))
+            .pause_execution("arn:test", "tok", "why")
+            .expect("the Lambda transport can pause")
+            .await
+            .expect_err("the pause fails");
+        let warning = pause_failure_warning("s", 5, &err);
+        assert!(
+            warning
+                .starts_with("Could not pause the execution after step \"s\" failed attempt 5: "),
+            "{warning}"
+        );
+        assert!(warning.contains("already paused"), "{warning}");
+        assert!(
+            warning.ends_with(
+                "The step retries as usual. The execution has closed (for example, stopped) or \
+                 is already paused."
+            ),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("lambda:PauseDurableExecution"),
+            "{warning}"
+        );
+    }
+
+    /// A transport without pause support retries as usual, with no warning.
+    #[tokio::test]
+    async fn client_without_pause_retries_as_usual() {
+        let (messages, _guard) = crate::driver::test_support::EventMessages::install();
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = context(&client, Vec::new());
+        assert_eq!(
+            drive_failing_step(&ctx, pause_on).await,
+            InvocationOutcome::Pending
+        );
+        assert_eq!(
+            actions(&client),
+            [OperationAction::Start, OperationAction::Retry]
+        );
+        assert_eq!(client.pause_calls(), []);
+        assert_eq!(messages.at(tracing::Level::WARN), Vec::<String>::new());
+    }
+
+    /// The token is 64 lowercase hex characters, the same for the same
+    /// attempt, and different across executions, steps and attempts.
+    #[test]
+    fn pause_client_token_is_stable_and_unique() {
+        let token = pause_client_token("arn:a", "op", 5);
+        assert_eq!(token.len(), 64);
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "{token}"
+        );
+        assert_eq!(token, pause_client_token("arn:a", "op", 5));
+        assert_eq!(
+            token,
+            crate::engine::compute_wire_id_public("pause:arn:a:op:5")
+        );
+        assert_ne!(token, pause_client_token("arn:b", "op", 5));
+        assert_ne!(token, pause_client_token("arn:a", "op2", 5));
+        assert_ne!(token, pause_client_token("arn:a", "op", 6));
+    }
+
+    /// `pause_every` pauses on multiples only, and a stop never pauses.
+    #[test]
+    fn pause_every_pauses_on_multiples_only() {
+        let config = RetryStrategyConfig::builder()
+            .max_attempts(20)
+            .pause_every(5)
+            .build();
+        let err = StepError::execution_failed("down");
+        let pauses: Vec<u32> = (1..=20)
+            .filter(|&attempt| {
+                matches!(
+                    config.decide(&err, attempt),
+                    RetryDecision::Retry { pause: true, .. }
+                )
+            })
+            .collect();
+        assert_eq!(pauses, [5, 10, 15], "attempt 20 stops");
+        assert_eq!(config.decide(&err, 20), RetryDecision::Stop);
+    }
+
+    /// Without `pause_every`, and with `pause_every(0)`, no attempt pauses.
+    #[test]
+    fn pause_every_unset_or_zero_never_pauses() {
+        let err = StepError::execution_failed("down");
+        for config in [
+            RetryStrategyConfig::builder().max_attempts(20).build(),
+            RetryStrategyConfig::builder()
+                .max_attempts(20)
+                .pause_every(0)
+                .build(),
+            RetryStrategyConfig::default_preset(),
+        ] {
+            for attempt in 1..20 {
+                assert!(
+                    !matches!(
+                        config.decide(&err, attempt),
+                        RetryDecision::Retry { pause: true, .. }
+                    ),
+                    "{config:?} attempt {attempt}"
+                );
+            }
+        }
+    }
+
+    /// A pausing attempt keeps the configured delay and jitter.
+    #[test]
+    fn pause_every_keeps_the_delay_and_jitter() {
+        let err = StepError::execution_failed("down");
+        let fixed = |pause_every: Option<u32>| {
+            let builder = RetryStrategyConfig::builder()
+                .max_attempts(20)
+                .initial_delay(Duration::from_secs(10))
+                .jitter(JitterStrategy::None);
+            match pause_every {
+                Some(n) => builder.pause_every(n),
+                None => builder,
+            }
+            .build()
+        };
+        assert_eq!(
+            fixed(Some(5)).decide(&err, 5),
+            fixed(None).decide(&err, 5).with_pause(true)
+        );
+
+        // Full jitter on a 160 s base: the pausing attempt's delays vary
+        // within [1, 160].
+        let jittered = RetryStrategyConfig::builder()
+            .max_attempts(20)
+            .initial_delay(Duration::from_secs(10))
+            .max_delay(Duration::from_secs(1000))
+            .jitter(JitterStrategy::Full)
+            .pause_every(5)
+            .build();
+        let delays: std::collections::BTreeSet<u64> = (0..50)
+            .map(|_| match jittered.decide(&err, 5) {
+                RetryDecision::Retry { delay, pause: true } => delay.as_secs(),
+                other => unreachable!("attempt 5 retries and pauses: {other:?}"),
+            })
+            .collect();
+        assert!(delays.len() > 1, "jittered: {delays:?}");
+        assert!(delays.iter().all(|d| (1..=160).contains(d)), "{delays:?}");
     }
 }
