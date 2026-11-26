@@ -1496,7 +1496,7 @@ async fn step_at_most_once_interruption_fires_nothing() {
                 Ok::<_, BoxError>(
                     ctx.step(|_| async { Ok("task-a".to_owned()) })
                         .name("a")
-                        .semantics(durable::StepSemantics::AtMostOncePerRetry)
+                        .semantics(durable::StepSemantics::AtMostOnce)
                         .retry_strategy(retry_below(3))
                         .await?,
                 )
@@ -5661,7 +5661,7 @@ async fn response_first_start_change_precedes_operation_start() {
                 Ok(ctx
                     .step(|_| async { Ok(1_u32) })
                     .name("m")
-                    .semantics(durable::StepSemantics::AtMostOncePerRetry)
+                    .semantics(durable::StepSemantics::AtMostOnce)
                     .await?)
             },
             (),

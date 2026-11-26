@@ -1669,14 +1669,14 @@ async fn run_spawned_step(
 }
 
 /// #126 rules 5.2 and 11 (#153): a `.spawn()`ed
-/// `AtLeastOncePerRetry` step fires `on_operation_start` on the caller's
+/// `AtLeastOnce` step fires `on_operation_start` on the caller's
 /// task before `.spawn()` returns, inside the caller's frames and span, and
 /// `on_attempt_start` and the body on the step's own task, inside the frames
 /// and span the step captured, which equal the caller's.
 /// Current-thread, so the thread-local subscriber sees every event.
 #[tokio::test]
 async fn a_spawned_step_starts_on_the_caller_in_the_callers_frames_and_span() {
-    let (seen, scopes) = run_spawned_step(durable::StepSemantics::AtLeastOncePerRetry).await;
+    let (seen, scopes) = run_spawned_step(durable::StepSemantics::AtLeastOnce).await;
     let order: Vec<&str> = seen.iter().map(|(what, _, _)| what.as_str()).collect();
     assert_eq!(
         order,
@@ -1701,13 +1701,13 @@ async fn a_spawned_step_starts_on_the_caller_in_the_callers_frames_and_span() {
     }
 }
 
-/// #126 rule 11: a `.spawn()`ed `AtMostOncePerRetry` step fires both start
+/// #126 rule 11: a `.spawn()`ed `AtMostOnce` step fires both start
 /// hooks on its own task after the START response, in the captured frames
 /// and span.
 /// Current-thread, so the thread-local subscriber sees every event.
 #[tokio::test]
 async fn a_spawned_at_most_once_step_starts_on_its_own_task() {
-    let (seen, scopes) = run_spawned_step(durable::StepSemantics::AtMostOncePerRetry).await;
+    let (seen, scopes) = run_spawned_step(durable::StepSemantics::AtMostOnce).await;
     let order: Vec<&str> = seen.iter().map(|(what, _, _)| what.as_str()).collect();
     assert_eq!(
         order,

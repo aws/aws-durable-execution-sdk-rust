@@ -218,12 +218,12 @@ where
     /// Controls how the SDK handles a replay where the previous attempt was
     /// interrupted (checkpoint status `Started` with no recorded outcome).
     ///
-    /// - [`StepSemantics::AtLeastOncePerRetry`](crate::StepSemantics::AtLeastOncePerRetry) (default): re-execute the
+    /// - [`StepSemantics::AtLeastOnce`](crate::StepSemantics::AtLeastOnce) (default): re-execute the
     ///   step body on replay. The body starts without waiting for the
     ///   `START` checkpoint. The outcome is written only after `START` is
     ///   acknowledged; if `START` fails, the outcome is not written and the
     ///   invocation fails.
-    /// - [`StepSemantics::AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry): treat the interruption as a
+    /// - [`StepSemantics::AtMostOnce`](crate::StepSemantics::AtMostOnce): treat the interruption as a
     ///   failure and consult the retry strategy without re-executing. The
     ///   body starts only after `START` is acknowledged.
     ///
@@ -242,7 +242,7 @@ where
     /// ) -> Result<String, durable::BoxError> {
     ///     let result = ctx.step(|_| async { Ok("done".to_owned()) })
     ///         .name("charge-card")
-    ///         .semantics(StepSemantics::AtMostOncePerRetry)
+    ///         .semantics(StepSemantics::AtMostOnce)
     ///         .await?;
     ///     Ok(result)
     /// }

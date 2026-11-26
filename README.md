@@ -516,10 +516,10 @@ A step is the unit of checkpointing. Its output needs
 Once a step succeeds and the service records its result, replay returns that
 result without re-running the body. Between the moment the SDK starts a step
 and the moment the service records the outcome, an interruption (function
-timeout, runtime crash) can occur. Under the default `AtLeastOncePerRetry`
+timeout, runtime crash) can occur. Under the default `AtLeastOnce`
 semantics the SDK re-executes the body on resume, so the body may run more
 than once per retry attempt if an interruption occurs in that window. Design
-step bodies to be idempotent, or use `StepSemantics::AtMostOncePerRetry` to
+step bodies to be idempotent, or use `StepSemantics::AtMostOnce` to
 treat an interrupted attempt as a failure rather than re-executing it.
 
 A step body is `FnOnce + Clone`. The SDK keeps the original closure and calls
@@ -572,7 +572,7 @@ let result = ctx
             RetryDecision::retry(Duration::from_secs(u64::from(attempt)))
         }
     })
-    .semantics(StepSemantics::AtMostOncePerRetry)
+    .semantics(StepSemantics::AtMostOnce)
     .await?;
 ```
 
@@ -584,12 +584,12 @@ fills the fields it leaves unset as JS `createRetryStrategy` does, with 3
 attempts and a 300 second cap, and its `retry_if(predicate)` retries only the
 errors for which the predicate returns `true`.
 
-`StepSemantics::AtLeastOncePerRetry` is the default: the SDK re-executes the
+`StepSemantics::AtLeastOnce` is the default: the SDK re-executes the
 body on resume if the previous attempt started but recorded no outcome.
 The body starts without waiting for the `START` checkpoint. The outcome is
 written only after `START` is acknowledged; if `START` fails, the outcome is
 not written and the invocation fails.
-`AtMostOncePerRetry` treats that interruption as a failure and consults the
+`AtMostOnce` treats that interruption as a failure and consults the
 retry strategy, so a non-idempotent body never runs twice for the same
 attempt. The strategy sees `StepErrorKind::Interrupted`, and the recorded
 failure carries the error type `StepInterruptedError`.
@@ -643,7 +643,7 @@ let value = ctx
 
 - The pause does not change how many attempts run. A `Stop` never pauses.
 - Only a body that failed in the current invocation pauses, including the
-  submitter of `wait_for_callback`. An interrupted `AtMostOncePerRetry`
+  submitter of `wait_for_callback`. An interrupted `AtMostOnce`
   attempt retries without a pause. A `with_retry` block ignores `pause`.
 - After the service accepts the pause, the step runs no further attempt in
   the invocation, even when other work keeps the invocation running past the
@@ -1295,7 +1295,7 @@ that already run. A step, a wait, a child context, a `with_retry`, a `map`, a
 first checkpoint comes before the combinator's, and a start hook it fires
 when it queues `START` runs before the combinator's. A start hook that waits
 for the `START` response, that of a wait or of a step under
-`AtMostOncePerRetry`, keeps that timing and runs after the combinator's. A
+`AtMostOnce`, keeps that timing and runs after the combinator's. A
 lazy invoke or `wait_for_condition` is polled once, in input order, before
 the combinator's start step, and the combinator does not wait for its
 `START`. The combinator then queues its own `START`, fires its start hook,

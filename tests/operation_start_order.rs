@@ -2,7 +2,7 @@
 //! hook, through `wrap` and a caller-supplied transport.
 //!
 //! JS fires `onOperationStart` after the `START` response for a step under
-//! `AtMostOncePerRetry`, a wait and a callback, and right after it queues
+//! `AtMostOnce`, a wait and a callback, and right after it queues
 //! `START` for a default step and `waitForCondition`. A queued JS `START`
 //! is sent only after the hook returns. These tests pin that order on the
 //! current-thread and the multi-thread runtime.
@@ -269,7 +269,7 @@ async fn at_most_once_step_start_hook_fires_after_start_response() {
         Ok(ctx
             .step(|_| async { Ok("v".to_owned()) })
             .name("a")
-            .semantics(StepSemantics::AtMostOncePerRetry)
+            .semantics(StepSemantics::AtMostOnce)
             .await?)
     })
     .await;

@@ -253,7 +253,7 @@ async fn step_marked_serialize_failure_at_most_once_takes_interrupted_path() {
                             }
                         })
                         .name("encode-me")
-                        .semantics(StepSemantics::AtMostOncePerRetry)
+                        .semantics(StepSemantics::AtMostOnce)
                         .retry_strategy(|_err, _attempt| RetryDecision::Stop)
                         .serdes(serdes)
                         .await;

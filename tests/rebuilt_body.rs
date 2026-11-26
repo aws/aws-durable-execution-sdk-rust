@@ -195,7 +195,7 @@ fn assert_ran_once(result: &TestResult<usize>, runs: usize) {
 
 #[tokio::test(start_paused = true)]
 async fn rebuilt_child_does_not_run_its_unfinished_spawned_step_again() {
-    let (result, runs) = escape_at(Site::Child, StepSemantics::AtLeastOncePerRetry).await;
+    let (result, runs) = escape_at(Site::Child, StepSemantics::AtLeastOnce).await;
     assert_ran_once(&result, runs);
 }
 
@@ -204,33 +204,26 @@ async fn rebuilt_child_does_not_run_its_unfinished_spawned_step_again() {
 /// again.
 #[tokio::test(start_paused = true)]
 async fn rebuilt_with_retry_block_does_not_run_its_unfinished_spawned_step_again() {
-    let (result, runs) = escape_at(Site::Block, StepSemantics::AtLeastOncePerRetry).await;
+    let (result, runs) = escape_at(Site::Block, StepSemantics::AtLeastOnce).await;
     assert_ran_once(&result, runs);
 }
 
 #[tokio::test(start_paused = true)]
 async fn rebuilt_map_item_does_not_run_its_unfinished_spawned_step_again() {
-    let (result, runs) = escape_at(
-        Site::Item(NestingMode::Normal),
-        StepSemantics::AtLeastOncePerRetry,
-    )
-    .await;
+    let (result, runs) =
+        escape_at(Site::Item(NestingMode::Normal), StepSemantics::AtLeastOnce).await;
     assert_ran_once(&result, runs);
 }
 
 #[tokio::test(start_paused = true)]
 async fn rebuilt_flat_map_item_does_not_run_its_unfinished_spawned_step_again() {
-    let (result, runs) = escape_at(
-        Site::Item(NestingMode::Flat),
-        StepSemantics::AtLeastOncePerRetry,
-    )
-    .await;
+    let (result, runs) = escape_at(Site::Item(NestingMode::Flat), StepSemantics::AtLeastOnce).await;
     assert_ran_once(&result, runs);
 }
 
 #[tokio::test(start_paused = true)]
 async fn rebuilt_child_does_not_retry_its_unfinished_at_most_once_step() {
-    let (result, runs) = escape_at(Site::Child, StepSemantics::AtMostOncePerRetry).await;
+    let (result, runs) = escape_at(Site::Child, StepSemantics::AtMostOnce).await;
     assert_ran_once(&result, runs);
 }
 
@@ -249,7 +242,7 @@ async fn rebuilt_item_of_a_running_map_does_not_run_its_unfinished_spawned_step_
                         two_waits(&child, 0).await?;
                         return Ok(String::new());
                     }
-                    escape(child, runs, holder, StepSemantics::AtLeastOncePerRetry).await
+                    escape(child, runs, holder, StepSemantics::AtLeastOnce).await
                 }
             })
             .name("m")
@@ -302,7 +295,7 @@ async fn rebuilt_child_fires_no_hook_for_its_unfinished_spawned_step() {
         |ctx, runs, holder, _invocation| async move {
             let len = ctx
                 .run_in_child_context(move |child| {
-                    escape(child, runs, holder, StepSemantics::AtLeastOncePerRetry)
+                    escape(child, runs, holder, StepSemantics::AtLeastOnce)
                 })
                 .name("child")
                 .await?
@@ -431,7 +424,7 @@ async fn rebuilt_child_does_not_retry_its_unfinished_failing_step() {
                     child,
                     counter(),
                     Arc::clone(&holder),
-                    StepSemantics::AtLeastOncePerRetry,
+                    StepSemantics::AtLeastOnce,
                 )
                 .await
             })

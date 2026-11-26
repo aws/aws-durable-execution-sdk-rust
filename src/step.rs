@@ -157,14 +157,19 @@ pub(crate) fn quantize_delay(secs: f64) -> Duration {
 /// use aws_durable_execution_sdk::StepSemantics;
 ///
 /// // Default: re-execute on replay if interrupted.
-/// let default = StepSemantics::AtLeastOncePerRetry;
+/// let default = StepSemantics::AtLeastOnce;
 ///
 /// // Idempotency-sensitive: treat interrupted as failed, consult retry strategy.
-/// let at_most_once = StepSemantics::AtMostOncePerRetry;
+/// let at_most_once = StepSemantics::AtMostOnce;
 /// # drop(default);
 /// # drop(at_most_once);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// The deprecated `AtLeastOncePerRetry` and `AtMostOncePerRetry` names
+/// behave as `AtLeastOnce` and `AtMostOnce`, and compare equal to them
+/// with `==`. A `match` that lists only the new names does not match the
+/// deprecated ones.
+#[derive(Debug, Clone, Copy, Eq, Default)]
 #[non_exhaustive]
 pub enum StepSemantics {
     /// Re-execute the step body on replay if the previous attempt was
@@ -179,7 +184,7 @@ pub enum StepSemantics {
     /// outcome is written only after `START` is acknowledged; if `START`
     /// fails, the outcome is not written and the invocation fails.
     #[default]
-    AtLeastOncePerRetry,
+    AtLeastOnce,
 
     /// Do **not** re-execute the step body if the previous attempt was
     /// interrupted. Instead, treat the interruption as a failure and
@@ -193,9 +198,9 @@ pub enum StepSemantics {
     ///
     /// Use this for non-idempotent operations (e.g., charging a credit
     /// card) where re-execution could produce duplicate side effects.
-    AtMostOncePerRetry,
+    AtMostOnce,
 
-    /// Like [`AtLeastOncePerRetry`](Self::AtLeastOncePerRetry), but the
+    /// Like [`AtLeastOnce`](Self::AtLeastOnce), but the
     /// step returns its result without waiting for the `SUCCEED`
     /// checkpoint. So the step has lower latency.
     ///
@@ -205,19 +210,44 @@ pub enum StepSemantics {
     /// saved before any later checkpoint the service accepts, and before
     /// the invocation ends. A failed `SUCCEED` write fails the invocation,
     /// and the step runs again on replay, as under
-    /// `AtLeastOncePerRetry`.
+    /// `AtLeastOnce`.
     ///
     /// Only the success checkpoint is not awaited. A failed attempt waits
     /// for its `RETRY` or `FAIL` checkpoint, as under
-    /// `AtLeastOncePerRetry`.
+    /// `AtLeastOnce`.
     AtLeastOnceAsync,
+
+    /// The old name of [`AtLeastOnce`](Self::AtLeastOnce).
+    #[deprecated(note = "use StepSemantics::AtLeastOnce")]
+    AtLeastOncePerRetry,
+
+    /// The old name of [`AtMostOnce`](Self::AtMostOnce).
+    #[deprecated(note = "use StepSemantics::AtMostOnce")]
+    AtMostOncePerRetry,
 }
 
 impl StepSemantics {
+    /// The value with the deprecated names replaced by the new ones.
+    #[expect(deprecated, reason = "maps the deprecated names to the new ones")]
+    const fn normalized(self) -> Self {
+        match self {
+            Self::AtLeastOncePerRetry => Self::AtLeastOnce,
+            Self::AtMostOncePerRetry => Self::AtMostOnce,
+            other => other,
+        }
+    }
+
     /// Whether the step body runs again on replay when its previous attempt
     /// was interrupted.
     fn reruns_interrupted(self) -> bool {
-        self != Self::AtMostOncePerRetry
+        self != Self::AtMostOnce
+    }
+}
+
+impl PartialEq for StepSemantics {
+    /// A deprecated name equals its new name.
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(&self.normalized()) == std::mem::discriminant(&other.normalized())
     }
 }
 
@@ -426,10 +456,10 @@ struct StepCore<O, S> {
 /// What [`StepCore::before`] decided for one cycle of the step loop.
 enum StepPrelude<O> {
     /// Resolved without running the body: a recorded terminal outcome, or
-    /// an `AtMostOncePerRetry` interruption the retry strategy stopped.
+    /// an `AtMostOnce` interruption the retry strategy stopped.
     Done(Result<O, OperationError>),
     /// The record is `PENDING`, or a `RETRY` was just recorded for an
-    /// interrupted `AtMostOncePerRetry` attempt: wait for the retry timer.
+    /// interrupted `AtMostOnce` attempt: wait for the retry timer.
     Wait,
     /// The body must run at `attempt`, inside `span`.
     Run {
@@ -548,7 +578,7 @@ where
         let start = match started {
             StartStep::Refused => return std::future::pending().await,
             StartStep::Queued(write) => Some(write),
-            // AtLeastOncePerRetry (default): skip re-checkpointing START but
+            // AtLeastOnce (default): skip re-checkpointing START but
             // re-execute the body. The start step fired the replay start
             // hook.
             StartStep::Recorded(view)
@@ -645,7 +675,7 @@ where
                 Ok(StepPrelude::Done(Err(replay_failure(wire, wire_id))))
             }
             CheckpointStatus::Started => {
-                // AtMostOncePerRetry: the previous attempt was interrupted
+                // AtMostOnce: the previous attempt was interrupted
                 // before recording an outcome. Do NOT re-execute; treat as
                 // a step-interrupted failure and consult the retry
                 // strategy to decide FAIL or RETRY.
@@ -784,7 +814,7 @@ where
 /// What the start step does with a step's record under `semantics`: a
 /// `READY`, `CANCELLED`, `TIMED_OUT` or `STOPPED` record begins a new
 /// attempt, which is a replay from the second attempt on. A `STARTED`
-/// record under `AtLeastOncePerRetry` re-enters its attempt, and every
+/// record under `AtLeastOnce` re-enters its attempt, and every
 /// other record queues no `START`.
 pub(crate) fn step_cycle(
     semantics: StepSemantics,
@@ -906,7 +936,7 @@ async fn handle_success<O, S: Serdes<O>>(
 ///
 /// `step_err` is `StepError::execution_failed` of the body's error when
 /// the body failed, and `StepError::interrupted()` when an
-/// `AtMostOncePerRetry` attempt started but recorded no outcome. The retry
+/// `AtMostOnce` attempt started but recorded no outcome. The retry
 /// strategy sees `step_err`, and the step returns it when the strategy
 /// stops.
 ///
@@ -1300,7 +1330,7 @@ async fn replay_success<O, S: Serdes<O>>(
 /// after persisting that record (issue #43). A record whose `error_type`
 /// is [`STEP_INTERRUPTED_ERROR_TYPE`] reconstructs
 /// `StepErrorKind::Interrupted`, the kind the live path yielded after the
-/// retry strategy stopped an interrupted `AtMostOncePerRetry` attempt.
+/// retry strategy stopped an interrupted `AtMostOnce` attempt.
 /// Every other record is an
 /// ordinary terminal step failure, which the live path yields as
 /// `StepErrorKind::ExecutionFailed` after its retry strategy stopped, so
@@ -1333,7 +1363,7 @@ fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationErro
 /// original recorded type instead (see [`crate::error::wire_error_for`]).
 const STEP_FALLBACK_ERROR_TYPE: &str = "Error";
 
-/// The wire `ErrorType` recorded for an `AtMostOncePerRetry` attempt that
+/// The wire `ErrorType` recorded for an `AtMostOnce` attempt that
 /// started but recorded no outcome. It is the name the JS SDK records.
 const STEP_INTERRUPTED_ERROR_TYPE: &str = "StepInterruptedError";
 
@@ -2037,7 +2067,7 @@ mod tests {
         "attempt_end",
     ];
 
-    /// Rule 7.8: an interrupted `AtMostOncePerRetry` attempt runs no
+    /// Rule 7.8: an interrupted `AtMostOnce` attempt runs no
     /// body and fires no user-function hook; it records a RETRY. The next
     /// attempt is a user function.
     #[tokio::test]
@@ -2051,7 +2081,7 @@ mod tests {
                 Ok(42_u32)
             })
             .name("s")
-            .semantics(StepSemantics::AtMostOncePerRetry)
+            .semantics(StepSemantics::AtMostOnce)
             .retry_strategy(|_err, _attempt| RetryDecision::retry(Duration::from_secs(1)))
         };
 
@@ -3026,7 +3056,7 @@ mod tests {
         );
     }
 
-    // AtMostOncePerRetry tests
+    // AtMostOnce tests
 
     /// A strategy that records the display of each kind it sees and
     /// returns `decision`.
@@ -3060,7 +3090,7 @@ mod tests {
         crate::error::WireError::new(error.error_type(), error.error_message())
     }
 
-    /// An `AtMostOncePerRetry` step over a STARTED record, whose body
+    /// An `AtMostOnce` step over a STARTED record, whose body
     /// sets `executed` if it runs.
     fn at_most_once_over_started(
         ctx: DurableContext,
@@ -3078,7 +3108,7 @@ mod tests {
             name: Some("at-most-once-step".to_owned()),
             retry_strategy,
             serdes: crate::serdes::JsonSerdes,
-            semantics: StepSemantics::AtMostOncePerRetry,
+            semantics: StepSemantics::AtMostOnce,
             sub_type: OperationSubType::STEP,
             plugin_name: None,
             closure: move |_: StepContext| {
@@ -3120,7 +3150,7 @@ mod tests {
         );
         assert!(
             !executed.load(Ordering::SeqCst),
-            "closure should NOT execute when AtMostOncePerRetry and replay=Started"
+            "closure should NOT execute when AtMostOnce and replay=Started"
         );
     }
 
@@ -3178,7 +3208,7 @@ mod tests {
         assert_eq!(retry.error_message(), Some(STEP_INTERRUPTED_MESSAGE));
         assert!(
             !executed.load(Ordering::SeqCst),
-            "closure should NOT execute when AtMostOncePerRetry and replay=Started"
+            "closure should NOT execute when AtMostOnce and replay=Started"
         );
     }
 
@@ -3211,7 +3241,7 @@ mod tests {
             name: None,
             retry_strategy: Some(strategy),
             serdes: crate::serdes::JsonSerdes,
-            semantics: StepSemantics::AtMostOncePerRetry,
+            semantics: StepSemantics::AtMostOnce,
             sub_type: OperationSubType::STEP,
             plugin_name: None,
             closure: |_: StepContext| async { Err::<i32, BoxError>("boom".into()) },
@@ -3247,7 +3277,7 @@ mod tests {
             name: None,
             retry_strategy: None,
             serdes: crate::serdes::JsonSerdes,
-            semantics: StepSemantics::AtMostOncePerRetry,
+            semantics: StepSemantics::AtMostOnce,
             sub_type: OperationSubType::STEP,
             plugin_name: None,
             closure: |_: StepContext| async { Ok::<i32, BoxError>(1) },
@@ -3279,7 +3309,7 @@ mod tests {
     #[tokio::test]
     async fn step_at_least_once_replay_started_re_executes() {
         // Verify that the DEFAULT semantics still re-execute on Started replay.
-        step_replay_started_re_executes(StepSemantics::AtLeastOncePerRetry).await;
+        step_replay_started_re_executes(StepSemantics::AtLeastOnce).await;
     }
 
     #[tokio::test]
@@ -4439,7 +4469,7 @@ mod start_write_tests {
     #[tokio::test(start_paused = true)]
     async fn at_least_once_body_starts_before_start_response() {
         let (client, started, outcome) =
-            timed_step(Duration::ZERO, StepSemantics::AtLeastOncePerRetry).await;
+            timed_step(Duration::ZERO, StepSemantics::AtLeastOnce).await;
         assert_eq!(started, ms(0), "the body starts before START is answered");
         let start = client.request_with(&OperationAction::Start).expect("START");
         let succeed = client
@@ -4452,8 +4482,7 @@ mod start_write_tests {
 
     #[tokio::test(start_paused = true)]
     async fn buffered_start_precedes_outcome() {
-        let (client, started, outcome) =
-            timed_step(ms(50), StepSemantics::AtLeastOncePerRetry).await;
+        let (client, started, outcome) = timed_step(ms(50), StepSemantics::AtLeastOnce).await;
         assert_eq!(started, ms(0), "the body starts before START is answered");
         let requests = client.requests();
         let first = requests.first().expect("a request");
@@ -4493,6 +4522,34 @@ mod start_write_tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    #[expect(deprecated, reason = "the test checks the deprecated names")]
+    async fn deprecated_names_behave_as_new_names() {
+        assert_eq!(StepSemantics::default(), StepSemantics::AtLeastOnce);
+        assert_eq!(
+            StepSemantics::AtLeastOncePerRetry,
+            StepSemantics::AtLeastOnce
+        );
+        assert_eq!(StepSemantics::AtMostOncePerRetry, StepSemantics::AtMostOnce);
+        assert_ne!(
+            StepSemantics::AtLeastOncePerRetry,
+            StepSemantics::AtMostOnce
+        );
+        assert_ne!(
+            StepSemantics::AtLeastOncePerRetry,
+            StepSemantics::AtLeastOnceAsync
+        );
+
+        let (_client, started, outcome) =
+            timed_step(Duration::ZERO, StepSemantics::AtLeastOncePerRetry).await;
+        assert_eq!(started, ms(0), "the body starts before START is answered");
+        assert_eq!(outcome, InvocationOutcome::Complete("1@1000".to_owned()));
+
+        let (_client, started, _outcome) =
+            timed_step(Duration::ZERO, StepSemantics::AtMostOncePerRetry).await;
+        assert_eq!(started, ms(500), "the body starts after START is answered");
+    }
+
     /// A step whose body fails with no retry, under `semantics`. Returns
     /// the client and the tokio time the step returned its error.
     async fn failing_step(semantics: StepSemantics) -> (Arc<LatencyClient>, Duration) {
@@ -4529,7 +4586,7 @@ mod start_write_tests {
     #[tokio::test(start_paused = true)]
     async fn at_most_once_body_waits_for_start_response() {
         let (_client, started, outcome) =
-            timed_step(Duration::ZERO, StepSemantics::AtMostOncePerRetry).await;
+            timed_step(Duration::ZERO, StepSemantics::AtMostOnce).await;
         assert_eq!(started, ms(500), "the body starts after START is answered");
         assert!(matches!(outcome, InvocationOutcome::Complete(ref v) if v.starts_with("1@")));
     }
@@ -4747,7 +4804,7 @@ mod pause_tests {
         let step = ctx
             .step(|_| async { Err::<u32, BoxError>("down".into()) })
             .name("s")
-            .semantics(StepSemantics::AtMostOncePerRetry)
+            .semantics(StepSemantics::AtMostOnce)
             .retry_strategy(strategy);
         let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
@@ -4806,7 +4863,7 @@ mod pause_tests {
             let step = handler_ctx
                 .step(|_| async { Err::<u32, BoxError>("down".into()) })
                 .name("s")
-                .semantics(StepSemantics::AtMostOncePerRetry)
+                .semantics(StepSemantics::AtMostOnce)
                 .retry_strategy(pause_on)
                 .await;
             wait.await?;

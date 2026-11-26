@@ -7094,7 +7094,7 @@ mod withdrawal_tests {
             Ok(ctx
                 .step(|_| async { Ok(1_u32) })
                 .name("a")
-                .semantics(crate::StepSemantics::AtMostOncePerRetry)
+                .semantics(crate::StepSemantics::AtMostOnce)
                 .await?)
         })
         .await;

@@ -364,7 +364,7 @@ pub trait Plugin: Send + Sync {
     ///   run without waiting for its response. So the hook of an input that
     ///   fires when its `START` is queued comes before the combinator's,
     ///   and the hook of an input that waits for its `START` response, a
-    ///   wait or a step under `AtMostOncePerRetry`, comes after it;
+    ///   wait or a step under `AtMostOnce`, comes after it;
     /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
     ///   fires `on_operation_start` with `is_replay` `true`, before the
     ///   body or the first item runs. A combinator fires it after its
@@ -429,7 +429,7 @@ pub trait Plugin: Send + Sync {
     /// start step runs on the caller's task before the call returns (see
     /// [`StepBuilder::spawn`](crate::builders::StepBuilder::spawn)). So when the operation's
     /// JS order is "queue `START`, then hook" (a step under
-    /// `AtLeastOncePerRetry` and every child-backed operation above), or
+    /// `AtLeastOnce` and every child-backed operation above), or
     /// when its record resumes work and fires the replay start hook, this
     /// hook runs on the caller's task before `.spawn()` returns. An
     /// operation that fires it after the `START` response fires it on the
@@ -526,7 +526,7 @@ pub trait Plugin: Send + Sync {
     ///   run without waiting for its response. So the hook of an input that
     ///   fires when its `START` is queued comes before the combinator's,
     ///   and the hook of an input that waits for its `START` response, a
-    ///   wait or a step under `AtMostOncePerRetry`, comes after it;
+    ///   wait or a step under `AtMostOnce`, comes after it;
     /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
     ///   fires `on_operation_start` with `is_replay` `true`, before the
     ///   body or the first item runs. A combinator fires it after its
@@ -694,7 +694,7 @@ pub trait Plugin: Send + Sync {
     ///
     /// Against [`on_operation_start`](Self::on_operation_start): a wait,
     /// `create_callback`, an invoke and a step under
-    /// `StepSemantics::AtMostOncePerRetry` call `on_operation_start` after
+    /// `StepSemantics::AtMostOnce` call `on_operation_start` after
     /// their `START` response, so the change that lists them `STARTED`
     /// comes first. A default step, `wait_for_condition` and every
     /// child-backed operation that writes a record, including a map, a
@@ -916,7 +916,7 @@ pub trait Plugin: Send + Sync {
     /// - a child context run again to rebuild a result that its record did
     ///   not store (`ReplayChildren`);
     /// - a step attempt interrupted under
-    ///   [`StepSemantics::AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry),
+    ///   [`StepSemantics::AtMostOnce`](crate::StepSemantics::AtMostOnce),
     ///   which the SDK records as failed;
     /// - a step waiting for its retry delay;
     /// - the `attempt-N` child contexts of a `with_retry` block, in either

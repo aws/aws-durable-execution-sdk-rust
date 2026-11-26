@@ -56,7 +56,7 @@
 //! An error marked with [`RetryableSerdesError`] ends the Lambda
 //! invocation and records nothing. The service then invokes the function
 //! again. After a marked serialize failure the body runs again, except
-//! that an [`AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry)
+//! that an [`AtMostOnce`](crate::StepSemantics::AtMostOnce)
 //! step takes its interrupted path. After a marked deserialize failure the
 //! next invocation decodes the recorded value again. The SDK finds the
 //! marker anywhere in the error's [`source()`](std::error::Error::source)

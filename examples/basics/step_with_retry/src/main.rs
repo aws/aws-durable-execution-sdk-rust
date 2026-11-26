@@ -54,7 +54,7 @@ async fn handler(
                 RetryDecision::retry(Duration::from_secs(u64::from(attempt)))
             }
         })
-        .semantics(StepSemantics::AtMostOncePerRetry)
+        .semantics(StepSemantics::AtMostOnce)
         .await?;
     Ok(result)
 }

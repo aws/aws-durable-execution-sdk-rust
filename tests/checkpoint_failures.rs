@@ -290,7 +290,7 @@ async fn serialization_failure_persists_fail_and_replays_without_rerun() {
 /// exhausts the client's internal retries fails the INVOCATION with no
 /// further writes. The service re-invokes (the interruption recovery
 /// path), replay finds the step still `Started`, the body re-runs under
-/// the documented `AtLeastOncePerRetry` contract, and the execution
+/// the documented `AtLeastOnce` contract, and the execution
 /// converges when the channel recovers.
 #[tokio::test]
 async fn retryable_exhaustion_fails_invocation_and_reinvocation_converges() {
@@ -336,7 +336,7 @@ async fn retryable_exhaustion_fails_invocation_and_reinvocation_converges() {
     assert_eq!(
         body_runs.load(Ordering::SeqCst),
         2,
-        "the interrupted attempt re-runs the body (AtLeastOncePerRetry): \
+        "the interrupted attempt re-runs the body (AtLeastOnce): \
          the record stayed Started because nothing further was written"
     );
     let step_op = result
@@ -889,7 +889,7 @@ async fn nonretryable_flush_failure_of_dropped_contributor_fails_execution() {
 /// Review finding 3, retryable half: a buffered outcome write whose
 /// contributor was dropped fails retryably. The invocation fails with no
 /// further writes, even though the handler completed, and the
-/// re-invocation converges under the documented `AtLeastOncePerRetry`
+/// re-invocation converges under the documented `AtLeastOnce`
 /// interruption contract.
 #[tokio::test]
 async fn retryable_flush_failure_fails_invocation_and_reinvocation_converges() {
@@ -947,7 +947,7 @@ async fn retryable_flush_failure_fails_invocation_and_reinvocation_converges() {
         body_runs.load(Ordering::SeqCst),
         2,
         "the orphaned operation re-runs on the re-invocation \
-         (AtLeastOncePerRetry): nothing further was written for it"
+         (AtLeastOnce): nothing further was written for it"
     );
 }
 

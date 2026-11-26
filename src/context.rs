@@ -3605,7 +3605,7 @@ impl DurableContext {
     /// then, so its first checkpoint comes before the combinator's, and a
     /// start hook it fires when it queues `START` runs before the
     /// combinator's. A start hook that waits for the `START` response (a
-    /// wait, a step under `AtMostOncePerRetry`) keeps that timing. A lazy
+    /// wait, a step under `AtMostOnce`) keeps that timing. A lazy
     /// invoke or `wait_for_condition` is polled once, in input order,
     /// before the combinator's start step, but the combinator does not wait
     /// for its `START`. The combinator then queues its own `START`, fires
@@ -3713,7 +3713,7 @@ impl DurableContext {
     /// then, so its first checkpoint comes before the combinator's, and a
     /// start hook it fires when it queues `START` runs before the
     /// combinator's. A start hook that waits for the `START` response (a
-    /// wait, a step under `AtMostOncePerRetry`) keeps that timing. A lazy
+    /// wait, a step under `AtMostOnce`) keeps that timing. A lazy
     /// invoke or `wait_for_condition` is polled once, in input order,
     /// before the combinator's start step, but the combinator does not wait
     /// for its `START`. The combinator then queues its own `START`, fires
@@ -3816,7 +3816,7 @@ impl DurableContext {
     /// then, so its first checkpoint comes before the combinator's, and a
     /// start hook it fires when it queues `START` runs before the
     /// combinator's. A start hook that waits for the `START` response (a
-    /// wait, a step under `AtMostOncePerRetry`) keeps that timing. A lazy
+    /// wait, a step under `AtMostOnce`) keeps that timing. A lazy
     /// invoke or `wait_for_condition` is polled once, in input order,
     /// before the combinator's start step, but the combinator does not wait
     /// for its `START`. The combinator then queues its own `START`, fires
@@ -3918,7 +3918,7 @@ impl DurableContext {
     /// then, so its first checkpoint comes before the combinator's, and a
     /// start hook it fires when it queues `START` runs before the
     /// combinator's. A start hook that waits for the `START` response (a
-    /// wait, a step under `AtMostOncePerRetry`) keeps that timing. A lazy
+    /// wait, a step under `AtMostOnce`) keeps that timing. A lazy
     /// invoke or `wait_for_condition` is polled once, in input order,
     /// before the combinator's start step, but the combinator does not wait
     /// for its `START`. The combinator then queues its own `START`, fires

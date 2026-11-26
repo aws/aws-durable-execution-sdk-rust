@@ -385,7 +385,7 @@ pub enum RetryDecision {
         /// - Only a step whose body failed in the current invocation
         ///   pauses. This includes the submitter step of
         ///   `wait_for_callback`. An interrupted
-        ///   [`AtMostOncePerRetry`](StepSemantics::AtMostOncePerRetry)
+        ///   [`AtMostOnce`](StepSemantics::AtMostOnce)
         ///   attempt retries without a pause. A `with_retry` block ignores
         ///   this field.
         /// - The pause does not change how many attempts run.

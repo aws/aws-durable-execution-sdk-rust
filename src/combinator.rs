@@ -4863,7 +4863,7 @@ mod tests {
                 Self::AtMostOnceStep => ctx
                     .step(|_| std::future::pending::<Result<(), crate::BoxError>>())
                     .name(name)
-                    .semantics(crate::StepSemantics::AtMostOncePerRetry)
+                    .semantics(crate::StepSemantics::AtMostOnce)
                     .future(),
             }
         }
