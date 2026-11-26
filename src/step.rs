@@ -4756,6 +4756,122 @@ mod start_write_tests {
     }
 }
 
+/// The execution's default step semantics
+/// ([`default_step_semantics`](crate::OptionsBuilder::default_step_semantics)).
+/// Each test checks whether a step awaited its `SUCCEED` write: an
+/// `AtLeastOnceAsync` step drops the write without polling it.
+#[cfg(test)]
+mod default_semantics_tests {
+    use crate::StepSemantics;
+    use crate::context::DurableContext;
+    use crate::driver::test_support::{drive_handler, wire_err};
+    use aws_sdk_lambda::types::OperationAction;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Each `SUCCEED` of a step the recorder saw, with its first-poll flag.
+    type Succeeds = Arc<Mutex<Vec<Arc<AtomicBool>>>>;
+
+    /// Drives `handler` on a root whose default step semantics is
+    /// `AtLeastOnceAsync`. Returns whether each step `SUCCEED` write was
+    /// awaited, in submission order.
+    async fn succeeds_awaited<F, Fut>(handler: F) -> Vec<bool>
+    where
+        F: FnOnce(DurableContext) -> Fut,
+        Fut: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
+    {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::test_context_with_depth_and_client(0, client)
+            .with_default_step_semantics(StepSemantics::AtLeastOnceAsync);
+        let succeeds: Succeeds = Arc::default();
+        let recorded = Arc::clone(&succeeds);
+        ctx.set_submission_recorder(Arc::new(move |updates, flag| {
+            if updates.iter().any(|u| {
+                u.action() == &OperationAction::Succeed
+                    && u.r#type() == &aws_sdk_lambda::types::OperationType::Step
+            }) {
+                recorded.lock().expect("lock").push(Arc::clone(flag));
+            }
+        }));
+        drive_handler(ctx, None, handler).await.expect("no panic");
+        let succeeds = succeeds.lock().expect("lock");
+        succeeds.iter().map(|f| f.load(Ordering::SeqCst)).collect()
+    }
+
+    #[tokio::test]
+    async fn step_without_semantics_uses_the_default() {
+        let awaited = succeeds_awaited(|ctx| async move {
+            ctx.step(|_| async { Ok(1_u32) })
+                .name("s")
+                .await
+                .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(awaited, [false]);
+    }
+
+    #[tokio::test]
+    async fn step_semantics_wins_over_the_default() {
+        let awaited = succeeds_awaited(|ctx| async move {
+            ctx.step(|_| async { Ok(1_u32) })
+                .name("s")
+                .semantics(StepSemantics::AtLeastOnce)
+                .await
+                .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(awaited, [true]);
+    }
+
+    #[tokio::test]
+    async fn child_context_step_uses_the_default() {
+        let awaited = succeeds_awaited(|ctx| async move {
+            ctx.run_in_child_context(|child| async move {
+                child.step(|_| async { Ok(1_u32) }).name("s").await?;
+                Ok(())
+            })
+            .name("child")
+            .await
+            .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(awaited, [false]);
+    }
+
+    #[tokio::test]
+    async fn map_item_step_uses_the_default() {
+        let awaited = succeeds_awaited(|ctx| async move {
+            ctx.map(vec![1_u32], |item_ctx, item, _index| async move {
+                Ok(item_ctx.step(move |_| async move { Ok(item) }).await?)
+            })
+            .name("map")
+            .await
+            .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(awaited, [false]);
+    }
+
+    #[tokio::test]
+    async fn wait_for_callback_submitter_uses_the_default() {
+        let awaited = succeeds_awaited(|ctx| async move {
+            let _: String = ctx
+                .wait_for_callback(|_, _callback_id| async { Ok(()) })
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(awaited, [false]);
+    }
+}
+
 #[cfg(test)]
 mod pause_tests {
     //! Pausing the execution from a retry decision.

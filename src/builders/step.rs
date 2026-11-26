@@ -85,13 +85,14 @@ where
     /// Creates a new step builder (internal). Taking the closure here keeps
     /// the field non-optional: a builder without a body is unrepresentable.
     pub(crate) fn new_internal(ctx: DurableContext, op_id: OperationId, closure: F) -> Self {
+        let semantics = ctx.default_step_semantics();
         Self {
             ctx,
             op_id,
             name: None,
             retry_strategy: None,
             serdes: JsonSerdes,
-            semantics: crate::step::StepSemantics::default(),
+            semantics,
             sub_type: None,
             closure,
             _marker: PhantomData,
@@ -226,6 +227,12 @@ where
     /// - [`StepSemantics::AtMostOnce`](crate::StepSemantics::AtMostOnce): treat the interruption as a
     ///   failure and consult the retry strategy without re-executing. The
     ///   body starts only after `START` is acknowledged.
+    /// - [`StepSemantics::AtLeastOnceAsync`](crate::StepSemantics::AtLeastOnceAsync): as `AtLeastOnce`,
+    ///   but the step returns without waiting for the `SUCCEED` checkpoint.
+    ///
+    /// Without this call the step uses the execution's
+    /// [`default_step_semantics`](crate::OptionsBuilder::default_step_semantics),
+    /// which is `AtLeastOnce` unless set.
     ///
     /// This is a client-side configuration only: it does not affect the
     /// wire protocol.

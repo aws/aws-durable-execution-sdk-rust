@@ -204,3 +204,51 @@ async fn retryable_succeed_failure_reruns_the_step() {
     assert_eq!(result.invocation_count(), 2);
     assert!(result.operation("s").expect("step s").succeeded());
 }
+
+/// Runs one step under `own` semantics, on an execution whose
+/// `default_step_semantics` is `AtLeastOnceAsync`, with a 300 ms checkpoint
+/// latency. Returns the tokio time the step took.
+async fn step_time(own: Option<StepSemantics>) -> Duration {
+    let options = durable::Options::builder()
+        .default_step_semantics(StepSemantics::AtLeastOnceAsync)
+        .build()
+        .expect("valid options");
+    let took = Arc::new(Mutex::new(None));
+    let step_took = Arc::clone(&took);
+    let result = LocalRunner::new()
+        .checkpoint_latency(Duration::from_millis(300))
+        .options(options)
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let step_took = Arc::clone(&step_took);
+                async move {
+                    let begin = tokio::time::Instant::now();
+                    let step = ctx.step(|_| async { Ok(1_u32) }).name("s");
+                    let value = match own {
+                        Some(semantics) => step.semantics(semantics).await?,
+                        None => step.await?,
+                    };
+                    *step_took.lock().expect("lock") = Some(begin.elapsed());
+                    Ok::<_, BoxError>(value)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{result:?}");
+    assert!(result.operation("s").expect("step s").succeeded());
+    let took = *took.lock().expect("lock");
+    took.expect("the step returned")
+}
+
+/// `default_step_semantics` reaches the steps of a wrapped handler, and a
+/// step's own semantics wins: the async step waits only for `START`.
+#[tokio::test(start_paused = true)]
+async fn default_step_semantics_applies_to_steps() {
+    assert_eq!(step_time(None).await, Duration::from_millis(300));
+    assert_eq!(
+        step_time(Some(StepSemantics::AtLeastOnce)).await,
+        Duration::from_millis(600)
+    );
+}

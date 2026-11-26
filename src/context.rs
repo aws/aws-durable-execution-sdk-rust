@@ -485,6 +485,10 @@ struct Inner {
     /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth),
     /// copied into every derived context.
     preserve_child_depth: u32,
+    /// The invocation's
+    /// [`default_step_semantics`](crate::OptionsBuilder::default_step_semantics),
+    /// copied into every derived context.
+    default_step_semantics: crate::StepSemantics,
     /// True inside a body that runs again to rebuild the result of a
     /// recorded success (`ReplayChildren`). Copied into every derived context.
     rebuilding: bool,
@@ -601,6 +605,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
@@ -643,6 +648,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
@@ -685,6 +691,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
@@ -737,10 +744,28 @@ impl DurableContext {
                 plugins,
                 nesting_level: 0,
                 preserve_child_depth,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
         }
+    }
+
+    /// Sets the semantics of every step that sets none, in this root
+    /// context and every context derived from it (see
+    /// [`default_step_semantics`](crate::OptionsBuilder::default_step_semantics)).
+    pub(crate) fn with_default_step_semantics(mut self, semantics: crate::StepSemantics) -> Self {
+        #[expect(clippy::expect_used)]
+        // reason: the caller sets it on a new root context, before any clone
+        // or derived context holds its `Inner`.
+        let inner = Arc::get_mut(&mut self.inner).expect("a new root context is not shared");
+        inner.default_step_semantics = semantics;
+        self
+    }
+
+    /// The semantics of a step that sets none.
+    pub(crate) fn default_step_semantics(&self) -> crate::StepSemantics {
+        self.inner.default_step_semantics
     }
 
     /// Test-only root with an empty log, an in-memory client and the
@@ -815,6 +840,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
@@ -881,6 +907,7 @@ impl DurableContext {
                 plugins: self.inner.plugins.clone(),
                 nesting_level: self.inner.nesting_level.saturating_add(1),
                 preserve_child_depth: self.inner.preserve_child_depth,
+                default_step_semantics: self.inner.default_step_semantics,
                 rebuilding: self.inner.rebuilding || rebuilding,
             }),
             awaited: None,
@@ -933,6 +960,7 @@ impl DurableContext {
                 plugins: self.inner.plugins.clone(),
                 nesting_level: self.inner.nesting_level,
                 preserve_child_depth: self.inner.preserve_child_depth,
+                default_step_semantics: self.inner.default_step_semantics,
                 rebuilding: self.inner.rebuilding,
             }),
             awaited: None,
@@ -1178,6 +1206,7 @@ impl DurableContext {
                 plugins: self.inner.plugins.clone(),
                 nesting_level: self.inner.nesting_level,
                 preserve_child_depth: self.inner.preserve_child_depth,
+                default_step_semantics: self.inner.default_step_semantics,
                 rebuilding: self.inner.rebuilding,
             }),
             awaited: None,
@@ -4240,6 +4269,25 @@ mod tests {
             ),
         ] {
             assert_eq!((level(&ctx), ctx.inner.preserve_child_depth), (0, 0));
+        }
+    }
+
+    /// Every derived context keeps the root's default step semantics.
+    #[test]
+    fn derived_contexts_keep_default_step_semantics() {
+        use crate::StepSemantics;
+        let (root, _client) = DurableContext::test_context_with_depth(0);
+        assert_eq!(root.default_step_semantics(), StepSemantics::AtLeastOnce);
+        let root = root.with_default_step_semantics(StepSemantics::AtLeastOnceAsync);
+        let batch = root.new_child("1", None);
+        let normal = batch.new_child("1-1", None);
+        let flat = batch.new_flat_child("1-2", "parent", None);
+        let virtual_child = root.new_virtual_child("2", None);
+        for ctx in [&root, &batch, &normal, &flat, &virtual_child] {
+            assert_eq!(
+                ctx.default_step_semantics(),
+                StepSemantics::AtLeastOnceAsync
+            );
         }
     }
 
