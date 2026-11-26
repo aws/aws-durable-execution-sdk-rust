@@ -74,7 +74,7 @@ fi
 if [ "$FAIL" -ne 0 ]; then
     echo ""
     echo "An MSRV bump must update every declaration in the same pull request:"
-    echo "the root Cargo.toml, every Cargo.toml under conformance/ and examples/"
+    echo "the root Cargo.toml, every Cargo.toml under conformance/, examples/ and telemetry-exporter/"
     echo "that declares rust-version, the msrv job in $CI_WORKFLOW, and README.md."
     echo "See CONTRIBUTING.md for the bump policy."
     exit 1

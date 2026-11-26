@@ -170,11 +170,12 @@ jobs:
       - name: Check the feature powerset
         run: make feature-powerset
 
-  # The conformance handlers and examples are separate cargo workspaces with
-  # heavier dependency graphs, deliberately outside the SDK's `make check`.
-  # CI checks the formatting of each, builds Cargo's default members and
-  # lints every workspace member, so a public API change cannot silently
-  # break them.
+  # The conformance handlers, the examples and the telemetry exporter are
+  # separate cargo workspaces with heavier dependency graphs, deliberately
+  # outside the SDK's `make check`. CI checks the formatting of each, builds
+  # Cargo's default members and lints every workspace member, so a public API
+  # change cannot silently break them. The telemetry exporter also runs its
+  # tests and doc build.
   workspaces:
     name: check (${{ matrix.workspace }})
     # Same routing and timeout as the check job, on the default instance.
@@ -183,7 +184,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        workspace: [conformance, examples]
+        workspace: [conformance, examples, telemetry-exporter]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 

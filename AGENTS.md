@@ -149,9 +149,10 @@ in that repository.
 
 ## Working in this repository
 
-- The repository holds three independent cargo workspaces: the SDK crate at
+- The repository holds four independent cargo workspaces: the SDK crate at
   the root (`src/` and `tests/`), the conformance handlers
-  (`conformance/`), and the deployable examples (`examples/`).
+  (`conformance/`), the deployable examples (`examples/`), and the
+  telemetry exporter plugin (`telemetry-exporter/`).
 - Read [CONTRIBUTING.md](CONTRIBUTING.md) before making changes, and
   follow its [rules for every change](CONTRIBUTING.md#rules-for-every-change).
   Run `make check` before you push. It is the single quality gate, and

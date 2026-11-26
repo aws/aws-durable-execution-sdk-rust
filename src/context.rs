@@ -1556,6 +1556,19 @@ impl DurableContext {
         self.inner.engine.checkpoint_log.with_record(wire_id, f)
     }
 
+    /// [`Self::with_checkpoint_record_by_wire`], where `f` also gets the
+    /// record's sequence in the checkpoint log.
+    pub(crate) fn with_sequenced_checkpoint_record_by_wire<R>(
+        &self,
+        wire_id: &str,
+        f: impl FnOnce(u64, &CheckpointRecord) -> R,
+    ) -> Option<R> {
+        self.inner
+            .engine
+            .checkpoint_log
+            .with_sequenced_record(wire_id, f)
+    }
+
     /// Returns the compact view (status, attempt,
     /// `replay_children`) of the checkpoint record for the given positional
     /// ID, without cloning any of the record's owned strings.
@@ -2692,8 +2705,8 @@ impl DurableContext {
             .ids
             .iter()
             .filter_map(|id| {
-                log.with_record(id, |record| {
-                    crate::plugin::OperationInfo::from_record(id, record)
+                log.with_sequenced_record(id, |sequence, record| {
+                    crate::plugin::OperationInfo::from_sequenced_record(id, sequence, record)
                 })
             })
             .collect();
