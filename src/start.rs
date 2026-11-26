@@ -346,7 +346,9 @@ mod tests {
     ) -> Result<StartStep, OperationError> {
         let op_id = ctx.mint_id();
         let order = match semantics {
-            StepSemantics::AtLeastOncePerRetry => StartOrder::QueueThenHook,
+            StepSemantics::AtLeastOncePerRetry | StepSemantics::AtLeastOnceAsync => {
+                StartOrder::QueueThenHook
+            }
             StepSemantics::AtMostOncePerRetry => StartOrder::AwaitResponse,
         };
         start_step(

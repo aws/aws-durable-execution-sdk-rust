@@ -194,6 +194,31 @@ pub enum StepSemantics {
     /// Use this for non-idempotent operations (e.g., charging a credit
     /// card) where re-execution could produce duplicate side effects.
     AtMostOncePerRetry,
+
+    /// Like [`AtLeastOncePerRetry`](Self::AtLeastOncePerRetry), but the
+    /// step returns its result without waiting for the `SUCCEED`
+    /// checkpoint. So the step has lower latency.
+    ///
+    /// The code after the step can run before the result is saved. Every
+    /// invocation writes its pending checkpoints before it reports its
+    /// outcome, and the SDK sends checkpoints in order. So the result is
+    /// saved before any later checkpoint the service accepts, and before
+    /// the invocation ends. A failed `SUCCEED` write fails the invocation,
+    /// and the step runs again on replay, as under
+    /// `AtLeastOncePerRetry`.
+    ///
+    /// Only the success checkpoint is not awaited. A failed attempt waits
+    /// for its `RETRY` or `FAIL` checkpoint, as under
+    /// `AtLeastOncePerRetry`.
+    AtLeastOnceAsync,
+}
+
+impl StepSemantics {
+    /// Whether the step body runs again on replay when its previous attempt
+    /// was interrupted.
+    fn reruns_interrupted(self) -> bool {
+        self != Self::AtMostOncePerRetry
+    }
 }
 
 /// Wire sub-type for step operations.
@@ -501,9 +526,10 @@ where
                 operation_type: "Step",
                 sub_type: self.sub_type.as_str(),
                 name: self.name.as_deref(),
-                order: match self.semantics {
-                    StepSemantics::AtLeastOncePerRetry => crate::start::StartOrder::QueueThenHook,
-                    StepSemantics::AtMostOncePerRetry => crate::start::StartOrder::AwaitResponse,
+                order: if self.semantics.reruns_interrupted() {
+                    crate::start::StartOrder::QueueThenHook
+                } else {
+                    crate::start::StartOrder::AwaitResponse
                 },
             },
             |view| self.cycle(view),
@@ -527,7 +553,7 @@ where
             // hook.
             StartStep::Recorded(view)
                 if view.status == CheckpointStatus::Started
-                    && self.semantics == StepSemantics::AtLeastOncePerRetry =>
+                    && self.semantics.reruns_interrupted() =>
             {
                 None
             }
@@ -545,7 +571,7 @@ where
         // that attempt awaits START here, then fires its start hooks.
         let start = match start {
             None => None,
-            Some(start) if self.semantics == StepSemantics::AtLeastOncePerRetry => Some(start),
+            Some(start) if self.semantics.reruns_interrupted() => Some(start),
             Some(start) => {
                 if let Err(err) = start.await {
                     return self.ctx.checkpoint_failure_unrecoverable(err).await;
@@ -730,6 +756,7 @@ where
                 &self.serdes,
                 value,
                 attempt,
+                self.semantics != StepSemantics::AtLeastOnceAsync,
             )
             .await
             .map(StepSettled::Done),
@@ -771,9 +798,7 @@ pub(crate) fn step_cycle(
         | CheckpointStatus::Stopped => Cycle::Start {
             is_replay: view.attempt > 0,
         },
-        CheckpointStatus::Started if semantics == StepSemantics::AtLeastOncePerRetry => {
-            Cycle::Resume
-        }
+        CheckpointStatus::Started if semantics.reruns_interrupted() => Cycle::Resume,
         _ => Cycle::Record,
     }
 }
@@ -802,6 +827,9 @@ fn step_info(
 
 /// Handles a successful step execution: serialize, checkpoint, return.
 ///
+/// With `await_succeed` false, the step returns without waiting for the
+/// `SUCCEED` write (see [`StepSemantics::AtLeastOnceAsync`]).
+///
 /// The value round-trips through the configured wire format: ownership
 /// transfers to `serialize`, and the returned value is what `deserialize`
 /// produced from the stored wire string (round-trip parity).
@@ -815,6 +843,7 @@ async fn handle_success<O, S: Serdes<O>>(
     serdes: &S,
     value: O,
     attempt: u32,
+    await_succeed: bool,
 ) -> Result<O, OperationError> {
     let serdes_ctx = SerdesContext::new(wire_id, ctx.execution_arn());
 
@@ -846,7 +875,11 @@ async fn handle_success<O, S: Serdes<O>>(
 
     // Checkpoint SUCCEED with payload.
     let update = build_succeed_update(wire_id, name, sub_type, ctx.parent_wire_id(), &serialized);
-    if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+    let write = ctx.submit_checkpoint_updates(vec![update]);
+    // An async step drops the write: the write keeps its place in the
+    // write order and goes on. A failed write fails the invocation, and
+    // every invocation end waits for pending writes before it reports.
+    if await_succeed && let Err(err) = write.await {
         return ctx.checkpoint_failure_unrecoverable(err).await;
     }
 
@@ -3246,6 +3279,16 @@ mod tests {
     #[tokio::test]
     async fn step_at_least_once_replay_started_re_executes() {
         // Verify that the DEFAULT semantics still re-execute on Started replay.
+        step_replay_started_re_executes(StepSemantics::AtLeastOncePerRetry).await;
+    }
+
+    #[tokio::test]
+    async fn step_at_least_once_async_replay_started_re_executes() {
+        step_replay_started_re_executes(StepSemantics::AtLeastOnceAsync).await;
+    }
+
+    /// A step under `semantics` over a STARTED record runs its body again.
+    async fn step_replay_started_re_executes(semantics: StepSemantics) {
         use crate::engine::{CheckpointLog, CheckpointRecord};
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3300,7 +3343,7 @@ mod tests {
             name: None,
             retry_strategy: None,
             serdes: crate::serdes::JsonSerdes,
-            semantics: StepSemantics::AtLeastOncePerRetry,
+            semantics,
             sub_type: OperationSubType::STEP,
             plugin_name: None,
             closure,
@@ -3311,7 +3354,7 @@ mod tests {
         assert_eq!(result.unwrap(), 77);
         assert!(
             executed.load(Ordering::SeqCst),
-            "closure SHOULD execute under AtLeastOncePerRetry with Started replay"
+            "closure SHOULD execute under {semantics:?} with Started replay"
         );
     }
 
@@ -4432,6 +4475,55 @@ mod start_write_tests {
             "SUCCEED is in a later request"
         );
         assert!(matches!(outcome, InvocationOutcome::Complete(ref v) if v.starts_with("1@")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn at_least_once_async_returns_before_succeed_response() {
+        let (client, started, outcome) =
+            timed_step(Duration::ZERO, StepSemantics::AtLeastOnceAsync).await;
+        assert_eq!(started, ms(0), "the body starts before START is answered");
+        let succeed = client
+            .request_with(&OperationAction::Succeed)
+            .expect("SUCCEED");
+        assert_eq!(succeed.received, ms(500), "SUCCEED waits for START");
+        assert_eq!(
+            outcome,
+            InvocationOutcome::Complete("1@500".to_owned()),
+            "the step returns before SUCCEED is answered"
+        );
+    }
+
+    /// A step whose body fails with no retry, under `semantics`. Returns
+    /// the client and the tokio time the step returned its error.
+    async fn failing_step(semantics: StepSemantics) -> (Arc<LatencyClient>, Duration) {
+        let client = Arc::new(LatencyClient::new(LATENCY));
+        let ctx = latency_ctx(&client, Duration::ZERO);
+        let clock = Arc::clone(&client);
+        let returned = Arc::new(Mutex::new(None));
+        let step_returned = Arc::clone(&returned);
+        drive_handler(ctx, None, move |ctx| async move {
+            let result: Result<u32, _> = ctx
+                .step(|_| async { Err("boom".into()) })
+                .name("s")
+                .semantics(semantics)
+                .retry_strategy(|_, _| crate::RetryDecision::Stop)
+                .await;
+            *step_returned.lock().expect("lock") = Some(clock.elapsed());
+            result.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        let returned = returned.lock().expect("lock").expect("the step returned");
+        (client, returned)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn at_least_once_async_waits_for_fail_response() {
+        let (client, returned) = failing_step(StepSemantics::AtLeastOnceAsync).await;
+        let fail = client.request_with(&OperationAction::Fail).expect("FAIL");
+        assert_eq!(fail.received, ms(500));
+        assert_eq!(returned, ms(1000), "the step waits for FAIL");
     }
 
     #[tokio::test(start_paused = true)]
