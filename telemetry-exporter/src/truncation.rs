@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn many_dropped_operations_take_a_few_renders() {
         let r = steps(2_000);
-        // The CloudWatch Logs limit and the by-name form.
+        // The default record size limit and the by-name form.
         let by_name = renders(&r, 256_000, OperationsFormat::ByName);
         assert!(by_name < 40, "by name: {by_name} renders");
         for format in [OperationsFormat::Array, OperationsFormat::Both] {
