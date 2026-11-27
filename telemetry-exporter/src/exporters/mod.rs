@@ -8,6 +8,5 @@ mod lambda_log;
 pub use cloudwatch_logs::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
 pub use lambda_log::LambdaLogExporter;
 
-/// The default record size limit of both exporters. It is below the
-/// `CloudWatch` Logs limit of 1 MB on one log event.
+/// The default record size limit of both exporters.
 pub const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 256_000;
