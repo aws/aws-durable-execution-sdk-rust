@@ -44,6 +44,7 @@
 //! | Feature | Enables |
 //! | --- | --- |
 //! | `cloudwatch-logs` | `CloudWatchLogsExporter`, which writes to a log group of your choice |
+//! | `eventbridge` | `EventBridgeExporter`, which publishes each record as an event |
 
 // Compiles the README's Rust examples as doctests, so a README example that
 // stops compiling fails `cargo test`.
@@ -70,6 +71,8 @@ pub use exporter::{ExportFuture, TelemetryExporter};
 #[cfg(feature = "cloudwatch-logs")]
 pub use exporters::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
 pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
+#[cfg(feature = "eventbridge")]
+pub use exporters::{EventBridgeExporter, EventBridgeExporterBuilder};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
     ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
@@ -87,6 +90,11 @@ pub use truncation::truncate_record;
 // `Client` types would not match.
 #[cfg(feature = "cloudwatch-logs")]
 pub use aws_sdk_cloudwatchlogs::Client as CloudWatchLogsClient;
+
+// `EventBridgeExporterBuilder::client` takes this type. The re-export
+// serves the same purpose as the one above.
+#[cfg(feature = "eventbridge")]
+pub use aws_sdk_eventbridge::Client as EventBridgeClient;
 
 /// The `tracing` target of every event this crate logs.
 pub(crate) const TARGET: &str = "aws_durable_execution_sdk_telemetry_exporter";
