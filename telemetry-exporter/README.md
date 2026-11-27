@@ -60,10 +60,10 @@ aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["clou
 `LambdaLogExporter` and `CloudWatchLogsExporter` write the
 `operationsByName` form of the record. Both truncate a record larger than
 256,000 bytes. `AuroraExporter` stores the array form in the `record_json`
-column and truncates a record larger than 1,000,000 bytes. Truncation drops operation
-results first, then whole operations, then the input, then the output. A
-truncated record carries `truncated: true` and the counts of what it
-dropped.
+column and truncates a record larger than 1,000,000 bytes. Truncation
+drops operation results first, then whole operations, then the input, then
+the output. A truncated record carries `truncated: true` and the counts of
+what it dropped.
 
 Each size check serializes the whole record. So truncation does not check
 the size after every drop. Each phase binary searches the number of
@@ -125,7 +125,8 @@ let telemetry = DurableExecutionTelemetry::builder()
 ## Development
 
 The crate is its own cargo workspace. The SDK's dependency allowlist does
-not include `aws-sdk-cloudwatchlogs` or `aws-sdk-rdsdata`, so the crate is not a member of the
-root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
-formatting, builds, lints, runs the tests and builds the docs. It lints,
-tests and builds the docs twice: with no feature and with every feature.
+not include `aws-sdk-cloudwatchlogs` or `aws-sdk-rdsdata`, so the crate is
+not a member of the root workspace.
+`make workspaces WORKSPACES=telemetry-exporter` checks the formatting,
+builds, lints, runs the tests and builds the docs. It lints, tests and
+builds the docs twice: with no feature and with every feature.
