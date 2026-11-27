@@ -112,9 +112,15 @@ impl OtelExporter {
                 record.emitted_at
             )
         })?;
-        // The nanosecond count of a time in the `i64` millisecond range
-        // exceeds `i64`, so the product uses `i128`.
-        let time_nanos = (i128::from(time_ms) * 1_000_000).to_string();
+        // OTLP defines `timeUnixNano` as an unsigned 64-bit count. So a
+        // time before the epoch or after the year 2554 has no valid
+        // value. The product uses `i128` because it can exceed `i64`.
+        let time_nanos = u64::try_from(i128::from(time_ms) * 1_000_000).map_err(|_| {
+            format!(
+                "OtelExporter: emittedAt is outside the OTLP time range: {}",
+                record.emitted_at
+            )
+        })?;
         let status = match record.status {
             ExecutionStatus::Failed => "FAILED",
             ExecutionStatus::Succeeded => "SUCCEEDED",
@@ -143,7 +149,7 @@ impl OtelExporter {
                         "version": record.schema_version,
                     },
                     "logRecords": [{
-                        "timeUnixNano": time_nanos,
+                        "timeUnixNano": time_nanos.to_string(),
                         "severityNumber": severity,
                         "severityText": status,
                         "body": { "stringValue": body },
@@ -467,6 +473,32 @@ mod tests {
             error.to_string(),
             "OtelExporter: emittedAt is not an ISO 8601 UTC time: yesterday"
         );
+    }
+
+    #[test]
+    fn an_emitted_at_outside_the_otlp_time_range_is_an_error() {
+        for emitted_at in ["1969-12-31T23:59:59.999Z", "2554-07-21T23:34:33.710Z"] {
+            let mut r = record(vec![]);
+            r.emitted_at = emitted_at.to_owned();
+            let error = exporter().payload(&r).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("OtelExporter: emittedAt is outside the OTLP time range: {emitted_at}")
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_and_last_representable_times_are_accepted() {
+        for (emitted_at, nanos) in [
+            ("1970-01-01T00:00:00.000Z", "0"),
+            ("2554-07-21T23:34:33.709Z", "18446744073709000000"),
+        ] {
+            let mut r = record(vec![]);
+            r.emitted_at = emitted_at.to_owned();
+            let payload = payload_of(&exporter(), &r);
+            assert_eq!(log_record(&payload)["timeUnixNano"], nanos);
+        }
     }
 
     #[test]
