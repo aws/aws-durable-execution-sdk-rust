@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Telemetry Conformance Test Examples - Rust
+
+# The shared telemetry-suite workflow of aws-durable-execution-conformance-tests
+# deploys this template. Its file name does not match template_*.yaml, so
+# scripts/conformance.sh does not run it with the other suites.
+#
+# conformance/build_examples.sh stages each handler in conformance/publish/.
+# So each CodeUri points one directory up.
+
+Parameters:
+  LambdaExecutionRoleArn:
+    Type: String
+    Description: Pre-created execution role for the test functions
+  TelemetryLogGroupName:
+    Type: String
+    Description: CloudWatch Logs group that receives Durable Execution Telemetry records
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures:
+      - x86_64
+    Timeout: 60
+    MemorySize: 128
+    DurableConfig:
+      ExecutionTimeout: 300
+      RetentionPeriodInDays: 1
+    Environment:
+      Variables:
+        TELEMETRY_LOG_GROUP_NAME: !Ref TelemetryLogGroupName
+
+Resources:
+  # The suite has no pre-deploy hook. So CloudFormation creates the group
+  # before the runner invokes any function.
+  TelemetryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref TelemetryLogGroupName
+      RetentionInDays: 1
+
+  Telemetry1Success:
+    Type: AWS::Serverless::Function
+    DependsOn: TelemetryLogGroup
+    TestingMetadata:
+      TestDescription:
+        - telemetry-1
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../publish/telemetry_1_success/
+      Handler: bootstrap
+      FunctionName: !Sub "${AWS::StackName}-telemetry-1"
+      Description: 'Telemetry conformance telemetry-1: a single-step success record'
+      Role: !Ref LambdaExecutionRoleArn
+
+  Telemetry2Failure:
+    Type: AWS::Serverless::Function
+    DependsOn: TelemetryLogGroup
+    TestingMetadata:
+      TestDescription:
+        - telemetry-2
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../publish/telemetry_2_failure/
+      Handler: bootstrap
+      FunctionName: !Sub "${AWS::StackName}-telemetry-2"
+      Description: 'Telemetry conformance telemetry-2: a single-step failure record'
+      Role: !Ref LambdaExecutionRoleArn
+
+  Telemetry3ResultSelect:
+    Type: AWS::Serverless::Function
+    DependsOn: TelemetryLogGroup
+    TestingMetadata:
+      TestDescription:
+        - telemetry-3
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../publish/telemetry_3_result_select/
+      Handler: bootstrap
+      FunctionName: !Sub "${AWS::StackName}-telemetry-3"
+      Description: 'Telemetry conformance telemetry-3: a per-operation result transform'
+      Role: !Ref LambdaExecutionRoleArn
+
+  Telemetry4FullTreeMap:
+    Type: AWS::Serverless::Function
+    DependsOn: TelemetryLogGroup
+    TestingMetadata:
+      TestDescription:
+        - telemetry-4
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../publish/telemetry_4_full_tree_map/
+      Handler: bootstrap
+      FunctionName: !Sub "${AWS::StackName}-telemetry-4"
+      Description: 'Telemetry conformance telemetry-4: a full-tree map record'
+      Role: !Ref LambdaExecutionRoleArn

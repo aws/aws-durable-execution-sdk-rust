@@ -101,6 +101,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-durable-execution-sdk-telemetry-exporter"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-durable-execution-sdk",
+ "aws-sdk-cloudwatchlogs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -147,6 +160,32 @@ dependencies = [
  "pin-project-lite",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aws-sdk-cloudwatchlogs"
+version = "1.157.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f6e015fb4953ff5aa49982d62591ff395c130487d2748daadf6762c0d4f894d"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json 0.63.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 0.2.1",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]
@@ -3627,6 +3666,50 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "telemetry_1_success"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "aws-durable-execution-sdk-telemetry-exporter",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "telemetry_2_failure"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "aws-durable-execution-sdk-telemetry-exporter",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "telemetry_3_result_select"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "aws-durable-execution-sdk-telemetry-exporter",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "telemetry_4_full_tree_map"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "aws-durable-execution-sdk-telemetry-exporter",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
