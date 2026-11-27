@@ -12,9 +12,8 @@ pub use lambda_log::LambdaLogExporter;
 #[cfg(feature = "s3")]
 pub use s3::{S3Exporter, S3ExporterBuilder, S3Partitioning};
 
-/// The `CloudWatch` Logs limit on one log event, which
-/// [`LambdaLogExporter`] and `CloudWatchLogsExporter`
-/// use as their default record size limit.
+/// The default record size limit of [`LambdaLogExporter`] and
+/// `CloudWatchLogsExporter`.
 pub const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 256_000;
 
 /// The export error for a failed call of `operation`.
