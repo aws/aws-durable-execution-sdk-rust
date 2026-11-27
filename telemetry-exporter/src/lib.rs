@@ -44,6 +44,7 @@
 //! | Feature | Enables |
 //! | --- | --- |
 //! | `cloudwatch-logs` | `CloudWatchLogsExporter`, which writes to a log group of your choice |
+//! | `sqs` | `SqsExporter`, which sends each record to an SQS queue |
 
 // Compiles the README's Rust examples as doctests, so a README example that
 // stops compiling fails `cargo test`.
@@ -70,6 +71,8 @@ pub use exporter::{ExportFuture, TelemetryExporter};
 #[cfg(feature = "cloudwatch-logs")]
 pub use exporters::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
 pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
+#[cfg(feature = "sqs")]
+pub use exporters::{SqsExporter, SqsExporterBuilder};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
     ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
@@ -87,6 +90,13 @@ pub use truncation::truncate_record;
 // `Client` types would not match.
 #[cfg(feature = "cloudwatch-logs")]
 pub use aws_sdk_cloudwatchlogs::Client as CloudWatchLogsClient;
+
+// `SqsExporterBuilder::client` takes this type, which another crate
+// defines. Without the re-export, a caller would need a direct dependency
+// on `aws-sdk-sqs` to name it, and the caller's version of that crate could
+// differ from this crate's version.
+#[cfg(feature = "sqs")]
+pub use aws_sdk_sqs::Client as SqsClient;
 
 /// The `tracing` target of every event this crate logs.
 pub(crate) const TARGET: &str = "aws_durable_execution_sdk_telemetry_exporter";
