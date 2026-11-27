@@ -2,9 +2,9 @@
 # The telemetry exporter is its OWN cargo workspace, like conformance/ and
 # examples/. The root workspace's direct-dependency allowlist
 # (scripts/check-direct-deps.sh) covers every root member, and this crate's
-# `cloudwatch-logs` feature depends on aws-sdk-cloudwatchlogs, which is not
-# on that list. A separate workspace keeps the SDK's dependency graph
-# unchanged.
+# exporter features depend on AWS service clients
+# (aws-sdk-cloudwatchlogs, aws-sdk-sqs), which are not on that list. A
+# separate workspace keeps the SDK's dependency graph unchanged.
 members = ["."]
 resolver = "2"
 
@@ -52,6 +52,8 @@ workspace = true
 [features]
 # Enables `CloudWatchLogsExporter`.
 cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs"]
+# Enables `SqsExporter`.
+sqs = ["dep:aws-config", "dep:aws-sdk-sqs", "dep:sha2"]
 
 [dependencies]
 aws-durable-execution-sdk = { path = ".." }
@@ -66,8 +68,16 @@ aws-sdk-cloudwatchlogs = { version = "1", optional = true, default-features = fa
     "default-https-client",
     "rt-tokio",
 ] }
+aws-sdk-sqs = { version = "1", optional = true, default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The SQS exporter hashes a FIFO ID that is over the length limit. The root
+# crate already uses this version.
+sha2 = { version = "0.10", optional = true }
 tokio = { version = "1.44", features = ["rt", "sync"] }
 tracing = "0.1"
 
@@ -78,6 +88,8 @@ aws-durable-execution-sdk = { path = "..", features = ["test-util"] }
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = [
     "test-util",
 ] }
+# The SQS exporter tests mock the service client the same way.
+aws-sdk-sqs = { version = "1", default-features = false, features = ["test-util"] }
 aws-smithy-mocks = "0.3"
 # Installs a test's tracing subscriber so that it receives an event
 # whichever thread reached the event's callsite first.

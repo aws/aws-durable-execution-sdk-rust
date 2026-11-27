@@ -123,9 +123,11 @@ dependencies = [
  "aws-config",
  "aws-durable-execution-sdk",
  "aws-sdk-cloudwatchlogs",
+ "aws-sdk-sqs",
  "aws-smithy-mocks",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "test-tracing",
  "tokio",
  "tracing",
@@ -215,6 +217,31 @@ dependencies = [
  "aws-runtime",
  "aws-smithy-async",
  "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-sqs"
+version = "1.122.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f858da807ceda1df8880f557f17dbb4c995a6210282d3692602bcff45eefa85"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
  "aws-smithy-http",
  "aws-smithy-json",
  "aws-smithy-observability",
