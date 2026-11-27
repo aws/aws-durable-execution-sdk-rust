@@ -25,7 +25,7 @@ unsafe_code = "forbid"
 
 [dependencies]
 aws-durable-execution-sdk = { path = "../../.." }
-aws-durable-execution-sdk-telemetry-exporter = { path = "../../../telemetry-exporter" }
+aws-durable-execution-sdk-telemetry-exporter = { path = "../../../telemetry-exporter", features = ["cloudwatch-logs"] }
 lambda_runtime = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
