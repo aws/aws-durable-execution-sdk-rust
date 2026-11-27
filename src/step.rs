@@ -918,7 +918,12 @@ async fn handle_success<O, S: Serdes<O>>(
     // An async step drops the write: the write keeps its place in the
     // write order and goes on. A failed write fails the invocation, and
     // every invocation end waits for pending writes before it reports.
-    if await_succeed && let Err(err) = write.await {
+    // A write that admission rejected is awaited, so the step stops there
+    // as an awaited step does: the scope it runs in was abandoned, or the
+    // invocation recorded a fatal error.
+    if (await_succeed || write.is_rejected())
+        && let Err(err) = write.await
+    {
         return ctx.checkpoint_failure_unrecoverable(err).await;
     }
 
@@ -4878,6 +4883,101 @@ mod default_semantics_tests {
         })
         .await;
         assert_eq!(awaited, [false]);
+    }
+}
+
+/// An `AtLeastOnceAsync` step whose `SUCCEED` admission rejects stops, as
+/// an awaited step does: the code after it does not run.
+#[cfg(test)]
+mod rejected_succeed_tests {
+    use crate::StepSemantics;
+    use crate::context::DurableContext;
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{drive_handler, wire_err};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Drives a handler whose async step runs `reject` in its body, in a
+    /// child context, and then sets a flag. Returns whether the flag was
+    /// set, the outcome (`None` when the drive did not end within 10 s of
+    /// tokio time), and the client.
+    async fn run(
+        reject: fn(&DurableContext),
+    ) -> (
+        bool,
+        Option<InvocationOutcome>,
+        Arc<crate::client::InMemoryExecutionClient>,
+    ) {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::test_context_with_depth_and_client(
+            0,
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+        );
+        let after = Arc::new(AtomicBool::new(false));
+        let step_after = Arc::clone(&after);
+        let drive = drive_handler(ctx, None, move |ctx| async move {
+            ctx.run_in_child_context(move |child| async move {
+                let body_ctx = child.clone();
+                child
+                    .step(move |_| async move {
+                        reject(&body_ctx);
+                        Ok(1_u32)
+                    })
+                    .name("s")
+                    .semantics(StepSemantics::AtLeastOnceAsync)
+                    .await?;
+                step_after.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .name("child")
+            .await
+            .map_err(wire_err)?;
+            Ok("done".to_owned())
+        });
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), drive)
+            .await
+            .ok()
+            .map(|outcome| outcome.expect("no panic"));
+        (after.load(Ordering::SeqCst), outcome, client)
+    }
+
+    /// Whether `client` received a `SUCCEED` for a step.
+    fn sent_step_succeed(client: &crate::client::InMemoryExecutionClient) -> bool {
+        client.recorded_updates().iter().any(|u| {
+            u.action() == &aws_sdk_lambda::types::OperationAction::Succeed
+                && u.r#type() == &aws_sdk_lambda::types::OperationType::Step
+        })
+    }
+
+    /// The scope the step runs in is abandoned, as a batch abandons an
+    /// item at early completion. The step never returns. In a batch the
+    /// SDK also aborts the item's task.
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_scope_stops_the_step() {
+        let (after, outcome, client) = run(|ctx| {
+            ctx.admission()
+                .abandon(ctx.owners().iter().map(String::as_str));
+        })
+        .await;
+        assert!(!after, "the code after the step does not run");
+        assert!(!sent_step_succeed(&client));
+        assert_eq!(outcome, None, "the step never returns");
+    }
+
+    /// The invocation recorded a fatal error, so no write is admitted.
+    #[tokio::test(start_paused = true)]
+    async fn fatal_error_stops_the_step() {
+        let (after, outcome, client) = run(|ctx| {
+            ctx.coordinator()
+                .record_fatal("Fatal".to_owned(), "stop".to_owned());
+        })
+        .await;
+        assert!(!after, "the code after the step does not run");
+        assert!(!sent_step_succeed(&client));
+        assert!(
+            matches!(outcome, Some(InvocationOutcome::Failed { .. })),
+            "{outcome:?}"
+        );
     }
 }
 

@@ -69,6 +69,8 @@ pub(crate) struct SubmittedWrite {
     /// when its result is ready (see [`Self::reported_by`]). `None` without
     /// plugins, and once delivered.
     report: Option<Box<WriteReport>>,
+    /// Whether admission rejected the write (see [`Self::rejected`]).
+    rejected: bool,
 }
 
 /// What a [`SubmittedWrite`] needs to deliver the change sets through its
@@ -99,6 +101,7 @@ impl SubmittedWrite {
             #[cfg(test)]
             first_poll: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             report: None,
+            rejected: false,
         }
     }
 
@@ -136,7 +139,17 @@ impl SubmittedWrite {
     /// A rejected write: nothing is sent, and the result never resolves.
     /// The rejected caller's task is being cancelled (see [`Admission`]).
     fn rejected() -> Self {
-        Self::new(std::future::pending())
+        Self {
+            rejected: true,
+            ..Self::new(std::future::pending())
+        }
+    }
+
+    /// Whether admission rejected the write: nothing is sent, and the
+    /// result never resolves. A caller that does not await the write
+    /// awaits a rejected one, so it stops as an awaiting caller does.
+    pub(crate) fn is_rejected(&self) -> bool {
+        self.rejected
     }
 }
 

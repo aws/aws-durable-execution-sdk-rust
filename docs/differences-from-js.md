@@ -269,10 +269,10 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### Async steps in an abandoned batch item
 
 - **JavaScript:** An abandoned `map` item or `parallel` branch keeps running new `AtLeastOnceAsync` steps after the batch completes, with no record in the history.
-- **Rust:** The SDK aborts the abandoned item's task and rejects its writes, so an async step does not keep the item running.
+- **Rust:** The SDK aborts the abandoned item's task and rejects its writes, so an async step does not keep the item running. An async step whose `SUCCEED` is rejected waits on it as an awaited step does, so it never returns and fires no end hook.
 - **Why:** Rust stops an abandoned item whatever the step semantics (see "Items running at early completion").
 - **Decision:** Same capability in Rust form.
-- **Where:** `src/map_parallel.rs`, `produce_batch`; `src/checkpoint_coalescer.rs`, `Admission`.
+- **Where:** `src/map_parallel.rs`, `produce_batch`; `src/checkpoint_coalescer.rs`, `Admission`; `src/step.rs`, `handle_success`.
 
 ### `pause_every` and the backoff
 
