@@ -12,6 +12,6 @@ pub use cloudwatch_logs::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder}
 pub use eventbridge::{EventBridgeExporter, EventBridgeExporterBuilder};
 pub use lambda_log::LambdaLogExporter;
 
-/// The `CloudWatch` Logs limit on one log event. The `CloudWatch` Logs and `EventBridge`
-/// exporters use it as their default record size limit.
+/// The `CloudWatch` Logs limit on one log event. The `CloudWatch` Logs and
+/// `EventBridge` exporters use it as their default record size limit.
 pub const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 256_000;
