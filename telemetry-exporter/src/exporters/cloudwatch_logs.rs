@@ -5,12 +5,13 @@ use std::sync::Mutex;
 
 use aws_durable_execution_sdk::BoxError;
 use aws_sdk_cloudwatchlogs::Client;
-use aws_sdk_cloudwatchlogs::error::{DisplayErrorContext, SdkError};
+use aws_sdk_cloudwatchlogs::error::SdkError;
 use aws_sdk_cloudwatchlogs::operation::create_log_stream::CreateLogStreamError;
 use aws_sdk_cloudwatchlogs::operation::put_log_events::PutLogEventsError;
 use aws_sdk_cloudwatchlogs::types::InputLogEvent;
 
 use super::DEFAULT_MAX_RECORD_SIZE_BYTES;
+use super::call_error::call_error;
 use crate::exporter::{ExportFuture, TelemetryExporter};
 use crate::record::TelemetryRecord;
 use crate::render::{OperationsFormat, render_json};
@@ -167,19 +168,6 @@ impl CloudWatchLogsExporter {
             .map_err(Box::new)?;
         Ok(())
     }
-}
-
-/// The export error for a failed call of `operation`.
-///
-/// The `Display` text of an `SdkError` is a fixed string for each variant,
-/// such as "service error". The service's error code and message are in
-/// the error's sources. The scheduler logs only the `Display` text of an
-/// export error. So the text here includes the sources.
-fn call_error<E>(operation: &str, error: &SdkError<E>) -> BoxError
-where
-    E: std::error::Error + 'static,
-{
-    format!("{operation} failed: {}", DisplayErrorContext(error)).into()
 }
 
 /// Whether `PutLogEvents` failed because the log stream does not exist.
