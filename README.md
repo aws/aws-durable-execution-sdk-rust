@@ -597,9 +597,10 @@ failure carries the error type `StepInterruptedError`.
 without waiting for the service to save its result. So the step has lower
 latency.
 The SDK sends checkpoints in order and writes every pending checkpoint
-before the invocation ends. If the invocation ends before the save, the step
-runs again on replay. Later steps then run again too, and the step can return
-a different value. So do not use it for a step whose result becomes an
+before the invocation ends. If a retryable save fails, or the invocation ends
+before the save, the step runs again on replay. A permanent checkpoint failure
+fails the execution. When the step runs again, later steps run again too, and
+the step can return a different value. So do not use it for a step whose result becomes an
 idempotency key for a later step. This value is experimental. It may change
 or be removed in a future release.
 

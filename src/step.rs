@@ -168,7 +168,9 @@ pub(crate) fn quantize_delay(secs: f64) -> Duration {
 /// The deprecated `AtLeastOncePerRetry` and `AtMostOncePerRetry` names
 /// behave as `AtLeastOnce` and `AtMostOnce`, and compare equal to them
 /// with `==`. A `match` that lists only the new names does not match the
-/// deprecated ones.
+/// deprecated ones. The reverse also holds: [`StepSemantics::default`] is
+/// now `AtLeastOnce`, and its `Debug` output is `AtLeastOnce`, so a `match`
+/// arm written for `AtLeastOncePerRetry` does not match the default.
 #[derive(Debug, Clone, Copy, Eq, Default)]
 #[non_exhaustive]
 pub enum StepSemantics {

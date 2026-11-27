@@ -253,7 +253,7 @@ This page lists every place where the Rust SDK behaves differently from the Java
 ### Deprecated step semantics names
 
 - **JavaScript:** `AtLeastOncePerRetry` and `AtMostOncePerRetry` are deprecated aliases with the same enum values as `AtLeastOnce` and `AtMostOnce`.
-- **Rust:** They are deprecated variants. `==` treats each as equal to its new name, and the SDK compares semantics with `==`. A `match` arm and the `Debug` output still tell them apart.
+- **Rust:** They are deprecated variants. `==` treats each as equal to its new name, and the SDK compares semantics with `==`. A `match` arm and the `Debug` output still tell them apart. `StepSemantics::default()` is now `AtLeastOnce`, so a `match` arm written for `AtLeastOncePerRetry` does not match it.
 - **Why:** A Rust enum cannot give one variant two names.
 - **Decision:** Rust language.
 - **Where:** `src/step.rs`, `StepSemantics` and its `PartialEq`.
