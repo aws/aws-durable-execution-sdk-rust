@@ -96,8 +96,8 @@ summary-order-consumer-test:
 	cd examples && cargo test --locked -p parallel_heterogeneous
 
 # The telemetry exporter is a separate workspace because it depends on
-# aws-sdk-cloudwatchlogs and the aws-smithy HTTP crates, which the SDK's
-# dependency allowlist does not include. So its tests and doc build run
+# aws-sdk-cloudwatchlogs, aws-sigv4 and the aws-smithy HTTP crates, which
+# the SDK's dependency allowlist does not include. So its tests and doc build run
 # here, not in check-sdk.
 workspace-telemetry-exporter: telemetry-exporter-test
 #
