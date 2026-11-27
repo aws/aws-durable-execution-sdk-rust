@@ -13,7 +13,7 @@ use crate::render::{OperationsFormat, render_json};
 const DEFAULT_TABLE: &str = "durable_execution_telemetry";
 
 /// The default record size limit in bytes.
-const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 1_000_000;
+const DEFAULT_AURORA_MAX_RECORD_SIZE_BYTES: usize = 1_000_000;
 
 /// The database engine of the Aurora cluster. It selects the SQL dialect of
 /// the upsert statement.
@@ -41,6 +41,10 @@ pub enum AuroraEngine {
 /// The exporter does not create the table. On PostgreSQL, the time columns
 /// are `timestamptz` and `record_json` is `jsonb`. The statement casts
 /// its text parameters to these types.
+///
+/// The exporter sends the time columns as ISO 8601 text that ends in `Z`,
+/// for example `2026-01-01T00:00:00.000Z`. The statement for MySQL does not
+/// convert the text. So a MySQL time column must accept that form.
 ///
 /// `record_json` holds the record with the `operations` array.
 ///
@@ -90,7 +94,7 @@ impl AuroraExporter {
             table: DEFAULT_TABLE.to_owned(),
             engine,
             region: None,
-            max_record_size_bytes: DEFAULT_MAX_RECORD_SIZE_BYTES,
+            max_record_size_bytes: DEFAULT_AURORA_MAX_RECORD_SIZE_BYTES,
             client: None,
         }
     }
