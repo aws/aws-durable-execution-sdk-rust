@@ -16,12 +16,16 @@ use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 
+/// The most bytes of a response body that the sender reads. It drops the rest.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
 /// The status and the body text of an HTTP response.
 #[derive(Debug)]
 pub(crate) struct HttpResponse {
     /// The status code, for example 200.
     pub(crate) status: u16,
-    /// The body. Bytes that are not UTF-8 are replaced with U+FFFD.
+    /// The first 64 KiB of the body. Bytes that are not UTF-8 are replaced
+    /// with U+FFFD.
     pub(crate) body: String,
 }
 
@@ -90,7 +94,7 @@ impl HttpSender {
             .map_err(|error| format!("invalid HTTP method {method:?}: {error}"))?;
         request
             .set_uri(url)
-            .map_err(|error| format!("invalid URL {url:?}: {error}"))?;
+            .map_err(|error| format!("invalid URL: {error}"))?;
         for (name, value) in headers {
             request
                 .headers_mut()
@@ -111,11 +115,17 @@ impl HttpSender {
             .await
             .map_err(|error| error_chain("request failed", &error))?;
         let status = response.status().as_u16();
-        let bytes = ByteStream::new(response.into_body())
-            .collect()
-            .await
-            .map_err(|error| error_chain("reading the response failed", &error))?
-            .into_bytes();
+        let mut stream = ByteStream::new(response.into_body());
+        let mut bytes = Vec::new();
+        while bytes.len() < MAX_BODY_BYTES {
+            let chunk = stream
+                .try_next()
+                .await
+                .map_err(|error| error_chain("reading the response failed", &error))?;
+            let Some(chunk) = chunk else { break };
+            bytes.extend_from_slice(&chunk);
+        }
+        bytes.truncate(MAX_BODY_BYTES);
         Ok(HttpResponse {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
@@ -273,6 +283,18 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn reads_only_the_first_64_kib_of_a_long_body() {
+        let body = "y".repeat(200_000);
+        let (url, _server) = serve_once(reply(200, "OK", &body)).await;
+        let sender = HttpSender::new(Duration::from_secs(5));
+        let response = sender
+            .send("POST", &url, &[], String::new())
+            .await
+            .expect("sent");
+        assert_eq!(response.body.len(), MAX_BODY_BYTES);
+    }
+
+    #[tokio::test]
     async fn reports_a_non_success_status_without_failing() {
         let (url, _server) = serve_once(reply(503, "Service Unavailable", "busy")).await;
         let sender = HttpSender::new(Duration::from_secs(5));
@@ -325,7 +347,9 @@ pub(crate) mod tests {
         let uri = sender
             .send("POST", "http://exa mple/", &[], String::new())
             .await;
-        assert!(uri.unwrap_err().to_string().starts_with("invalid URL"));
+        let uri = uri.unwrap_err().to_string();
+        assert!(uri.starts_with("invalid URL: "), "{uri}");
+        assert!(!uri.contains("exa mple"), "{uri}");
         let header = sender
             .send("POST", url, &headers(&[("bad name", "v")]), String::new())
             .await;
