@@ -74,6 +74,9 @@ impl Candidate<'_> {
         let format = match self.measure {
             Measure::Format(format) => format,
             Measure::Text(text) => {
+                if self.unmeasured.get() {
+                    return true;
+                }
                 let mut kept = self.kept.iter();
                 let mut record = self.record.clone();
                 record
@@ -601,6 +604,25 @@ mod tests {
             truncate_measured(&r, Some(15), Measure::Text(&measure)),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn no_candidate_is_measured_after_one_had_no_text() {
+        let r = record(vec![
+            timed("d", Some(40), None),
+            timed("c", Some(30), None),
+            timed("b", Some(20), None),
+            timed("a", Some(10), None),
+        ]);
+        let calls = Cell::new(0);
+        let measure = |record: &TelemetryRecord| {
+            calls.set(calls.get() + 1);
+            (record.operations.len() >= 4).then_some(record.operations.len() * 10)
+        };
+        let out = truncate_measured(&r, Some(15), Measure::Text(&measure));
+        assert!(matches!(out, Cow::Borrowed(_)));
+        // One call for the whole record and one for the first candidate.
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

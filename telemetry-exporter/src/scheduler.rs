@@ -449,7 +449,12 @@ impl Scheduler {
                         Ok(Err(error)) => {
                             let error = describe_error(error);
                             log_contained(|| {
-                                tracing::warn!(target: crate::TARGET, exporter = index, %error, "telemetry record could not be measured");
+                                tracing::warn!(
+                                    target: crate::TARGET,
+                                    exporter = index,
+                                    %error,
+                                    "telemetry record could not be measured"
+                                );
                             });
                             None
                         }

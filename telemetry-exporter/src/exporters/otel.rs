@@ -39,9 +39,11 @@ pub enum OtlpProtocol {
 /// that you add with [`header`](OtelExporterBuilder::header) replaces a
 /// default header with the same name, ignoring case.
 ///
-/// The log record's body is the record's JSON, as a string. The resource
-/// carries the function's name, region, account and qualifier. The log
-/// record's attributes carry the execution ARN, name, status and duration.
+/// The instrumentation scope is this crate's name, with the record's schema
+/// version as its version. The log record's body is the record's JSON, as a
+/// string. The resource carries the function's name, region, account and
+/// qualifier. The log record's attributes carry the execution ARN, name,
+/// status and duration.
 /// The severity is 17 (`ERROR`) for a failed execution, 9 (`INFO`) for a
 /// running or succeeded one.
 ///
@@ -131,6 +133,7 @@ impl OtelExporter {
         } else {
             9
         };
+        let duration = record.duration_ms.unwrap_or(0).to_string();
         let body = render_json(record, self.operations_format)?;
         let payload = json!({
             "resourceLogs": [{
@@ -162,7 +165,7 @@ impl OtelExporter {
                             string_attribute("workflow.status", status),
                             {
                                 "key": "workflow.duration_ms",
-                                "value": { "intValue": record.duration_ms.unwrap_or(0).to_string() },
+                                "value": { "intValue": duration },
                             },
                         ],
                     }],
