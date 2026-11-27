@@ -10,7 +10,7 @@ use crate::record::{ExecutionStatus, TelemetryRecord};
 use crate::render::{OperationsFormat, render_json};
 
 /// The default record size limit, in bytes. It differs from the crate-wide
-/// `DEFAULT_MAX_RECORD_SIZE_BYTES`, which is the `CloudWatch` Logs limit.
+/// `DEFAULT_MAX_RECORD_SIZE_BYTES`.
 const DEFAULT_REDSHIFT_MAX_RECORD_SIZE_BYTES: usize = 1_000_000;
 
 /// The default table name.

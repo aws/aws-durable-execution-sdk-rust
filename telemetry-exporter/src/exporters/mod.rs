@@ -12,6 +12,6 @@ pub use lambda_log::LambdaLogExporter;
 #[cfg(feature = "redshift")]
 pub use redshift::{RedshiftExporter, RedshiftExporterBuilder};
 
-/// The `CloudWatch` Logs limit on one log event. `LambdaLogExporter` and
-/// `CloudWatchLogsExporter` use it as their default record size limit.
+/// The default record size limit of [`LambdaLogExporter`] and
+/// `CloudWatchLogsExporter`.
 pub const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 256_000;
