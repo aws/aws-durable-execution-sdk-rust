@@ -12,6 +12,6 @@ pub use lambda_log::LambdaLogExporter;
 #[cfg(feature = "sqs")]
 pub use sqs::{SqsExporter, SqsExporterBuilder};
 
-/// The default record size limit of both exporters. It is below the
-/// `CloudWatch` Logs limit of 1 MB on one log event.
+/// The default record size limit of `LambdaLogExporter`,
+/// `CloudWatchLogsExporter` and `SqsExporter`.
 pub const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 256_000;
