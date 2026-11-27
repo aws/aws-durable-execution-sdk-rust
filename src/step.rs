@@ -226,6 +226,11 @@ pub enum StepSemantics {
     /// The step still waits for its `START` response before it submits
     /// `SUCCEED`, as under `AtLeastOnce`.
     ///
+    /// The plugin hooks `on_attempt_end` and `on_operation_end` fire when
+    /// the service accepted the `SUCCEED`, as under `AtLeastOnce`, so they
+    /// can fire after the code that follows the step. A failed `SUCCEED`
+    /// fires neither.
+    ///
     /// Only the success checkpoint is not awaited. A failed attempt waits
     /// for its `RETRY` or `FAIL` checkpoint, as under
     /// `AtLeastOnce`.
@@ -926,29 +931,77 @@ async fn handle_success<O, S: Serdes<O>>(
     // A write that admission rejected is awaited, so the step stops there
     // as an awaited step does: the scope it runs in was abandoned, or the
     // invocation recorded a fatal error.
-    if (await_succeed || write.is_rejected())
-        && let Err(err) = write.await
-    {
-        return ctx.checkpoint_failure_unrecoverable(err).await;
-    }
-
-    if let Some(plugins) = ctx.plugins() {
-        crate::plugin::attempt_ended(
-            plugins,
-            step_info(ctx, wire_id, sub_type, name, plugin_name)
-                .with_status(crate::OperationStatus::Succeeded)
-                .with_result(Some(serialized.clone())),
-            crate::plugin::AttemptEnd {
+    if await_succeed || write.is_rejected() {
+        if let Err(err) = write.await {
+            return ctx.checkpoint_failure_unrecoverable(err).await;
+        }
+        if let Some(plugins) = ctx.plugins() {
+            succeeded_hooks(
+                plugins,
+                ctx,
+                wire_id,
+                sub_type,
+                name,
+                plugin_name,
+                &serialized,
                 attempt,
-                outcome: crate::plugin::AttemptOutcome::Succeeded,
-                error: None,
-                ends_operation: true,
-            },
-        );
+            );
+        }
+    } else if let Some(plugins) = ctx.shared_plugins() {
+        // The end hooks fire when the service acknowledges the `SUCCEED`,
+        // as for an awaited step, after the step returned. A failed write
+        // fires none.
+        let hook_plugins = std::sync::Arc::clone(&plugins);
+        let ctx = ctx.clone();
+        let wire_id = wire_id.to_owned();
+        let sub_type = sub_type.to_owned();
+        let name = name.map(str::to_owned);
+        let plugin_name = plugin_name.map(str::to_owned);
+        let result = serialized.clone();
+        plugins.after_write(async move { write.await.is_ok() }, move || {
+            succeeded_hooks(
+                &hook_plugins,
+                &ctx,
+                &wire_id,
+                &sub_type,
+                name.as_deref(),
+                plugin_name.as_deref(),
+                &result,
+                attempt,
+            );
+        });
     }
 
     // Return deserialized from the serialized form (round-trip parity).
     deserialize_result(ctx, name, serdes, serialized, serdes_ctx).await
+}
+
+/// Fires the end hooks of a step attempt whose `SUCCEED` the service
+/// recorded: `on_attempt_end`, then `on_operation_end`, with the result
+/// `serialized`.
+#[expect(clippy::too_many_arguments)] // reason: the end hooks need the step's identity and result
+fn succeeded_hooks(
+    plugins: &crate::plugin::InvocationPlugins,
+    ctx: &DurableContext,
+    wire_id: &str,
+    sub_type: &str,
+    name: Option<&str>,
+    plugin_name: Option<&str>,
+    serialized: &str,
+    attempt: u32,
+) {
+    crate::plugin::attempt_ended(
+        plugins,
+        step_info(ctx, wire_id, sub_type, name, plugin_name)
+            .with_status(crate::OperationStatus::Succeeded)
+            .with_result(Some(serialized.to_owned())),
+        crate::plugin::AttemptEnd {
+            attempt,
+            outcome: crate::plugin::AttemptOutcome::Succeeded,
+            error: None,
+            ends_operation: true,
+        },
+    );
 }
 
 /// Handles a failed step: consult retry strategy, checkpoint accordingly.

@@ -303,6 +303,15 @@ pub trait Plugin: Send + Sync {
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
     ///
+    /// A step under
+    /// [`StepSemantics::AtLeastOnceAsync`](crate::StepSemantics::AtLeastOnceAsync)
+    /// returns before the service answers its `SUCCEED`. Its
+    /// `on_attempt_end` and `on_operation_end` still fire only once the
+    /// service accepted the `SUCCEED`, so they can come after the code
+    /// that follows the step. They run on a task of the SDK, not on the
+    /// step's task, and before `on_invocation_end`. A `SUCCEED` the service
+    /// rejects, or one the invocation never sends, fires neither hook.
+    ///
     /// For a wait, a chained invoke and a callback:
     ///
     /// - a new operation fires `on_operation_start` with `is_replay`
@@ -2454,8 +2463,13 @@ pub(crate) struct InvocationPlugins {
     /// The panics of undelivered plugin values' destructors, which fail
     /// the invocation.
     undelivered: Arc<Mutex<Undelivered>>,
-    /// The work the operation hooks returned.
+    /// The work the operation hooks returned, and the tasks that wait for
+    /// an unawaited checkpoint write (see [`Self::after_write`]).
     work: Mutex<WorkState>,
+    /// Set when the invocation's checkpoint writes are over, before the
+    /// drain: a write that has not returned by then never returns `Ok`
+    /// (see [`Self::after_write`]).
+    writes_over: tokio::sync::watch::Sender<bool>,
     /// The change sets of the checkpoint responses not yet delivered to
     /// `on_operation_change`, in response order.
     change_queue: Mutex<std::collections::VecDeque<Vec<OperationInfo>>>,
@@ -2940,6 +2954,9 @@ impl InvocationPlugins {
     ) -> Option<Payload> {
         let now = tokio::time::Instant::now();
         let by = |reserve: Duration| remaining.map(|left| now + left.saturating_sub(reserve));
+        // The end-of-invocation flush has run, so every write the SDK did
+        // not await has returned or never returns (see `after_write`).
+        self.writes_over.send_replace(true);
         self.drain(by(PLUGIN_DRAIN_RESERVE)).await;
         let drained = self.take_late_panic(late);
         let end = match &drained {
@@ -3212,6 +3229,46 @@ impl InvocationPlugins {
                     "plugin hook work could not be spawned; it is dropped"
                 );
             });
+        }
+    }
+
+    /// Calls `fire` once `write` returns `true`, on its own task. `write`
+    /// is a checkpoint write the operation does not await, and returns
+    /// whether the service accepted it.
+    ///
+    /// An `AtLeastOnceAsync` step uses it to fire its end hooks when the
+    /// service acknowledges its `SUCCEED`, after the step returned. The
+    /// task is hook work: it holds neither the task cleanup nor the
+    /// suspension decision, and the invocation-end drain joins it, so
+    /// `fire` and the work its hooks return finish before
+    /// `on_invocation_end`. A write that has not returned when the drain
+    /// starts never returns `Ok`, because the end-of-invocation flush has
+    /// run: a write the write-failure latch dropped, or one a fault
+    /// outcome never sent. The task then ends without calling `fire`.
+    /// After the drain closed, nothing is spawned.
+    pub(crate) fn after_write(
+        &self,
+        write: impl Future<Output = bool> + Send + 'static,
+        fire: impl FnOnce() + Send + 'static,
+    ) {
+        let mut over = self.writes_over.subscribe();
+        let task = async move {
+            let accepted = tokio::select! {
+                biased;
+                accepted = write => accepted,
+                _ = over.wait_for(|over| *over) => false,
+            };
+            if accepted {
+                fire();
+            }
+        };
+        let mut state = self.lock_work();
+        let WorkState::Open(list) = &mut *state else {
+            return;
+        };
+        list.retain(|handle| !handle.is_finished());
+        if let Ok(handle) = crate::task::spawn_plugin_work(task) {
+            list.push(handle);
         }
     }
 
@@ -3608,6 +3665,7 @@ pub(crate) fn create_plugins(
         execution: Mutex::new(execution),
         undelivered: Arc::new(Mutex::new(Undelivered::Kept(error_drop_panics))),
         work: Mutex::new(WorkState::Open(Vec::new())),
+        writes_over: tokio::sync::watch::Sender::new(false),
         change_queue: Mutex::new(std::collections::VecDeque::new()),
         draining: std::sync::atomic::AtomicBool::new(false),
         changes_pushed: std::sync::atomic::AtomicU64::new(0),

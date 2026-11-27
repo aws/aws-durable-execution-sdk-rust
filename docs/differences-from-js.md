@@ -266,6 +266,14 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Same capability in Rust form.
 - **Where:** `src/step.rs`, `StepCore::await_start` and `handle_success`.
 
+### `AtLeastOnceAsync` end hooks
+
+- **JavaScript:** An `AtLeastOnceAsync` step fires `onOperationAttemptEnd` and `onOperationEnd` right after it queues `SUCCEED`, before the service answers. If that write fails and the next invocation runs the step again, a plugin sees a second successful end for the same step.
+- **Rust:** The step returns before the service answers its `SUCCEED`, as in JavaScript. `on_attempt_end` and `on_operation_end` fire only when the service accepted the `SUCCEED`, on an SDK task, before `on_invocation_end`. A failed `SUCCEED` fires neither hook. Java fires them at the same point.
+- **Why:** `Plugin::on_operation_end` says it runs after the checkpoint that records the outcome. Firing at the answer keeps that true for every step semantics, so a plugin never sees a success that was not saved.
+- **Decision:** Decision (2026-11-27): fire the end hooks when the service accepts the `SUCCEED`, as Java does.
+- **Where:** `src/step.rs`, `handle_success`; `src/plugin.rs`, `InvocationPlugins::after_write`.
+
 ### Async steps in an abandoned batch item
 
 - **JavaScript:** An abandoned `map` item or `parallel` branch keeps running new `AtLeastOnceAsync` steps after the batch completes, with no record in the history.

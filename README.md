@@ -601,7 +601,9 @@ before the invocation ends. If a retryable save fails, or the invocation ends
 before the save, the step runs again on replay. A permanent checkpoint failure
 fails the execution. When the step runs again, later steps run again too, and
 the step can return a different value. So do not use it for a step whose result becomes an
-idempotency key for a later step. This value is experimental. It may change
+idempotency key for a later step. The plugin end hooks of the step fire when
+the service has saved the result, so they can fire after the code that
+follows the step. A failed save fires no end hook. This value is experimental. It may change
 or be removed in a future release.
 
 The deprecated names `AtLeastOncePerRetry` and `AtMostOncePerRetry` behave as

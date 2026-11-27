@@ -134,16 +134,47 @@ async fn child_step_succeed_precedes_the_context_succeed() {
     );
 }
 
-/// Records the info of every step's `on_operation_end`.
+/// Records the info of every step's `on_operation_end`, and the order of
+/// those hooks and `on_invocation_end` with the tokio time of each.
 #[derive(Clone, Default)]
-struct StepEnds(Arc<Mutex<Vec<OperationInfo>>>);
+struct StepEnds {
+    ends: Arc<Mutex<Vec<OperationInfo>>>,
+    order: Arc<Mutex<Vec<(&'static str, tokio::time::Instant)>>>,
+}
+
+impl StepEnds {
+    /// The hook names in call order: `step_end` and `invocation_end`.
+    fn order(&self) -> Vec<&'static str> {
+        self.order
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(hook, _)| *hook)
+            .collect()
+    }
+}
 
 impl Plugin for StepEnds {
     fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
         if info.kind() == Some(durable::OperationKind::Step) {
-            self.0.lock().expect("lock").push(info.clone());
+            self.ends.lock().expect("lock").push(info.clone());
+            self.order
+                .lock()
+                .expect("lock")
+                .push(("step_end", tokio::time::Instant::now()));
         }
         Ok(None)
+    }
+
+    fn on_invocation_end<'a>(
+        &'a self,
+        _info: &'a durable::plugin::InvocationEndInfo,
+    ) -> durable::plugin::HookFuture<'a> {
+        self.order
+            .lock()
+            .expect("lock")
+            .push(("invocation_end", tokio::time::Instant::now()));
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -153,23 +184,29 @@ impl PluginFactory for StepEnds {
     }
 }
 
-/// The end hook reports `SUCCEEDED`, the result and both timestamps before
-/// the service answered the `SUCCEED`.
+/// Options with the plugin `ends`.
+fn with_plugin(ends: &StepEnds) -> durable::Options {
+    durable::Options::builder()
+        .plugin(ends.clone())
+        .build()
+        .expect("valid options")
+}
+
+/// The end hook fires once, when the service acknowledged the `SUCCEED`,
+/// before `on_invocation_end`. It reports `SUCCEEDED`, the result and both
+/// timestamps.
 #[tokio::test]
 async fn end_hook_reports_succeeded() {
     let ends = StepEnds::default();
-    let options = durable::Options::builder()
-        .plugin(ends.clone())
-        .build()
-        .expect("valid options");
     let (result, _) = run_async_step(
         LocalRunner::new()
             .checkpoint_latency(Duration::from_millis(50))
-            .options(options),
+            .options(with_plugin(&ends)),
     )
     .await;
     assert!(result.is_success(), "{result:?}");
-    let ends = ends.0.lock().expect("lock");
+    assert_eq!(ends.order(), ["step_end", "invocation_end"]);
+    let ends = ends.ends.lock().expect("lock");
     let [end] = ends.as_slice() else {
         unreachable!("expected one step end, got {ends:?}");
     };
@@ -177,6 +214,83 @@ async fn end_hook_reports_succeeded() {
     assert_eq!(end.result(), Some(r#""one""#));
     assert!(end.start_timestamp().is_some(), "a start time");
     assert!(end.end_timestamp().is_some(), "an end time");
+}
+
+/// The step returns before its `SUCCEED` is answered, and the end hook
+/// fires only after the answer: one checkpoint latency after the step
+/// returned, or later.
+#[tokio::test(start_paused = true)]
+async fn end_hook_waits_for_the_succeed_answer() {
+    let latency = Duration::from_millis(300);
+    let ends = StepEnds::default();
+    let returned = Arc::new(Mutex::new(None));
+    let step_returned = Arc::clone(&returned);
+    let result = LocalRunner::new()
+        .checkpoint_latency(latency)
+        .options(with_plugin(&ends))
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let step_returned = Arc::clone(&step_returned);
+                async move {
+                    let value = ctx
+                        .step(|_| async { Ok(1_u32) })
+                        .name("s")
+                        .semantics(StepSemantics::AtLeastOnceAsync)
+                        .await?;
+                    *step_returned.lock().expect("lock") = Some(tokio::time::Instant::now());
+                    Ok::<_, BoxError>(value)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{result:?}");
+    let returned = returned.lock().expect("lock").expect("the step returned");
+    let order = ends.order.lock().expect("lock").clone();
+    let [("step_end", ended), ("invocation_end", _)] = order.as_slice() else {
+        unreachable!("expected a step end, then the invocation end, got {order:?}");
+    };
+    assert!(
+        *ended >= returned + latency,
+        "the end hook fired {:?} after the step returned",
+        ended.duration_since(returned)
+    );
+}
+
+/// A `SUCCEED` the service rejected fires no end hook. A permanent
+/// rejection ends the execution. A retryable one fails the invocation,
+/// and the next invocation's `SUCCEED` fires the only end hook.
+#[tokio::test]
+async fn failed_succeed_fires_no_end_hook() {
+    let ends = StepEnds::default();
+    let (result, _) = run_async_step(
+        LocalRunner::new()
+            .fail_checkpoints_after(1, 1)
+            .options(with_plugin(&ends)),
+    )
+    .await;
+    assert!(result.is_failure(), "{result:?}");
+    assert_eq!(ends.order(), ["invocation_end"]);
+
+    let ends = StepEnds::default();
+    let (result, _) = run_async_step(
+        LocalRunner::new()
+            .fail_checkpoints_after_retryable(1, 1)
+            .options(with_plugin(&ends)),
+    )
+    .await;
+    assert!(result.is_success(), "{result:?}");
+    assert_eq!(
+        ends.order(),
+        ["invocation_end", "step_end", "invocation_end"]
+    );
+    let ends = ends.ends.lock().expect("lock");
+    assert_eq!(ends.len(), 1);
+    assert_eq!(
+        ends.first().and_then(OperationInfo::status),
+        Some(durable::OperationStatus::Succeeded)
+    );
 }
 
 /// The service permanently rejects the `SUCCEED`: the execution fails, and
