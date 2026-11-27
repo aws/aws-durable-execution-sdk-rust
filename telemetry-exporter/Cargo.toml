@@ -4,7 +4,8 @@
 # (scripts/check-direct-deps.sh) covers every root member, and this crate's
 # `cloudwatch-logs` feature depends on aws-sdk-cloudwatchlogs, which is not
 # on that list. A separate workspace keeps the SDK's dependency graph
-# unchanged.
+# unchanged. The same script checks this crate against a separate list,
+# EXPORTER_ALLOWLIST.
 members = ["."]
 resolver = "2"
 

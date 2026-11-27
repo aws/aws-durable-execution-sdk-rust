@@ -59,9 +59,9 @@ msrv:
 
 # The telemetry exporter is its own workspace with its own Cargo.lock, so
 # the root cargo deny run does not read its graph. The second deny line
-# checks that graph against the same deny.toml. check-direct-deps.sh stays
-# root-only: the exporter is a separate workspace because its direct
-# dependencies are outside the SDK allowlist.
+# checks that graph against the same deny.toml. The exporter's direct
+# dependencies are outside the SDK allowlist, so check-direct-deps.sh
+# checks the exporter against a separate allowlist.
 dependencies:
 	. scripts/tools.sh && require cargo cargo-deny
 	cargo deny --all-features check
