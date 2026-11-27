@@ -7,7 +7,7 @@ use aws_durable_execution_sdk::BoxError;
 use aws_sdk_cloudwatchlogs::Client;
 use aws_sdk_cloudwatchlogs::error::{DisplayErrorContext, SdkError};
 use aws_sdk_cloudwatchlogs::operation::create_log_stream::CreateLogStreamError;
-use aws_sdk_cloudwatchlogs::operation::put_log_events::PutLogEventsError;
+use aws_sdk_cloudwatchlogs::operation::put_log_events::{PutLogEventsError, PutLogEventsOutput};
 use aws_sdk_cloudwatchlogs::types::InputLogEvent;
 
 use super::DEFAULT_MAX_RECORD_SIZE_BYTES;
@@ -36,6 +36,12 @@ const DEFAULT_LOG_STREAM_PREFIX: &str = "durable-execution-telemetry/";
 /// stream on its first record and treats an existing stream as created.
 /// If a write fails because the stream no longer exists, the exporter
 /// creates the stream again and resends the record once.
+///
+/// `CloudWatch` Logs can accept a write and still reject its log event. It
+/// rejects an event whose timestamp is more than 2 hours in the future,
+/// older than 14 days, or older than the log group's retention period.
+/// The export of that record then fails with an error that names the
+/// rejection.
 #[derive(Debug)]
 pub struct CloudWatchLogsExporter {
     log_group_name: String,
@@ -133,8 +139,7 @@ impl CloudWatchLogsExporter {
             .message(message)
             .build()
             .expect("timestamp and message are set");
-        match self.put_event(client, &stream, event.clone()).await {
-            Ok(()) => Ok(()),
+        let sent = match self.put_event(client, &stream, event.clone()).await {
             Err(error) if is_stream_missing(&error) => {
                 // `created_streams` records that a stream existed at its first
                 // write. The stream can be deleted later. Without this removal,
@@ -143,12 +148,21 @@ impl CloudWatchLogsExporter {
                 // stream is created again, and the event is resent once.
                 lock(&self.created_streams).remove(&stream);
                 self.ensure_stream(client, &stream).await?;
-                self.put_event(client, &stream, event)
-                    .await
-                    .map_err(|error| call_error("PutLogEvents", &error))
+                self.put_event(client, &stream, event).await
             }
-            Err(error) => Err(call_error("PutLogEvents", &error)),
+            sent => sent,
+        };
+        let output = sent.map_err(|error| call_error("PutLogEvents", &error))?;
+        // `PutLogEvents` can succeed and still not store the event. The
+        // service does not store an event whose timestamp is outside the
+        // range it accepts. It names such an event in
+        // `rejected_log_events_info` and returns no error. Without this
+        // check the record would be lost with no warning. So a rejected
+        // event is an export error, which the scheduler logs.
+        if let Some(rejected) = output.rejected_log_events_info() {
+            return Err(format!("PutLogEvents rejected the log event: {rejected:?}").into());
         }
+        Ok(())
     }
 
     /// Sends `event` to `stream` with one `PutLogEvents` request.
@@ -160,7 +174,7 @@ impl CloudWatchLogsExporter {
         client: &Client,
         stream: &str,
         event: InputLogEvent,
-    ) -> Result<(), Box<SdkError<PutLogEventsError>>> {
+    ) -> Result<PutLogEventsOutput, Box<SdkError<PutLogEventsError>>> {
         client
             .put_log_events()
             .log_group_name(&self.log_group_name)
@@ -168,8 +182,7 @@ impl CloudWatchLogsExporter {
             .log_events(event)
             .send()
             .await
-            .map_err(Box::new)?;
-        Ok(())
+            .map_err(Box::new)
     }
 }
 
@@ -277,9 +290,7 @@ mod tests {
     use aws_sdk_cloudwatchlogs::operation::create_log_stream::{
         CreateLogStreamError, CreateLogStreamOutput,
     };
-    use aws_sdk_cloudwatchlogs::operation::put_log_events::{
-        PutLogEventsError, PutLogEventsOutput,
-    };
+    use aws_sdk_cloudwatchlogs::types::RejectedLogEventsInfo;
     use aws_sdk_cloudwatchlogs::types::error::{
         InvalidParameterException, ResourceAlreadyExistsException, ResourceNotFoundException,
     };
@@ -523,6 +534,37 @@ mod tests {
         let error = error_text(exporter.export(&record(Vec::new())).await);
         assert!(error.starts_with("PutLogEvents failed: "), "{error}");
         assert!(error.contains("InvalidParameterException"), "{error}");
+        assert_eq!(create.num_calls(), 1);
+        assert_eq!(put.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_event_fails_the_export_without_a_resend() {
+        let create = mock!(Client::create_log_stream)
+            .then_output(|| CreateLogStreamOutput::builder().build());
+        let put = mock!(Client::put_log_events).then_output(|| {
+            PutLogEventsOutput::builder()
+                .rejected_log_events_info(
+                    RejectedLogEventsInfo::builder()
+                        .too_new_log_event_start_index(0)
+                        .build(),
+                )
+                .build()
+        });
+        let client = mock_client!(aws_sdk_cloudwatchlogs, RuleMode::MatchAny, [&create, &put]);
+        let exporter = CloudWatchLogsExporter::builder("group")
+            .client(client)
+            .build();
+
+        let error = error_text(exporter.export(&record(Vec::new())).await);
+        assert!(
+            error.starts_with("PutLogEvents rejected the log event: "),
+            "{error}"
+        );
+        assert!(
+            error.contains("too_new_log_event_start_index: Some(0)"),
+            "{error}"
+        );
         assert_eq!(create.num_calls(), 1);
         assert_eq!(put.num_calls(), 1);
     }
