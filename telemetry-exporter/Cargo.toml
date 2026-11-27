@@ -3,8 +3,8 @@
 # examples/. The root workspace's direct-dependency allowlist
 # (scripts/check-direct-deps.sh) covers every root member, and this crate's
 # `cloudwatch-logs` and `http` features depend on aws-sdk-cloudwatchlogs and
-# the aws-smithy HTTP crates, which are not on that list. A separate workspace keeps the SDK's dependency graph
-# unchanged.
+# the aws-smithy HTTP crates, which are not on that list. A separate
+# workspace keeps the SDK's dependency graph unchanged.
 members = ["."]
 resolver = "2"
 
