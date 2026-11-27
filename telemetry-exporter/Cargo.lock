@@ -123,6 +123,7 @@ dependencies = [
  "aws-config",
  "aws-durable-execution-sdk",
  "aws-sdk-cloudwatchlogs",
+ "aws-sdk-rdsdata",
  "aws-smithy-mocks",
  "serde",
  "serde_json",
@@ -215,6 +216,31 @@ dependencies = [
  "aws-runtime",
  "aws-smithy-async",
  "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-rdsdata"
+version = "1.125.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1e6f563a31ff4a112a8cc3c317bf52d47b693966ba26f5aa1e662904a2c2862"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
  "aws-smithy-http",
  "aws-smithy-json",
  "aws-smithy-observability",
