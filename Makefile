@@ -97,8 +97,8 @@ summary-order-consumer-test:
 
 # The telemetry exporter is a separate workspace because it depends on
 # aws-sdk-cloudwatchlogs, aws-sigv4 and the aws-smithy HTTP crates, which
-# the SDK's dependency allowlist does not include. So its tests and doc build run
-# here, not in check-sdk.
+# the SDK's dependency allowlist does not include. So its tests and doc
+# build run here, not in check-sdk.
 workspace-telemetry-exporter: telemetry-exporter-test
 #
 # Each exporter that needs a service client is behind a feature, and no

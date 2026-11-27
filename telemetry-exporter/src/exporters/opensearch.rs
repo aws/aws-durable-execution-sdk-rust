@@ -172,7 +172,7 @@ impl OpenSearchExporter {
                         DisplayErrorContext(&error)
                     )
                 })?;
-                sign_put(url, body, Identity::from(credentials), region.as_ref(), time)
+                sign_put(url, body, &Identity::from(credentials), region.as_ref(), time)
             }
         }
     }
@@ -213,7 +213,7 @@ impl OpenSearchExporter {
 fn sign_put(
     url: &str,
     body: &str,
-    identity: Identity,
+    identity: &Identity,
     region: &str,
     time: SystemTime,
 ) -> Result<Vec<(String, String)>, BoxError> {
@@ -222,7 +222,7 @@ fn sign_put(
         reason = "build fails only when a field is missing, and every field is set"
     )]
     let params = v4::SigningParams::builder()
-        .identity(&identity)
+        .identity(identity)
         .region(region)
         .name(SIGNING_NAME)
         .time(time)
@@ -375,7 +375,6 @@ impl TelemetryExporter for OpenSearchExporter {
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
-    clippy::unwrap_used,
     clippy::indexing_slicing,
     reason = "a test fails by panicking"
 )]
@@ -542,7 +541,7 @@ mod tests {
         let headers = sign_put(
             &url,
             "{\"a\":1}",
-            Identity::from(credentials()),
+            &Identity::from(credentials()),
             "us-east-1",
             time,
         )
@@ -570,7 +569,7 @@ mod tests {
         let error = sign_put(
             "not a url",
             "{}",
-            Identity::from(credentials()),
+            &Identity::from(credentials()),
             "us-east-1",
             UNIX_EPOCH,
         )
