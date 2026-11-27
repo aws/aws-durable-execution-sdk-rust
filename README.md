@@ -594,10 +594,11 @@ retry strategy, so a non-idempotent body never runs twice for the same
 attempt. The strategy sees `StepErrorKind::Interrupted`, and the recorded
 failure carries the error type `StepInterruptedError`.
 `AtLeastOnceAsync` (experimental) is like `AtLeastOnce`, but the step returns
-without waiting for the service to save its result. So the step has lower
-latency.
-The SDK sends checkpoints in order and writes every pending checkpoint
-before the invocation ends. If a retryable save fails, or the invocation ends
+without waiting for the service to save its `START` or its result. It queues
+the result behind `START`. So the step has lower latency.
+The SDK sends checkpoints in order, and a failed checkpoint stops every later
+one, so the result is never saved without `START`. It writes every pending
+checkpoint before the invocation ends. If a retryable save fails, or the invocation ends
 before the save, the step runs again on replay. A permanent checkpoint failure
 fails the execution. When the step runs again, later steps run again too, and
 the step can return a different value. So do not use it for a step whose result becomes an

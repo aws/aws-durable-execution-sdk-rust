@@ -1,10 +1,10 @@
 //! `StepSemantics::AtLeastOnceAsync` through the whole invocation.
 //!
-//! The step returns before its `SUCCEED` is answered. These tests drive
-//! handlers through [`LocalRunner`] with a slow checkpoint client and check
-//! that the invocation still saves the result before it reports the
-//! execution's outcome, in checkpoint order, and that a failed `SUCCEED`
-//! write does not report the execution as succeeded.
+//! The step returns before its `START` and `SUCCEED` are answered. These
+//! tests drive handlers through [`LocalRunner`] with a slow checkpoint
+//! client and check that the invocation still saves the result before it
+//! reports the execution's outcome, in checkpoint order, and that a failed
+//! `START` or `SUCCEED` write does not report the execution as succeeded.
 
 #![cfg(feature = "test-util")]
 #![expect(clippy::expect_used)] // reason: test assertions
@@ -28,9 +28,14 @@ fn event_types<O>(result: &TestResult<O>) -> Vec<EventType> {
         .collect()
 }
 
-/// Runs a handler with one async step named `s` that counts its body runs
-/// and returns `"one"`, on `runner`. Returns the result and the body runs.
-async fn run_async_step(runner: LocalRunner) -> (TestResult<String>, u32) {
+/// The body delay after which the `START` of a step is answered under a
+/// 50 ms checkpoint latency, so its `SUCCEED` goes in a later request.
+const AFTER_START: Duration = Duration::from_millis(100);
+
+/// Runs a handler with one async step named `s` that counts its body runs,
+/// sleeps for `body_delay` and returns `"one"`, on `runner`. Returns the
+/// result and the body runs.
+async fn run_async_step(runner: LocalRunner, body_delay: Duration) -> (TestResult<String>, u32) {
     let runs = Arc::new(AtomicU32::new(0));
     let body_runs = Arc::clone(&runs);
     let result = runner
@@ -43,6 +48,7 @@ async fn run_async_step(runner: LocalRunner) -> (TestResult<String>, u32) {
                             let body_runs = Arc::clone(&body_runs);
                             async move {
                                 body_runs.fetch_add(1, Ordering::SeqCst);
+                                tokio::time::sleep(body_delay).await;
                                 Ok("one".to_owned())
                             }
                         })
@@ -61,8 +67,11 @@ async fn run_async_step(runner: LocalRunner) -> (TestResult<String>, u32) {
 
 #[tokio::test]
 async fn succeed_is_saved_before_the_execution_succeeds() {
-    let (result, runs) =
-        run_async_step(LocalRunner::new().checkpoint_latency(Duration::from_millis(50))).await;
+    let (result, runs) = run_async_step(
+        LocalRunner::new().checkpoint_latency(Duration::from_millis(50)),
+        Duration::ZERO,
+    )
+    .await;
     assert!(result.is_success(), "{result:?}");
     assert_eq!(runs, 1);
     assert_eq!(result.invocation_count(), 1);
@@ -89,7 +98,7 @@ async fn buffered_succeed_is_saved_before_the_execution_succeeds() {
         .checkpoint_delay(Duration::from_millis(200))
         .build()
         .expect("valid options");
-    let (result, runs) = run_async_step(LocalRunner::new().options(options)).await;
+    let (result, runs) = run_async_step(LocalRunner::new().options(options), Duration::ZERO).await;
     assert!(result.is_success(), "{result:?}");
     assert_eq!(runs, 1);
     assert_eq!(result.invocation_count(), 1);
@@ -202,6 +211,7 @@ async fn end_hook_reports_succeeded() {
         LocalRunner::new()
             .checkpoint_latency(Duration::from_millis(50))
             .options(with_plugin(&ends)),
+        Duration::ZERO,
     )
     .await;
     assert!(result.is_success(), "{result:?}");
@@ -266,8 +276,10 @@ async fn failed_succeed_fires_no_end_hook() {
     let ends = StepEnds::default();
     let (result, _) = run_async_step(
         LocalRunner::new()
+            .checkpoint_latency(Duration::from_millis(50))
             .fail_checkpoints_after(1, 1)
             .options(with_plugin(&ends)),
+        AFTER_START,
     )
     .await;
     assert!(result.is_failure(), "{result:?}");
@@ -276,8 +288,10 @@ async fn failed_succeed_fires_no_end_hook() {
     let ends = StepEnds::default();
     let (result, _) = run_async_step(
         LocalRunner::new()
+            .checkpoint_latency(Duration::from_millis(50))
             .fail_checkpoints_after_retryable(1, 1)
             .options(with_plugin(&ends)),
+        AFTER_START,
     )
     .await;
     assert!(result.is_success(), "{result:?}");
@@ -297,7 +311,13 @@ async fn failed_succeed_fires_no_end_hook() {
 /// it is not reported as succeeded.
 #[tokio::test]
 async fn rejected_succeed_fails_the_execution() {
-    let (result, runs) = run_async_step(LocalRunner::new().fail_checkpoints_after(1, 1)).await;
+    let (result, runs) = run_async_step(
+        LocalRunner::new()
+            .checkpoint_latency(Duration::from_millis(50))
+            .fail_checkpoints_after(1, 1),
+        AFTER_START,
+    )
+    .await;
     assert!(result.is_failure(), "{result:?}");
     assert_eq!(
         result.error_type(),
@@ -311,12 +331,107 @@ async fn rejected_succeed_fails_the_execution() {
 /// finds the step `STARTED` and runs its body again.
 #[tokio::test]
 async fn retryable_succeed_failure_reruns_the_step() {
-    let (result, runs) =
-        run_async_step(LocalRunner::new().fail_checkpoints_after_retryable(1, 1)).await;
+    let (result, runs) = run_async_step(
+        LocalRunner::new()
+            .checkpoint_latency(Duration::from_millis(50))
+            .fail_checkpoints_after_retryable(1, 1),
+        AFTER_START,
+    )
+    .await;
     assert!(result.is_success(), "{result:?}");
     assert_eq!(runs, 2, "the body runs again in the next invocation");
     assert_eq!(result.invocation_count(), 2);
     assert!(result.operation("s").expect("step s").succeeded());
+}
+
+/// The service permanently rejects the `START`, which the step did not
+/// await. With `body_delay` zero the `SUCCEED` shares the request; with
+/// a short delay the `SUCCEED` waits behind it and is never sent. The
+/// execution fails, and it is not reported as succeeded.
+async fn rejected_start_fails_the_execution(body_delay: Duration) {
+    let (result, runs) = run_async_step(
+        LocalRunner::new()
+            .checkpoint_latency(Duration::from_millis(50))
+            .fail_checkpoints_after(0, 1),
+        body_delay,
+    )
+    .await;
+    assert!(result.is_failure(), "{result:?}");
+    assert_eq!(
+        result.error_type(),
+        Some("CheckpointUnrecoverableExecutionError")
+    );
+    assert_eq!(runs, 1);
+    assert_eq!(result.invocation_count(), 1);
+    assert!(result.operation("s").is_none(), "no record is saved");
+    assert!(!event_types(&result).contains(&EventType::ExecutionSucceeded));
+}
+
+/// A `START` the service rejected while the `SUCCEED` waited behind it
+/// fires no end hook, and the invocation still ends: the end hook task of
+/// the `SUCCEED` that was never sent stops.
+#[tokio::test]
+async fn rejected_start_fires_no_end_hook() {
+    for body_delay in [Duration::ZERO, Duration::from_millis(10)] {
+        let ends = StepEnds::default();
+        let (result, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_async_step(
+                LocalRunner::new()
+                    .checkpoint_latency(Duration::from_millis(50))
+                    .fail_checkpoints_after(0, 1)
+                    .options(with_plugin(&ends)),
+                body_delay,
+            ),
+        )
+        .await
+        .expect("the invocation ends");
+        assert!(result.is_failure(), "{result:?}");
+        assert_eq!(ends.order(), ["invocation_end"], "{body_delay:?}");
+    }
+}
+
+#[tokio::test]
+async fn rejected_start_in_the_succeed_request_fails_the_execution() {
+    rejected_start_fails_the_execution(Duration::ZERO).await;
+}
+
+#[tokio::test]
+async fn rejected_start_before_the_succeed_fails_the_execution() {
+    rejected_start_fails_the_execution(Duration::from_millis(10)).await;
+}
+
+/// A retryable `START` failure fails the invocation before the `SUCCEED`
+/// is saved. The next invocation finds no record and runs the step again.
+async fn retryable_start_failure_reruns_the_step(body_delay: Duration) {
+    let (result, runs) = run_async_step(
+        LocalRunner::new()
+            .checkpoint_latency(Duration::from_millis(50))
+            .fail_checkpoints_after_retryable(0, 1),
+        body_delay,
+    )
+    .await;
+    assert!(result.is_success(), "{result:?}");
+    assert_eq!(runs, 2, "the body runs again in the next invocation");
+    assert_eq!(result.invocation_count(), 2);
+    assert!(result.operation("s").expect("step s").succeeded());
+    assert_eq!(
+        event_types(&result)
+            .into_iter()
+            .filter(|t| matches!(t, EventType::StepStarted | EventType::StepSucceeded))
+            .collect::<Vec<_>>(),
+        [EventType::StepStarted, EventType::StepSucceeded]
+    );
+}
+
+#[tokio::test]
+async fn retryable_start_failure_in_the_succeed_request_reruns_the_step() {
+    retryable_start_failure_reruns_the_step(Duration::ZERO).await;
+}
+
+#[tokio::test]
+async fn retryable_start_failure_before_the_succeed_reruns_the_step() {
+    retryable_start_failure_reruns_the_step(Duration::from_millis(10)).await;
 }
 
 /// Runs one step under `own` semantics, on an execution whose
@@ -357,10 +472,11 @@ async fn step_time(own: Option<StepSemantics>) -> Duration {
 }
 
 /// `default_step_semantics` reaches the steps of a wrapped handler, and a
-/// step's own semantics wins: the async step waits only for `START`.
+/// step's own semantics wins: the async step waits for neither `START`
+/// nor `SUCCEED`.
 #[tokio::test(start_paused = true)]
 async fn default_step_semantics_applies_to_steps() {
-    assert_eq!(step_time(None).await, Duration::from_millis(300));
+    assert_eq!(step_time(None).await, Duration::ZERO);
     assert_eq!(
         step_time(Some(StepSemantics::AtLeastOnce)).await,
         Duration::from_millis(600)
@@ -383,6 +499,7 @@ async fn fail_after_async_step(runner: LocalRunner) -> (TestResult<String>, u32)
                         let body_runs = Arc::clone(&body_runs);
                         async move {
                             body_runs.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(AFTER_START).await;
                             Ok("one".to_owned())
                         }
                     })

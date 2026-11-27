@@ -258,14 +258,6 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Rust language.
 - **Where:** `src/step.rs`, `StepSemantics` and its `PartialEq`.
 
-### `AtLeastOnceAsync` and the `START` response
-
-- **JavaScript:** An `AtLeastOnceAsync` step awaits neither its `START` nor its `SUCCEED` checkpoint.
-- **Rust:** An `AtLeastOnceAsync` step awaits its `START` response before it submits `SUCCEED`, as every Rust `AtLeastOnce` outcome does. It does not await `SUCCEED`.
-- **Why:** The Rust `AtLeastOnce` step writes its outcome only after `START` is acknowledged. The async mode changes only the `SUCCEED` wait.
-- **Decision:** Same capability in Rust form.
-- **Where:** `src/step.rs`, `StepCore::await_start` and `handle_success`.
-
 ### `AtLeastOnceAsync` end hooks
 
 - **JavaScript:** An `AtLeastOnceAsync` step fires `onOperationAttemptEnd` and `onOperationEnd` right after it queues `SUCCEED`, before the service answers. If that write fails and the next invocation runs the step again, a plugin sees a second successful end for the same step.

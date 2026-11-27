@@ -228,8 +228,8 @@ where
     ///   failure and consult the retry strategy without re-executing. The
     ///   body starts only after `START` is acknowledged.
     /// - [`StepSemantics::AtLeastOnceAsync`](crate::StepSemantics::AtLeastOnceAsync) (experimental): as
-    ///   `AtLeastOnce`, but the step returns without waiting for the `SUCCEED`
-    ///   checkpoint.
+    ///   `AtLeastOnce`, but the step returns without waiting for the `START`
+    ///   or `SUCCEED` checkpoint.
     ///
     /// Without this call the step uses the execution's
     /// [`default_step_semantics`](crate::OptionsBuilder::default_step_semantics),

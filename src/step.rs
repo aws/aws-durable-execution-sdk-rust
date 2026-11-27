@@ -223,8 +223,10 @@ pub enum StepSemantics {
     /// whose result becomes an idempotency key or a client token for a
     /// later step.
     ///
-    /// The step still waits for its `START` response before it submits
-    /// `SUCCEED`, as under `AtLeastOnce`.
+    /// The step does not wait for its `START` response either. It queues
+    /// `SUCCEED` behind `START`. A failed `START` stops every later
+    /// checkpoint, so the result is never saved without `START`, and the
+    /// failure fails the invocation as a failed `SUCCEED` does.
     ///
     /// The plugin hooks `on_attempt_end` and `on_operation_end` fire when
     /// the service accepted the `SUCCEED`, as under `AtLeastOnce`, so they
@@ -413,9 +415,11 @@ where
                         ))
                         .await;
                     // The failure keeps the runner's wire: the error's
-                    // `Display` runs once, in the runner.
-                    core.await_start(start).await?;
-                    match core.settle(attempt, ran).await? {
+                    // `Display` runs once, in the runner. `settle` awaits
+                    // the `START` write before it writes the outcome,
+                    // except for the `SUCCEED` of an `AtLeastOnceAsync`
+                    // step.
+                    match core.settle(attempt, start, ran).await? {
                         StepSettled::Done(value) => return Ok(value),
                         StepSettled::Retry => {}
                         StepSettled::Paused => {
@@ -487,7 +491,8 @@ enum StepPrelude<O> {
         /// The operation span the body runs under.
         span: tracing::Span,
         /// The in-flight `START` write of an at-least-once attempt, awaited
-        /// after the body returns and before the outcome is written. `None`
+        /// after the body returns and before the outcome is written, except
+        /// before the `SUCCEED` of an `AtLeastOnceAsync` step. `None`
         /// when START was awaited before the body, or was already recorded.
         /// A body that panics drops it, and the write continues.
         start: Option<SubmittedWrite>,
@@ -789,41 +794,53 @@ where
 
     /// Settles one attempt: checkpoints success or consults the retry
     /// strategy on failure.
+    ///
+    /// `start` is the attempt's `START` write when it is still in flight
+    /// (see [`StepPrelude::Run`]). A failed attempt awaits it before its
+    /// `RETRY` or `FAIL`. A successful attempt hands it to
+    /// [`handle_success`].
     async fn settle(
         &self,
         attempt: u32,
+        start: Option<SubmittedWrite>,
         ran: crate::plugin::Ran<O>,
     ) -> Result<StepSettled<O>, OperationError> {
         let wire_id = self.op_id.wire();
         match ran.into_parts() {
             Ok(value) => handle_success(
                 &self.ctx,
-                wire_id,
-                self.name.as_deref(),
-                self.sub_type.as_str(),
-                self.plugin_name.as_deref(),
+                SuccessSpec {
+                    wire_id,
+                    name: self.name.as_deref(),
+                    sub_type: self.sub_type.as_str(),
+                    plugin_name: self.plugin_name.as_deref(),
+                    attempt,
+                    asynchronous: self.semantics == StepSemantics::AtLeastOnceAsync,
+                },
                 &self.serdes,
                 value,
-                attempt,
-                self.semantics != StepSemantics::AtLeastOnceAsync,
+                start,
             )
             .await
             .map(StepSettled::Done),
-            Err((err, wire)) => handle_failure(
-                &self.ctx,
-                wire_id,
-                self.name.as_deref(),
-                self.sub_type.as_str(),
-                self.plugin_name.as_deref(),
-                self.retry_strategy.as_ref(),
-                (StepError::execution_failed(err), wire),
-                attempt,
-            )
-            .await
-            .map(|retry| match retry {
-                RetryRecorded::Paused => StepSettled::Paused,
-                RetryRecorded::NotPaused => StepSettled::Retry,
-            }),
+            Err((err, wire)) => {
+                self.await_start(start).await?;
+                handle_failure(
+                    &self.ctx,
+                    wire_id,
+                    self.name.as_deref(),
+                    self.sub_type.as_str(),
+                    self.plugin_name.as_deref(),
+                    self.retry_strategy.as_ref(),
+                    (StepError::execution_failed(err), wire),
+                    attempt,
+                )
+                .await
+                .map(|retry| match retry {
+                    RetryRecorded::Paused => StepSettled::Paused,
+                    RetryRecorded::NotPaused => StepSettled::Retry,
+                })
+            }
         }
     }
 }
@@ -874,26 +891,64 @@ fn step_info(
     }
 }
 
+/// What [`handle_success`] needs to know about the step and its attempt.
+struct SuccessSpec<'a> {
+    wire_id: &'a str,
+    name: Option<&'a str>,
+    sub_type: &'a str,
+    /// The name the plugin hooks report instead of `name`, if any.
+    plugin_name: Option<&'a str>,
+    /// 1-based attempt number.
+    attempt: u32,
+    /// Whether the step is `AtLeastOnceAsync`: it queues `SUCCEED` behind
+    /// an in-flight `START` and awaits neither write.
+    asynchronous: bool,
+}
+
+/// Awaits `start`, the `START` write of an at-least-once attempt, when it
+/// is still in flight. A failed write fails the invocation.
+async fn await_start_write(
+    ctx: &DurableContext,
+    start: &mut Option<SubmittedWrite>,
+) -> Result<(), OperationError> {
+    if let Some(write) = start.take()
+        && let Err(err) = write.await
+    {
+        return ctx.checkpoint_failure_unrecoverable(err).await;
+    }
+    Ok(())
+}
+
 /// Handles a successful step execution: serialize, checkpoint, return.
 ///
-/// With `await_succeed` false, the step returns without waiting for the
-/// `SUCCEED` write (see [`StepSemantics::AtLeastOnceAsync`]).
+/// `start` is the attempt's `START` write when it is still in flight. An
+/// awaited step awaits it before it serializes the value. An async step
+/// (see [`StepSemantics::AtLeastOnceAsync`]) awaits neither `START` nor
+/// `SUCCEED`: it queues `SUCCEED` behind `START`. The SDK sends
+/// checkpoints in order, and a failed write stops every later one (the
+/// write-failure latch), so `SUCCEED` is never recorded without `START`.
 ///
 /// The value round-trips through the configured wire format: ownership
 /// transfers to `serialize`, and the returned value is what `deserialize`
 /// produced from the stored wire string (round-trip parity).
-#[expect(clippy::too_many_arguments)] // reason: the plugin name joins the inputs the end hooks need
 async fn handle_success<O, S: Serdes<O>>(
     ctx: &DurableContext,
-    wire_id: &str,
-    name: Option<&str>,
-    sub_type: &str,
-    plugin_name: Option<&str>,
+    spec: SuccessSpec<'_>,
     serdes: &S,
     value: O,
-    attempt: u32,
-    await_succeed: bool,
+    mut start: Option<SubmittedWrite>,
 ) -> Result<O, OperationError> {
+    let SuccessSpec {
+        wire_id,
+        name,
+        sub_type,
+        plugin_name,
+        attempt,
+        asynchronous,
+    } = spec;
+    if !asynchronous {
+        await_start_write(ctx, &mut start).await?;
+    }
     let serdes_ctx = SerdesContext::new(wire_id, ctx.execution_arn());
 
     // Serialize the result (ownership transfers to the serdes).
@@ -907,6 +962,9 @@ async fn handle_success<O, S: Serdes<O>>(
     let serialized = match serialize_value(ctx, name, serdes, value, serdes_ctx.clone()).await {
         Ok(serialized) => serialized,
         Err(op_err) => {
+            // The FAIL is awaited, so it waits for START first, as every
+            // awaited outcome does.
+            await_start_write(ctx, &mut start).await?;
             // The fixed serialization wire type is the replay
             // discriminator: `replay_failure` matches it to reconstruct
             // `StepErrorKind::SerializationFailed`, so a handler that
@@ -925,13 +983,14 @@ async fn handle_success<O, S: Serdes<O>>(
     // Checkpoint SUCCEED with payload.
     let update = build_succeed_update(wire_id, name, sub_type, ctx.parent_wire_id(), &serialized);
     let write = ctx.submit_checkpoint_updates(vec![update]);
-    // An async step drops the write: the write keeps its place in the
-    // write order and goes on. A failed write fails the invocation, and
+    // An async step does not await `START` or `SUCCEED`: each write keeps
+    // its place in the write order and goes on, so `SUCCEED` is sent after
+    // `START`. A failed write fails the invocation, and
     // every invocation end waits for pending writes before it reports.
     // A write that admission rejected is awaited, so the step stops there
     // as an awaited step does: the scope it runs in was abandoned, or the
     // invocation recorded a fatal error.
-    if await_succeed || write.is_rejected() {
+    if !asynchronous || write.is_rejected() {
         if let Err(err) = write.await {
             return ctx.checkpoint_failure_unrecoverable(err).await;
         }
@@ -4578,19 +4637,89 @@ mod start_write_tests {
         assert!(matches!(outcome, InvocationOutcome::Complete(ref v) if v.starts_with("1@")));
     }
 
+    /// The actions of the step updates `client` received, in order.
+    fn step_actions(client: &LatencyClient) -> Vec<OperationAction> {
+        client
+            .requests()
+            .iter()
+            .flat_map(|r| r.updates.clone())
+            .filter(|u| u.r#type() == &aws_sdk_lambda::types::OperationType::Step)
+            .map(|u| u.action().clone())
+            .collect()
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn at_least_once_async_returns_before_succeed_response() {
+    async fn at_least_once_async_returns_before_start_and_succeed_responses() {
         let (client, started, outcome) =
             timed_step(Duration::ZERO, StepSemantics::AtLeastOnceAsync).await;
         assert_eq!(started, ms(0), "the body starts before START is answered");
+        let start = client.request_with(&OperationAction::Start).expect("START");
         let succeed = client
             .request_with(&OperationAction::Succeed)
             .expect("SUCCEED");
-        assert_eq!(succeed.received, ms(500), "SUCCEED waits for START");
+        assert_eq!(start.received, ms(0));
+        assert_eq!(succeed.received, ms(0), "SUCCEED does not wait for START");
+        assert_eq!(
+            step_actions(&client),
+            [OperationAction::Start, OperationAction::Succeed]
+        );
         assert_eq!(
             outcome,
-            InvocationOutcome::Complete("1@500".to_owned()),
-            "the step returns before SUCCEED is answered"
+            InvocationOutcome::Complete("1@0".to_owned()),
+            "the step returns before START and SUCCEED are answered"
+        );
+    }
+
+    /// Under a coalescing window the async step still returns at once:
+    /// `START` and `SUCCEED` wait in the buffer, in that order.
+    #[tokio::test(start_paused = true)]
+    async fn buffered_at_least_once_async_returns_before_start_and_succeed_responses() {
+        let (client, _started, outcome) = timed_step(ms(50), StepSemantics::AtLeastOnceAsync).await;
+        let start = client.request_with(&OperationAction::Start).expect("START");
+        let succeed = client
+            .request_with(&OperationAction::Succeed)
+            .expect("SUCCEED");
+        assert!(start.received >= ms(0) && succeed.received >= start.received);
+        assert_eq!(
+            step_actions(&client),
+            [OperationAction::Start, OperationAction::Succeed]
+        );
+        assert_eq!(
+            outcome,
+            InvocationOutcome::Complete("1@0".to_owned()),
+            "the step returns before START and SUCCEED are answered"
+        );
+    }
+
+    /// The `START` of an async step fails while its `SUCCEED` waits behind
+    /// it. The execution fails with the checkpoint error, and the step
+    /// records no outcome.
+    #[tokio::test(start_paused = true)]
+    async fn at_least_once_async_failed_start_records_no_outcome() {
+        let client = Arc::new(LatencyClient::new(LATENCY).failing_start());
+        let ctx = latency_ctx(&client, Duration::ZERO);
+        let outcome = drive_handler(ctx.clone(), None, move |ctx| async move {
+            ctx.step(|_| async { Ok(1_u32) })
+                .name("s")
+                .semantics(StepSemantics::AtLeastOnceAsync)
+                .await
+                .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        let InvocationOutcome::Failed { error } = &outcome else {
+            unreachable!("expected a failed execution, got {outcome:?}");
+        };
+        assert_eq!(
+            error.error_type(),
+            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        let view = ctx.checkpoint_status_view("1");
+        assert!(
+            view.as_ref()
+                .is_none_or(|v| v.status != crate::engine::CheckpointStatus::Succeeded),
+            "no SUCCEEDED record: {view:?}"
         );
     }
 
