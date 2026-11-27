@@ -52,6 +52,8 @@ workspace = true
 [features]
 # Enables `CloudWatchLogsExporter`.
 cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs"]
+# Enables `FileExporter`. It uses the async file system calls of tokio.
+file = ["tokio/fs"]
 
 [dependencies]
 aws-durable-execution-sdk = { path = ".." }

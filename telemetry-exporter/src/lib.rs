@@ -37,13 +37,14 @@
 //!
 //! # Features
 //!
-//! No feature is on by default. An exporter that needs a service client is
-//! behind its own feature, so a build compiles only the clients of the
-//! exporters it enables.
+//! No feature is on by default. An exporter that needs a service client or an
+//! extra part of `tokio` is behind its own feature, so a build compiles only
+//! the dependencies of the exporters it enables.
 //!
 //! | Feature | Enables |
 //! | --- | --- |
 //! | `cloudwatch-logs` | `CloudWatchLogsExporter`, which writes to a log group of your choice |
+//! | `file` | `FileExporter`, which writes to files in a directory |
 
 // Compiles the README's Rust examples as doctests, so a README example that
 // stops compiling fails `cargo test`.
@@ -70,6 +71,8 @@ pub use exporter::{ExportFuture, TelemetryExporter};
 #[cfg(feature = "cloudwatch-logs")]
 pub use exporters::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
 pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
+#[cfg(feature = "file")]
+pub use exporters::{FileExporter, FileExporterBuilder, FileMode};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
     ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
