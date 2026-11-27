@@ -1,6 +1,7 @@
 //! Shrinks a record to an exporter's size limit.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::io;
 
 use crate::record::{OperationRecord, TelemetryRecord};
@@ -23,7 +24,7 @@ impl io::Write for ByteCounter {
 #[cfg(test)]
 thread_local! {
     /// How many records this thread has rendered to measure them.
-    static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RENDERS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The UTF-8 size of a view's JSON, or `None` when it does not serialize.
@@ -53,8 +54,8 @@ pub(crate) enum Measure<'a> {
     /// The size of the record's JSON in this format.
     Format(OperationsFormat),
     /// The byte length of the text this function returns for a record, or
-    /// `None` when the record has no text. A record with no text counts
-    /// as one that fits.
+    /// `None` when the record has no text. When any measured record has no
+    /// text, the truncation returns the record unchanged.
     Text(&'a dyn Fn(&TelemetryRecord) -> Option<usize>),
 }
 
@@ -64,6 +65,8 @@ struct Candidate<'a> {
     kept: Vec<bool>,
     measure: Measure<'a>,
     max_bytes: usize,
+    /// Set when a measured candidate had no text.
+    unmeasured: Cell<bool>,
 }
 
 impl Candidate<'_> {
@@ -76,7 +79,14 @@ impl Candidate<'_> {
                 record
                     .operations
                     .retain(|_| kept.next().copied().unwrap_or(true));
-                return text(&record).is_some_and(|size| size <= self.max_bytes);
+                return text(&record).map_or_else(
+                    || {
+                        // The search stops at the first count it believes fits.
+                        self.unmeasured.set(true);
+                        true
+                    },
+                    |size| size <= self.max_bytes,
+                );
             }
         };
         let operations: Vec<&OperationRecord> = self
@@ -202,6 +212,7 @@ pub(crate) fn truncate_measured<'r>(
         kept: vec![true; record.operations.len()],
         measure,
         max_bytes,
+        unmeasured: Cell::new(false),
     };
     candidate.record.truncated = true;
     let order = oldest_first(&record.operations);
@@ -254,7 +265,7 @@ pub(crate) fn truncate_measured<'r>(
         dropped_any = true;
     }
 
-    if !dropped_any {
+    if !dropped_any || candidate.unmeasured.get() {
         return Cow::Borrowed(record);
     }
     let Candidate {
@@ -490,7 +501,7 @@ mod tests {
         RENDERS.with(|count| count.set(0));
         let out = truncate_record(r, Some(limit), format);
         assert!(out.dropped_operations > 0);
-        RENDERS.with(std::cell::Cell::get)
+        RENDERS.with(Cell::get)
     }
 
     #[test]
@@ -577,6 +588,22 @@ mod tests {
     }
 
     #[test]
+    fn a_candidate_with_no_text_returns_the_record_unchanged() {
+        let r = record(vec![
+            timed("new", Some(30), None),
+            timed("mid", Some(20), None),
+            timed("old", Some(10), None),
+        ]);
+        let measure = |record: &TelemetryRecord| {
+            (record.operations.len() >= 3).then_some(record.operations.len() * 10)
+        };
+        assert!(matches!(
+            truncate_measured(&r, Some(15), Measure::Text(&measure)),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
     fn text_that_fits_returns_the_record_unchanged() {
         let r = record(vec![timed("a", Some(1), Some("x"))]);
         let measure = |_: &TelemetryRecord| Some(5);
@@ -598,6 +625,7 @@ mod tests {
             kept: vec![true; r.operations.len()],
             measure: Measure::Format(format),
             max_bytes,
+            unmeasured: Cell::new(false),
         };
         candidate.record.truncated = true;
         let order = oldest_first(&r.operations);

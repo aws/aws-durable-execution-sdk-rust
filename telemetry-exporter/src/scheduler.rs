@@ -437,7 +437,8 @@ impl Scheduler {
         let records: Vec<Result<Cow<'_, TelemetryRecord>, String>> = self
             .exporters
             .iter()
-            .map(|exporter| {
+            .enumerate()
+            .map(|(index, exporter)| {
                 let max_bytes = contained(|| exporter.max_record_size_bytes())?;
                 let panicked = Cell::new(false);
                 let text = |record: &TelemetryRecord| {
@@ -446,7 +447,10 @@ impl Scheduler {
                     match contained(|| exporter.measured_text(record)) {
                         Ok(Ok(text)) => Some(text.len()),
                         Ok(Err(error)) => {
-                            describe_error(error);
+                            let error = describe_error(error);
+                            log_contained(|| {
+                                tracing::warn!(target: crate::TARGET, exporter = index, %error, "telemetry record could not be measured");
+                            });
                             None
                         }
                         Err(_) => {
@@ -890,18 +894,18 @@ mod tests {
         assert_eq!(*lock(&large.0), [false]);
     }
 
-    type Measure = fn(&TelemetryRecord) -> Result<String, aws_durable_execution_sdk::BoxError>;
+    type MeasureFn = fn(&TelemetryRecord) -> Result<String, aws_durable_execution_sdk::BoxError>;
 
     /// An exporter whose size limit is 100 bytes and whose measured text
     /// comes from `measure`. It records each exported record's
     /// `truncated` flag and its operation count.
     struct Measured {
         exported: Mutex<Vec<(bool, usize)>>,
-        measure: Measure,
+        measure: MeasureFn,
     }
 
     impl Measured {
-        fn new(measure: Measure) -> Arc<Self> {
+        fn new(measure: MeasureFn) -> Arc<Self> {
             Arc::new(Self {
                 exported: Mutex::default(),
                 measure,
