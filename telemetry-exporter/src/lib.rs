@@ -70,9 +70,9 @@ pub use config::{
 pub use exporter::{ExportFuture, TelemetryExporter};
 #[cfg(feature = "cloudwatch-logs")]
 pub use exporters::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
+pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
 #[cfg(feature = "firehose")]
 pub use exporters::{FirehoseExporter, FirehoseExporterBuilder};
-pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
     ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
