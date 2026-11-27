@@ -205,9 +205,9 @@ impl CloudWatchLogsExporterBuilder {
     }
 
     /// Sets the largest record, in bytes, before truncation. The default
-    /// is 256,000, the `CloudWatch` Logs event limit. The service also counts
-    /// 26 bytes per event, so a limit close to the maximum can still be
-    /// rejected.
+    /// is 256,000. `CloudWatch` Logs accepts a request of up to 1,048,576
+    /// bytes, and counts 26 bytes per event in addition to the message. So
+    /// the service rejects a record larger than 1,048,550 bytes.
     pub fn max_record_size_bytes(mut self, max: usize) -> Self {
         self.max_record_size_bytes = max;
         self
