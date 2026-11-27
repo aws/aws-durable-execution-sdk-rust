@@ -16,5 +16,6 @@ pub use lambda_log::LambdaLogExporter;
 #[cfg(feature = "opensearch")]
 pub use opensearch::{OpenSearchExporter, OpenSearchExporterBuilder};
 
-/// The default record size limit of `LambdaLogExporter` and `CloudWatchLogsExporter`.
+/// The default record size limit of `LambdaLogExporter` and
+/// `CloudWatchLogsExporter`.
 pub const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 256_000;

@@ -166,6 +166,7 @@ let telemetry = DurableExecutionTelemetry::builder()
 
 The crate is its own cargo workspace. The SDK's dependency allowlist does
 not include `aws-sdk-cloudwatchlogs`, `aws-sigv4` or the `aws-smithy` HTTP
-crates, so the crate is not a member of the root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
-formatting, builds, lints, runs the tests and builds the docs. It lints,
-tests and builds the docs twice: with no feature and with every feature.
+crates, so the crate is not a member of the root workspace.
+`make workspaces WORKSPACES=telemetry-exporter` checks the formatting,
+builds, lints, runs the tests and builds the docs. It lints, tests and
+builds the docs twice: with no feature and with every feature.
