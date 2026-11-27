@@ -252,3 +252,65 @@ async fn default_step_semantics_applies_to_steps() {
         Duration::from_millis(600)
     );
 }
+
+/// Runs a handler that fails right after an async step, on `runner`, so
+/// the handler returns while the step's `SUCCEED` is still in flight.
+/// Returns the result and the body runs.
+async fn fail_after_async_step(runner: LocalRunner) -> (TestResult<String>, u32) {
+    let runs = Arc::new(AtomicU32::new(0));
+    let body_runs = Arc::clone(&runs);
+    let result = runner
+        .checkpoint_latency(Duration::from_millis(50))
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let body_runs = Arc::clone(&body_runs);
+                async move {
+                    ctx.step(move |_| {
+                        let body_runs = Arc::clone(&body_runs);
+                        async move {
+                            body_runs.fetch_add(1, Ordering::SeqCst);
+                            Ok("one".to_owned())
+                        }
+                    })
+                    .name("s")
+                    .semantics(StepSemantics::AtLeastOnceAsync)
+                    .await?;
+                    Err::<String, BoxError>("handler failed".into())
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    (result, runs.load(Ordering::SeqCst))
+}
+
+/// The handler fails, and the step's `SUCCEED` then fails with a retryable
+/// error. The invocation fails, so the execution is not failed without the
+/// step's result. The next invocation runs the step again and saves it.
+#[tokio::test]
+async fn handler_error_with_retryable_succeed_failure_retries_the_invocation() {
+    let (result, runs) =
+        fail_after_async_step(LocalRunner::new().fail_checkpoints_after_retryable(1, 1)).await;
+    assert_eq!(result.invocation_count(), 2, "the first invocation fails");
+    assert_eq!(runs, 2, "the step runs again in the next invocation");
+    assert!(result.operation("s").expect("step s").succeeded());
+    assert!(result.is_failure(), "{result:?}");
+    assert_eq!(result.error_message(), Some("handler failed"));
+}
+
+/// The handler fails, and the step's `SUCCEED` then fails with an
+/// execution-scope error, such as a validation error. The execution fails
+/// in the same invocation.
+#[tokio::test]
+async fn handler_error_with_execution_succeed_failure_fails_the_execution() {
+    let (result, runs) =
+        fail_after_async_step(LocalRunner::new().fail_checkpoints_after(1, 1)).await;
+    assert_eq!(result.invocation_count(), 1);
+    assert_eq!(runs, 1);
+    assert!(result.is_failure(), "{result:?}");
+    assert_eq!(
+        result.error_type(),
+        Some("CheckpointUnrecoverableExecutionError")
+    );
+}
