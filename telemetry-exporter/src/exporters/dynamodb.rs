@@ -18,8 +18,7 @@ const DEFAULT_PARTITION_KEY: &str = "pk";
 /// The default sort key attribute name.
 const DEFAULT_SORT_KEY: &str = "sk";
 
-/// The `DynamoDB` limit on one item, in bytes. It is the default record size
-/// limit.
+/// The default record size limit, in bytes.
 const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 400_000;
 
 /// The largest integer, 2^53 - 1, that a JSON number holds without losing
@@ -42,9 +41,8 @@ const MAX_SAFE_FLOAT: f64 = 9_007_199_254_740_991.0;
 /// the partition key. Then each record replaces the previous record of the
 /// same execution.
 ///
-/// The record limit is the size of the JSON rendering. `DynamoDB` counts
-/// the size of an item by its own rules, which can give a larger number.
-/// So a limit close to 400,000 can still be rejected.
+/// The record size limit applies to the JSON rendering of the record. It
+/// does not apply to the size of the item that the exporter sends.
 ///
 /// The function's role needs `dynamodb:PutItem` on the table.
 #[derive(Debug)]
@@ -206,8 +204,8 @@ impl DynamoDbExporterBuilder {
     /// Sets the sort key attribute name. Its value is the record's
     /// `emittedAt` time. The default is `sk`.
     ///
-    /// The exporter sends the name as given. `DynamoDB` rejects an empty
-    /// name. To write no sort key, call
+    /// The exporter sends the name as given, including an empty name. To
+    /// write no sort key, call
     /// [`without_sort_key`](Self::without_sort_key).
     pub fn sort_key(mut self, name: impl Into<String>) -> Self {
         self.sort_key = Some(name.into());
@@ -230,7 +228,7 @@ impl DynamoDbExporterBuilder {
     }
 
     /// Sets the largest record, in bytes, before truncation. The default
-    /// is 400,000, which is below the `DynamoDB` item limit of 400 KB.
+    /// is 400,000.
     pub fn max_record_size_bytes(mut self, max: usize) -> Self {
         self.max_record_size_bytes = max;
         self
