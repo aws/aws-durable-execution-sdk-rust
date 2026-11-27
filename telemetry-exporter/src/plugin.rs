@@ -47,12 +47,12 @@ struct Environment {
 /// ```no_run
 /// use aws_durable_execution_sdk as durable;
 /// use aws_durable_execution_sdk_telemetry_exporter::{
-///     CloudWatchLogsExporter, DurableExecutionTelemetry, EmitMode,
+///     DurableExecutionTelemetry, EmitMode, LambdaLogExporter,
 /// };
 ///
 /// # fn options() -> Result<durable::Options, durable::BoxError> {
 /// let telemetry = DurableExecutionTelemetry::builder()
-///     .exporter(CloudWatchLogsExporter::builder("my-telemetry-group").build())
+///     .exporter(LambdaLogExporter::new())
 ///     .emit_mode(EmitMode::OnComplete)
 ///     .build();
 /// let options = durable::Options::builder().plugin(telemetry).build()?;

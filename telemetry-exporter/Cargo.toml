@@ -1,10 +1,11 @@
 [workspace]
 # The telemetry exporter is its OWN cargo workspace, like conformance/ and
 # examples/. The root workspace's direct-dependency allowlist
-# (scripts/check-direct-deps.sh) covers every root member, and this crate
-# depends on aws-sdk-cloudwatchlogs, which is not on that list. A separate
-# workspace keeps the SDK's dependency graph unchanged. The same script
-# checks this crate against a separate list, EXPORTER_ALLOWLIST.
+# (scripts/check-direct-deps.sh) covers every root member, and this crate's
+# `cloudwatch-logs` feature depends on aws-sdk-cloudwatchlogs, which is not
+# on that list. A separate workspace keeps the SDK's dependency graph
+# unchanged. The same script checks this crate against a separate list,
+# EXPORTER_ALLOWLIST.
 members = ["."]
 resolver = "2"
 
@@ -46,15 +47,22 @@ unsafe_code = "forbid"
 [lints]
 workspace = true
 
+# An exporter that needs a service client is behind its own feature, and no
+# feature is on by default. So a build compiles a service client only for
+# an exporter that the build enables.
+[features]
+# Enables `CloudWatchLogsExporter`.
+cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs"]
+
 [dependencies]
 aws-durable-execution-sdk = { path = ".." }
 # The same trim as the SDK's own AWS crates: no legacy hyper-0.14 /
 # rustls-0.21 chain. See the root Cargo.toml.
-aws-config = { version = "1", default-features = false, features = [
+aws-config = { version = "1", optional = true, default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = [
+aws-sdk-cloudwatchlogs = { version = "1", optional = true, default-features = false, features = [
     "behavior-version-latest",
     "default-https-client",
     "rt-tokio",
