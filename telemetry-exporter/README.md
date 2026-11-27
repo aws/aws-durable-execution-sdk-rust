@@ -47,20 +47,53 @@ standard output. Lambda sends standard output to the function's log group.
 | --- | --- | --- | --- |
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
 | `CloudWatchLogsExporter` | `cloudwatch-logs` | An existing log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
+| `FileExporter` | `file` | Files in a directory: one NDJSON file per UTC day, or one JSON file per execution | None. The function needs write access to the directory. |
 
 `CloudWatchLogsExporter` does not create the log group. Create the group
 before the function runs.
 
 No cargo feature is on by default. An exporter that needs a service client
-is behind its own feature, so a build compiles only the clients of the
-exporters it enables. To use `CloudWatchLogsExporter`, enable its feature:
+or an extra part of `tokio` is behind its own feature, so a build compiles
+only the dependencies of the exporters it enables. To use
+`CloudWatchLogsExporter`, enable its feature:
 
 ```toml
 aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs"] }
 ```
 
-Both exporters write the `operationsByName` form of the record. Both
-truncate a record larger than 256,000 bytes. Truncation drops operation
+`FileExporter` writes to a directory, for example an EFS mount or `/tmp`.
+In the default `FileMode::Ndjson` mode, it appends each record as one line
+to `{directory}/{YYYY-MM-DD}.ndjson`. The date is the first 10 characters of
+the record's `emittedAt`. In `FileMode::Json` mode, it writes each
+execution to `{directory}/{name}.json` as JSON indented by 2 spaces, and
+each later record of that execution replaces the file. The name is the
+execution name, or the execution ARN when there is no name. Each character
+outside `a-z`, `A-Z`, `0-9`, `.`, `_` and `-` becomes `_`. The exporter
+creates the directory and its parents before the first write.
+
+```rust,no_run
+# #[cfg(feature = "file")]
+# {
+use aws_durable_execution_sdk_telemetry_exporter::{
+    DurableExecutionTelemetry, FileExporter, FileMode,
+};
+
+let telemetry = DurableExecutionTelemetry::builder()
+    .exporter(
+        FileExporter::builder("/mnt/efs/telemetry")
+            .mode(FileMode::Json)
+            .build(),
+    )
+    .build();
+# }
+```
+
+`LambdaLogExporter` and `CloudWatchLogsExporter` write the
+`operationsByName` form of the record. They truncate a record larger than
+256,000 bytes. `FileExporter` writes the `operations` array by default and
+truncates nothing by default. Its builder sets the form with
+`operations_format` and a limit with `max_record_size_bytes`. When an
+exporter truncates a record, truncation drops operation
 results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
 dropped.

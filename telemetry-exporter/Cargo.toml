@@ -46,12 +46,15 @@ unsafe_code = "forbid"
 [lints]
 workspace = true
 
-# An exporter that needs a service client is behind its own feature, and no
-# feature is on by default. So a build compiles a service client only for
-# an exporter that the build enables.
+# An exporter that needs a service client or an extra tokio feature is
+# behind its own feature, and no feature is on by default. So a build
+# compiles only the dependencies of the exporters that it enables.
 [features]
 # Enables `CloudWatchLogsExporter`.
 cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs"]
+# Enables `FileExporter`. It uses the async file system calls and the
+# async write methods of tokio.
+file = ["tokio/fs", "tokio/io-util"]
 
 [dependencies]
 aws-durable-execution-sdk = { path = ".." }
