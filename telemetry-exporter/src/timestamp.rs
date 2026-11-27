@@ -100,6 +100,58 @@ pub(crate) fn format_iso_ms(ms: i64) -> String {
     )
 }
 
+#[cfg(any(feature = "otel", test))]
+/// Parses `YYYY-MM-DDTHH:MM:SS[.fff]Z` into epoch milliseconds, or `None`
+/// when `text` has another form or an impossible date or time.
+///
+/// Digits after the third fraction digit are dropped. This is the inverse
+/// of [`format_iso_ms`] for years 0 to 9999.
+pub(crate) fn parse_iso_ms(text: &str) -> Option<i64> {
+    let (date_time, fraction) = text
+        .strip_suffix('Z')?
+        .split_once('T')
+        .map(|(date, time)| {
+            let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
+            ((date, clock), fraction)
+        })?;
+    let (date, clock) = date_time;
+    let number = |part: &str, width: usize| -> Option<i64> {
+        (part.len() == width && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| part.parse().ok())?
+    };
+    let mut date = date.split('-');
+    let (year, month, day) = (
+        number(date.next()?, 4)?,
+        number(date.next()?, 2)?,
+        number(date.next()?, 2)?,
+    );
+    let mut clock = clock.split(':');
+    let (hour, minute, second) = (
+        number(clock.next()?, 2)?,
+        number(clock.next()?, 2)?,
+        number(clock.next()?, 2)?,
+    );
+    if date.next().is_some() || clock.next().is_some() {
+        return None;
+    }
+    if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let millis: i64 = format!("{fraction:0<3}").get(..3)?.parse().ok()?;
+    let fields_fit = (1..=12).contains(&month) && hour < 24 && minute < 60 && second < 60;
+    // Hinnant's `days_from_civil`.
+    let shifted_year = year - i64::from(month <= 2);
+    let era = shifted_year.div_euclid(400);
+    let yoe = shifted_year.rem_euclid(400);
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * shifted_month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let ms = days * MS_PER_DAY + ((hour * 60 + minute) * 60 + second) * 1000 + millis;
+    // A day that the month lacks formats back to another date.
+    (fields_fit && format_iso_ms(ms).get(..10) == text.get(..10)).then_some(ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +214,43 @@ mod tests {
         let far = Duration::from_secs(u64::MAX / 2);
         assert_eq!(epoch_ms(SystemTime::UNIX_EPOCH + far), i64::MAX);
         assert_eq!(epoch_ms(SystemTime::UNIX_EPOCH - far), i64::MIN);
+    }
+
+    #[test]
+    fn parses_what_it_formats() {
+        for ms in [0, 1_800_000_000_123, -1, 951_782_400_000, 4_102_444_799_999] {
+            assert_eq!(parse_iso_ms(&format_iso_ms(ms)), Some(ms), "{ms}");
+        }
+    }
+
+    #[test]
+    fn parses_a_time_without_a_fraction_and_a_short_or_long_fraction() {
+        assert_eq!(parse_iso_ms("1970-01-01T00:00:01Z"), Some(1000));
+        assert_eq!(parse_iso_ms("1970-01-01T00:00:01.5Z"), Some(1500));
+        assert_eq!(parse_iso_ms("1970-01-01T00:00:01.123456Z"), Some(1123));
+    }
+
+    #[test]
+    fn rejects_text_that_is_not_a_time() {
+        for text in [
+            "",
+            "1970-01-01",
+            "1970-01-01T00:00:00",
+            "1970-01-01T00:00:00+00:00",
+            "1970-01-01T00:00:00.1xZ",
+            "1970-1-01T00:00:00Z",
+            "1970-13-01T00:00:00Z",
+            "1970-02-30T00:00:00Z",
+            "1970-01-00T00:00:00Z",
+            "1970-01-01T24:00:00Z",
+            "1970-01-01T00:60:00Z",
+            "1970-01-01T00:00:60Z",
+            "1970-01-01T00:00Z",
+            "1970-01-01T00:00:00:00Z",
+            "1970-01-01-01T00:00:00Z",
+        ] {
+            assert_eq!(parse_iso_ms(text), None, "{text:?}");
+        }
     }
 
     #[test]

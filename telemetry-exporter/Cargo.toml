@@ -2,9 +2,10 @@
 # The telemetry exporter is its OWN cargo workspace, like conformance/ and
 # examples/. The root workspace's direct-dependency allowlist
 # (scripts/check-direct-deps.sh) covers every root member, and this crate's
-# `cloudwatch-logs` and `http` features depend on aws-sdk-cloudwatchlogs and
-# the aws-smithy HTTP crates, which are not on that list. A separate
-# workspace keeps the SDK's dependency graph unchanged.
+# `cloudwatch-logs`, `http` and `otel` features depend on
+# aws-sdk-cloudwatchlogs and the aws-smithy HTTP crates, which are not on
+# that list. A separate workspace keeps the SDK's dependency graph
+# unchanged.
 members = ["."]
 resolver = "2"
 
@@ -54,6 +55,8 @@ workspace = true
 cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs"]
 # Enables `HttpExporter`.
 http = ["http-client"]
+# Enables `OtelExporter`.
+otel = ["http-client"]
 # Compiles the private HTTP sender in `src/http.rs`. It is not part of the
 # public API. An exporter that sends HTTP requests lists this feature, and no
 # other change enables the sender.

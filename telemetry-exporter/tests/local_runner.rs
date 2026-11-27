@@ -679,3 +679,51 @@ async fn a_retried_step_reports_its_highest_attempt() {
         "{flaky}"
     );
 }
+
+/// Limits the size to 1,500 bytes and measures 1,000 bytes per operation.
+/// The measured text, not the record's JSON, decides what the plugin drops.
+#[derive(Clone, Default)]
+struct MeasuresPerOperation {
+    records: Arc<Mutex<Vec<Value>>>,
+}
+
+impl TelemetryExporter for MeasuresPerOperation {
+    fn export<'a>(&'a self, record: &'a TelemetryRecord) -> ExportFuture<'a> {
+        let value = render_value(record, OperationsFormat::Array).expect("render");
+        self.records.lock().expect("lock").push(value);
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn max_record_size_bytes(&self) -> Option<usize> {
+        Some(1_500)
+    }
+
+    fn measured_text(&self, record: &TelemetryRecord) -> Result<String, BoxError> {
+        Ok("x".repeat(record.operations.len() * 1_000))
+    }
+}
+
+async fn three_steps(_event: Value, ctx: DurableContext) -> Result<u32, BoxError> {
+    for name in ["first", "second", "third"] {
+        ctx.step(|_| async move { Ok(1_u32) }).name(name).await?;
+    }
+    Ok(3)
+}
+
+#[tokio::test]
+async fn an_exporter_measures_the_limit_on_its_own_text() {
+    let exporter = MeasuresPerOperation::default();
+    let telemetry = DurableExecutionTelemetry::builder()
+        .exporter(exporter.clone())
+        .build();
+    runner(telemetry)
+        .run(three_steps, json!({}))
+        .await
+        .expect("runner");
+    let records = exporter.records.lock().expect("lock").clone();
+    let last = records.last().expect("a record");
+    assert_eq!(last["truncated"], true);
+    assert_eq!(last["droppedOperations"], 2);
+    assert_eq!(last["operations"].as_array().map(Vec::len), Some(1));
+    assert_eq!(last["operations"][0]["name"], "third");
+}
