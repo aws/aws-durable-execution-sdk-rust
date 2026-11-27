@@ -44,6 +44,7 @@
 //! | Feature | Enables |
 //! | --- | --- |
 //! | `cloudwatch-logs` | `CloudWatchLogsExporter`, which writes to a log group of your choice |
+//! | `s3` | `S3Exporter`, which writes one object per execution to a bucket |
 
 // Compiles the README's Rust examples as doctests, so a README example that
 // stops compiling fails `cargo test`.
@@ -70,6 +71,8 @@ pub use exporter::{ExportFuture, TelemetryExporter};
 #[cfg(feature = "cloudwatch-logs")]
 pub use exporters::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
 pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
+#[cfg(feature = "s3")]
+pub use exporters::{S3Exporter, S3ExporterBuilder, S3Partitioning};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
     ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
@@ -87,6 +90,13 @@ pub use truncation::truncate_record;
 // `Client` types would not match.
 #[cfg(feature = "cloudwatch-logs")]
 pub use aws_sdk_cloudwatchlogs::Client as CloudWatchLogsClient;
+
+// `S3ExporterBuilder::client` takes this type, which another crate defines.
+// Without the re-export, a caller would need a direct dependency on
+// `aws-sdk-s3`. The caller's version of that crate could then differ from
+// this crate's version. The two `Client` types would not match.
+#[cfg(feature = "s3")]
+pub use aws_sdk_s3::Client as S3Client;
 
 /// The `tracing` target of every event this crate logs.
 pub(crate) const TARGET: &str = "aws_durable_execution_sdk_telemetry_exporter";

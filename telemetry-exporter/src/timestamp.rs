@@ -86,6 +86,58 @@ impl Civil {
     }
 }
 
+/// The epoch millisecond count of a time in the form [`format_iso_ms`]
+/// writes, `YYYY-MM-DDTHH:MM:SS.sssZ`.
+///
+/// Returns `None` when the text has another form or names a day that does
+/// not exist, such as February 30. The year has four digits.
+#[cfg(any(feature = "s3", test))]
+pub(crate) fn parse_iso_ms(text: &str) -> Option<i64> {
+    let digits = |from: usize, to: usize| -> Option<i64> {
+        let part = text.get(from..to)?;
+        if part.bytes().all(|b| b.is_ascii_digit()) {
+            part.parse().ok()
+        } else {
+            None
+        }
+    };
+    let separators = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+        (23, b'Z'),
+    ];
+    if text.len() != 24
+        || separators
+            .iter()
+            .any(|&(at, sep)| text.as_bytes().get(at) != Some(&sep))
+    {
+        return None;
+    }
+    let (year, month, day) = (digits(0, 4)?, digits(5, 7)?, digits(8, 10)?);
+    let (hour, minute, second, milli) = (
+        digits(11, 13)?,
+        digits(14, 16)?,
+        digits(17, 19)?,
+        digits(20, 23)?,
+    );
+    // Days since the epoch: Howard Hinnant's `days_from_civil`.
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let ms = days * MS_PER_DAY + hour * 3_600_000 + minute * 60_000 + second * 1000 + milli;
+    // A field out of range, such as month 13 or hour 25, does not survive
+    // the round trip through the calendar fields.
+    (format_iso_ms(ms) == text).then_some(ms)
+}
+
 /// Formats an epoch millisecond count as `YYYY-MM-DDTHH:MM:SS.sssZ` in UTC.
 ///
 /// A year outside 0..=9999 is written with as many digits as it needs, and
@@ -125,6 +177,32 @@ mod tests {
     #[test]
     fn formats_a_time_before_the_epoch() {
         assert_eq!(format_iso_ms(-1), "1969-12-31T23:59:59.999Z");
+    }
+
+    #[test]
+    fn parses_what_it_formats() {
+        for ms in [0, 1_794_902_950_123, 1_709_251_199_999, -1, 951_782_400_000] {
+            assert_eq!(parse_iso_ms(&format_iso_ms(ms)), Some(ms));
+        }
+    }
+
+    #[test]
+    fn rejects_text_that_is_not_the_written_form() {
+        for text in [
+            "",
+            "garbage",
+            "2026-01-01",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01 00:00:00.000Z",
+            "2026-01-01T00:00:00.000+00:00",
+            "2026-13-01T00:00:00.000Z",
+            "2026-02-30T00:00:00.000Z",
+            "2026-01-01T25:00:00.000Z",
+            "2026-0a-01T00:00:00.000Z",
+            "２０２６-01-01T00:00:00.000Z",
+        ] {
+            assert_eq!(parse_iso_ms(text), None, "{text}");
+        }
     }
 
     #[test]
