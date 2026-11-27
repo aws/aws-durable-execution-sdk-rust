@@ -44,6 +44,7 @@
 //! | Feature | Enables |
 //! | --- | --- |
 //! | `cloudwatch-logs` | `CloudWatchLogsExporter`, which writes to a log group of your choice |
+//! | `redshift` | `RedshiftExporter`, which upserts one row per execution into a Redshift table |
 
 // Compiles the README's Rust examples as doctests, so a README example that
 // stops compiling fails `cargo test`.
@@ -70,6 +71,8 @@ pub use exporter::{ExportFuture, TelemetryExporter};
 #[cfg(feature = "cloudwatch-logs")]
 pub use exporters::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
 pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
+#[cfg(feature = "redshift")]
+pub use exporters::{RedshiftExporter, RedshiftExporterBuilder};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
     ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
@@ -87,6 +90,14 @@ pub use truncation::truncate_record;
 // `Client` types would not match.
 #[cfg(feature = "cloudwatch-logs")]
 pub use aws_sdk_cloudwatchlogs::Client as CloudWatchLogsClient;
+
+// `RedshiftExporterBuilder::client` takes this type, which another crate
+// defines. Without the re-export, a caller would need a direct dependency on
+// `aws-sdk-redshiftdata` to name it. The caller's version of that crate could
+// then differ from this crate's version. The two `Client` types would not
+// match.
+#[cfg(feature = "redshift")]
+pub use aws_sdk_redshiftdata::Client as RedshiftDataClient;
 
 /// The `tracing` target of every event this crate logs.
 pub(crate) const TARGET: &str = "aws_durable_execution_sdk_telemetry_exporter";

@@ -47,20 +47,25 @@ standard output. Lambda sends standard output to the function's log group.
 | --- | --- | --- | --- |
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
 | `CloudWatchLogsExporter` | `cloudwatch-logs` | An existing log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
+| `RedshiftExporter` | `redshift` | A Redshift table you choose, one row per execution | `redshift-data:ExecuteStatement`, plus `redshift-serverless:GetCredentials` (Serverless) or `redshift:GetClusterCredentialsWithIAM` (provisioned cluster) |
 
 `CloudWatchLogsExporter` does not create the log group. Create the group
 before the function runs.
 
 No cargo feature is on by default. An exporter that needs a service client
 is behind its own feature, so a build compiles only the clients of the
-exporters it enables. To use `CloudWatchLogsExporter`, enable its feature:
+exporters it enables. To use `CloudWatchLogsExporter` or `RedshiftExporter`,
+enable its feature:
 
 ```toml
-aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs"] }
+aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs", "redshift"] }
 ```
 
-Both exporters write the `operationsByName` form of the record. Both
-truncate a record larger than 256,000 bytes. Truncation drops operation
+`LambdaLogExporter` and `CloudWatchLogsExporter` write the
+`operationsByName` form of the record. `RedshiftExporter` writes the
+`operations` array. `LambdaLogExporter` and `CloudWatchLogsExporter`
+truncate a record larger than 256,000 bytes. `RedshiftExporter` truncates a
+record larger than 1,000,000 bytes. Truncation drops operation
 results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
 dropped.
@@ -88,6 +93,43 @@ logged as a warning. It never fails the execution.
 
 To unit test an exporter, build a record with `TelemetryRecord::new` and
 `OperationRecord::new`, then assign the fields the test needs.
+
+### `RedshiftExporter`
+
+`RedshiftExporter` runs one `MERGE` statement per record with the Redshift
+Data API. It matches rows on `execution_arn`, so the table holds one row per
+execution. The table must exist. Its columns are `execution_arn`,
+`execution_name`, `function_name`, `status`, `start_time`, `end_time`,
+`duration_ms`, `record_json` (type `SUPER`) and `emitted_at`.
+
+The builder needs `workgroup_name` (Redshift Serverless) or
+`cluster_identifier` (provisioned cluster), and `build()` returns an error
+without one. `database` is the builder's argument. `db_user`, `secret_arn`,
+`region` and `client` are optional. `table` defaults to
+`durable_execution_telemetry` and `schema` to `public`. Both must match
+`^[a-zA-Z_][a-zA-Z0-9_]*$`, and `build()` returns an error otherwise.
+
+The Data API runs a statement asynchronously. The exporter does not wait for
+the statement to finish. An export succeeds when Redshift accepts the
+statement.
+
+```rust,no_run
+# #[cfg(feature = "redshift")]
+# fn build() -> Result<(), aws_durable_execution_sdk::BoxError> {
+use aws_durable_execution_sdk_telemetry_exporter::{
+    DurableExecutionTelemetry, RedshiftExporter,
+};
+
+let exporter = RedshiftExporter::builder("dev")
+    .workgroup_name("my-workgroup")
+    .build()?;
+let telemetry = DurableExecutionTelemetry::builder()
+    .exporter(exporter)
+    .build();
+# drop(telemetry);
+# Ok(())
+# }
+```
 
 ## Configuration
 
@@ -125,7 +167,7 @@ let telemetry = DurableExecutionTelemetry::builder()
 ## Development
 
 The crate is its own cargo workspace. The SDK's dependency allowlist does
-not include `aws-sdk-cloudwatchlogs`, so the crate is not a member of the
+not include `aws-sdk-cloudwatchlogs` or `aws-sdk-redshiftdata`, so the crate is not a member of the
 root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
 formatting, builds, lints, runs the tests and builds the docs. It lints,
 tests and builds the docs twice: with no feature and with every feature.
