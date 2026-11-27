@@ -107,14 +107,11 @@ pub(crate) fn format_iso_ms(ms: i64) -> String {
 /// Digits after the third fraction digit are dropped. This is the inverse
 /// of [`format_iso_ms`] for years 0 to 9999.
 pub(crate) fn parse_iso_ms(text: &str) -> Option<i64> {
-    let (date_time, fraction) = text
-        .strip_suffix('Z')?
-        .split_once('T')
-        .map(|(date, time)| {
-            let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
-            ((date, clock), fraction)
-        })?;
-    let (date, clock) = date_time;
+    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+    let (clock, fraction) = match time.split_once('.') {
+        Some((clock, fraction)) => (clock, (!fraction.is_empty()).then_some(fraction)?),
+        None => (time, ""),
+    };
     let number = |part: &str, width: usize| -> Option<i64> {
         (part.len() == width && part.bytes().all(|byte| byte.is_ascii_digit()))
             .then(|| part.parse().ok())?
@@ -238,6 +235,7 @@ mod tests {
             "1970-01-01T00:00:00",
             "1970-01-01T00:00:00+00:00",
             "1970-01-01T00:00:00.1xZ",
+            "1970-01-01T00:00:00.Z",
             "1970-1-01T00:00:00Z",
             "1970-13-01T00:00:00Z",
             "1970-02-30T00:00:00Z",
