@@ -166,7 +166,13 @@ impl OpenSearchExporter {
                         DisplayErrorContext(&error)
                     )
                 })?;
-                sign_put(url, body, &Identity::from(credentials), region.as_ref(), time)
+                sign_put(
+                    url,
+                    body,
+                    &Identity::from(credentials),
+                    region.as_ref(),
+                    time,
+                )
             }
         }
     }
@@ -394,8 +400,7 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     const ARN: &str = "arn:aws:lambda:us-east-1:123456789012:function:f:1/durable-execution/e/i";
-    const ENCODED_ARN: &str =
-        "arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Afunction%3Af%3A1%2Fdurable-execution%2Fe%2Fi";
+    const ENCODED_ARN: &str = "arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Afunction%3Af%3A1%2Fdurable-execution%2Fe%2Fi";
 
     fn credentials() -> Credentials {
         Credentials::new(
