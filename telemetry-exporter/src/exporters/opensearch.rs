@@ -19,8 +19,8 @@ use crate::render::{OperationsFormat, render_json};
 /// The default index name.
 const DEFAULT_INDEX_NAME: &str = "durable-execution-telemetry";
 
-/// The default record size limit. `OpenSearch` accepts large documents, so
-/// this is a guard and not a service limit.
+/// The default record size limit. The exporter truncates a larger record
+/// before it sends the record.
 const OPENSEARCH_DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 10_000_000;
 
 /// The default request timeout, in milliseconds.
