@@ -104,11 +104,8 @@ impl FileExporter {
         Ok(())
     }
 
-    /// Appends `line` and a newline to the file at `path`.
-    async fn append(path: &Path, line: &str) -> Result<(), BoxError> {
-        let mut text = String::with_capacity(line.len() + 1);
-        text.push_str(line);
-        text.push('\n');
+    /// Appends `text`, which ends with a newline, to the file at `path`.
+    async fn append(path: &Path, text: &str) -> Result<(), BoxError> {
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -144,7 +141,8 @@ impl FileExporter {
                     )
                 })?;
                 let path = self.directory.join(format!("{date}.ndjson"));
-                let line = render_json(record, self.operations_format)?;
+                let mut line = render_json(record, self.operations_format)?;
+                line.push('\n');
                 Self::append(&path, &line).await
             }
             FileMode::Json => {
