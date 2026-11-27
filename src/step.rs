@@ -204,6 +204,9 @@ pub enum StepSemantics {
     /// step returns its result without waiting for the `SUCCEED`
     /// checkpoint. So the step has lower latency.
     ///
+    /// Experimental: this value may change or be removed in a future
+    /// release.
+    ///
     /// The code after the step can run before the result is saved. Every
     /// invocation writes its pending checkpoints before it reports its
     /// outcome, and the SDK sends checkpoints in order. So the result is

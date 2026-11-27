@@ -593,13 +593,15 @@ not written and the invocation fails.
 retry strategy, so a non-idempotent body never runs twice for the same
 attempt. The strategy sees `StepErrorKind::Interrupted`, and the recorded
 failure carries the error type `StepInterruptedError`.
-`AtLeastOnceAsync` is like `AtLeastOnce`, but the step returns without
-waiting for the service to save its result. So the step has lower latency.
+`AtLeastOnceAsync` (experimental) is like `AtLeastOnce`, but the step returns
+without waiting for the service to save its result. So the step has lower
+latency.
 The SDK sends checkpoints in order and writes every pending checkpoint
 before the invocation ends. If the invocation ends before the save, the step
 runs again on replay. Later steps then run again too, and the step can return
 a different value. So do not use it for a step whose result becomes an
-idempotency key for a later step.
+idempotency key for a later step. This value is experimental. It may change
+or be removed in a future release.
 
 The deprecated names `AtLeastOncePerRetry` and `AtMostOncePerRetry` behave as
 `AtLeastOnce` and `AtMostOnce` and compare equal to them with `==`.
