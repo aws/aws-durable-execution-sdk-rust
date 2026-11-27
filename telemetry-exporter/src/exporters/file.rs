@@ -109,22 +109,26 @@ impl FileExporter {
         let mut text = String::with_capacity(line.len() + 1);
         text.push_str(line);
         text.push('\n');
-        // The line and its newline go out in one write call. So the file
-        // never holds a line without its newline.
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .await
             .map_err(|error| io_error("opening", path, &error))?;
-        file.write_all(text.as_bytes())
-            .await
-            .map_err(|error| io_error("appending to", path, &error))?;
-        // A tokio file hands its writes to a blocking thread. Dropping the
-        // file does not wait for them. So the flush is required.
-        file.flush()
-            .await
-            .map_err(|error| io_error("appending to", path, &error))?;
+        // A tokio file splits a write at its buffer cap, 2 MiB by default.
+        // Two writes of one line could interleave with another writer's
+        // line. So the cap is raised to the length of the line, and the
+        // line and its newline reach the file as one write.
+        file.set_max_buf_size(text.len());
+        // A tokio file hands its writes to a blocking thread, and reports a
+        // failed write on a later call. Dropping the file does not wait for
+        // the thread. So the flush is required, and its error is reported.
+        async {
+            file.write_all(text.as_bytes()).await?;
+            file.flush().await
+        }
+        .await
+        .map_err(|error| io_error("appending to", path, &error))?;
         Ok(())
     }
 
@@ -448,6 +452,37 @@ mod tests {
             .unwrap_or_default();
         assert!(error.starts_with("opening "), "{error}");
         assert!(error.contains("2026-01-01.ndjson"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_file_that_cannot_be_appended_to_names_the_path() {
+        let dir = TempDir::new();
+        assert!(std::fs::create_dir_all(&dir.0).is_ok());
+        // Every write to /dev/full fails with "no space left on device".
+        let link = dir.0.join("2026-01-01.ndjson");
+        assert!(std::os::unix::fs::symlink("/dev/full", link).is_ok());
+        let exporter = FileExporter::builder(&dir.0).build();
+        let error = exporter
+            .export(&record(Vec::new()))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(error.starts_with("appending to "), "{error}");
+        assert!(error.contains("2026-01-01.ndjson"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_line_over_the_default_buffer_cap_is_appended_whole() {
+        let dir = TempDir::new();
+        let exporter = FileExporter::builder(&dir.0).build();
+        let mut big = record(Vec::new());
+        big.output = Some(json!("x".repeat(3 * 1024 * 1024)));
+        assert!(exporter.export(&big).await.is_ok());
+        let text = dir.read("2026-01-01.ndjson");
+        assert!(text.len() > 3 * 1024 * 1024);
+        assert_eq!(lines(&text).len(), 1);
     }
 
     #[tokio::test]

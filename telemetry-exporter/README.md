@@ -68,7 +68,9 @@ execution name, or the execution ARN when there is no name. Each character
 outside `a-z`, `A-Z`, `0-9`, `.`, `_` and `-` becomes `_`. The exporter
 creates the directory and its parents before the first write.
 
-```rust,ignore
+```rust,no_run
+# #[cfg(feature = "file")]
+# {
 use aws_durable_execution_sdk_telemetry_exporter::{
     DurableExecutionTelemetry, FileExporter, FileMode,
 };
@@ -80,6 +82,7 @@ let telemetry = DurableExecutionTelemetry::builder()
             .build(),
     )
     .build();
+# }
 ```
 
 `LambdaLogExporter` and `CloudWatchLogsExporter` write the
