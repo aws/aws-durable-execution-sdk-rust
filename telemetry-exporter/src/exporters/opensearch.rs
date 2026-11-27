@@ -136,13 +136,7 @@ impl OpenSearchExporter {
     /// use.
     async fn config(&self) -> &SdkConfig {
         self.config
-            .get_or_init(|| async {
-                let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-                if let Some(region) = &self.region {
-                    loader = loader.region(aws_config::Region::new(region.clone()));
-                }
-                loader.load().await
-            })
+            .get_or_init(|| default_loader(self.region.as_deref()).load())
             .await
     }
 
@@ -201,6 +195,16 @@ impl OpenSearchExporter {
             )
             .into())
         }
+    }
+}
+
+/// The loader of the default credential and region chain. `region`, when
+/// set, replaces the region of the chain.
+fn default_loader(region: Option<&str>) -> aws_config::ConfigLoader {
+    let loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    match region {
+        Some(region) => loader.region(aws_config::Region::new(region.to_owned())),
+        None => loader,
     }
 }
 
@@ -474,6 +478,15 @@ mod tests {
         );
         assert_eq!(exporter.sender.timeout(), Duration::from_millis(250));
         assert_eq!(exporter.max_record_size_bytes(), Some(99));
+    }
+
+    #[tokio::test]
+    async fn the_builder_region_replaces_the_region_of_the_default_chain() {
+        let config = default_loader(Some("eu-west-1"))
+            .credentials_provider(SharedCredentialsProvider::new(credentials()))
+            .load()
+            .await;
+        assert_eq!(config.region().map(AsRef::as_ref), Some("eu-west-1"));
     }
 
     #[test]
