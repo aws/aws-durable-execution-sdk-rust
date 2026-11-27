@@ -27,6 +27,10 @@ const DEFAULT_LOG_STREAM_PREFIX: &str = "durable-execution-telemetry/";
 /// `{prefix}YYYY/MM/DD`, which bounds a stream's size. The event message
 /// is the `operationsByName` form of the record.
 ///
+/// The log group must exist before the first record. The exporter does
+/// not create a log group. If the group is missing, each export fails
+/// with the `ResourceNotFoundException` of `CreateLogStream`.
+///
 /// The function's role needs `logs:CreateLogStream` and
 /// `logs:PutLogEvents` on the log group. The exporter creates each day's
 /// stream on its first record and treats an existing stream as created.
