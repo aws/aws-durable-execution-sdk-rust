@@ -2,9 +2,9 @@
 # The telemetry exporter is its OWN cargo workspace, like conformance/ and
 # examples/. The root workspace's direct-dependency allowlist
 # (scripts/check-direct-deps.sh) covers every root member, and this crate's
-# `cloudwatch-logs` feature depends on aws-sdk-cloudwatchlogs, which is not
-# on that list. A separate workspace keeps the SDK's dependency graph
-# unchanged.
+# `cloudwatch-logs` and `dynamodb` features depend on aws-sdk-cloudwatchlogs
+# and aws-sdk-dynamodb, which are not on that list. A separate workspace
+# keeps the SDK's dependency graph unchanged.
 members = ["."]
 resolver = "2"
 
@@ -51,7 +51,9 @@ workspace = true
 # an exporter that the build enables.
 [features]
 # Enables `CloudWatchLogsExporter`.
-cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs"]
+cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs", "dep:aws-smithy-types"]
+# Enables `DynamoDbExporter`.
+dynamodb = ["dep:aws-config", "dep:aws-sdk-dynamodb", "dep:aws-smithy-types"]
 
 [dependencies]
 aws-durable-execution-sdk = { path = ".." }
@@ -66,6 +68,13 @@ aws-sdk-cloudwatchlogs = { version = "1", optional = true, default-features = fa
     "default-https-client",
     "rt-tokio",
 ] }
+aws-sdk-dynamodb = { version = "1", optional = true, default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
+# The shared `call_error` formats a service error with `DisplayErrorContext`.
+aws-smithy-types = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.44", features = ["rt", "sync"] }
@@ -76,6 +85,10 @@ aws-durable-execution-sdk = { path = "..", features = ["test-util"] }
 # The CloudWatch Logs exporter tests mock the service client at the HTTP
 # layer. `mock_client!` requires the service crate's `test-util` feature.
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = [
+    "test-util",
+] }
+# The DynamoDB exporter tests mock the client the same way.
+aws-sdk-dynamodb = { version = "1", default-features = false, features = [
     "test-util",
 ] }
 aws-smithy-mocks = "0.3"

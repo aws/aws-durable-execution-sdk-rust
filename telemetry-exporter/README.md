@@ -47,23 +47,35 @@ standard output. Lambda sends standard output to the function's log group.
 | --- | --- | --- | --- |
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
 | `CloudWatchLogsExporter` | `cloudwatch-logs` | An existing log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
+| `DynamoDbExporter` | `dynamodb` | A `DynamoDB` table you choose, one item per record | `dynamodb:PutItem` |
 
 `CloudWatchLogsExporter` does not create the log group. Create the group
 before the function runs.
 
 No cargo feature is on by default. An exporter that needs a service client
 is behind its own feature, so a build compiles only the clients of the
-exporters it enables. To use `CloudWatchLogsExporter`, enable its feature:
+exporters it enables. To use `CloudWatchLogsExporter` or `DynamoDbExporter`,
+enable its feature:
 
 ```toml
-aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs"] }
+aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs", "dynamodb"] }
 ```
 
-Both exporters write the `operationsByName` form of the record. Both
-truncate a record larger than 256,000 bytes. Truncation drops operation
-results first, then whole operations, then the input, then the output. A
-truncated record carries `truncated: true` and the counts of what it
-dropped.
+`DynamoDbExporter` writes each record as one item. The item has the
+attributes of the record and a partition key attribute (`pk`), which holds
+the execution ARN. It also has a sort key attribute (`sk`), which holds the
+`emittedAt` time. So each record is a new item, and the table keeps the
+history of an execution. Call `without_sort_key` to write no sort key. The
+table then has only the partition key, and each record replaces the
+previous record of the same execution. `partition_key` and `sort_key`
+rename the attributes.
+
+All three exporters write the `operationsByName` form of the record.
+`LambdaLogExporter` and `CloudWatchLogsExporter` truncate a record larger
+than 256,000 bytes. `DynamoDbExporter` truncates a record larger than
+400,000 bytes. Truncation drops operation results first, then whole
+operations, then the input, then the output. A truncated record carries
+`truncated: true` and the counts of what it dropped.
 
 Each size check serializes the whole record. So truncation does not check
 the size after every drop. Each phase binary searches the number of
@@ -125,7 +137,7 @@ let telemetry = DurableExecutionTelemetry::builder()
 ## Development
 
 The crate is its own cargo workspace. The SDK's dependency allowlist does
-not include `aws-sdk-cloudwatchlogs`, so the crate is not a member of the
-root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
+not include `aws-sdk-cloudwatchlogs` or `aws-sdk-dynamodb`, so the crate
+is not a member of the root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
 formatting, builds, lints, runs the tests and builds the docs. It lints,
 tests and builds the docs twice: with no feature and with every feature.
