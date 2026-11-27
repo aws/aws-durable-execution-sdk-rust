@@ -47,17 +47,23 @@ standard output. Lambda sends standard output to the function's log group.
 | --- | --- | --- | --- |
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
 | `CloudWatchLogsExporter` | `cloudwatch-logs` | A log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
+| `FirehoseExporter` | `firehose` | A Firehose delivery stream you choose, one newline-terminated JSON record per call | `firehose:PutRecord` |
 
 No cargo feature is on by default. An exporter that needs a service client
 is behind its own feature, so a build compiles only the clients of the
-exporters it enables. To use `CloudWatchLogsExporter`, enable its feature:
+exporters it enables. To use `CloudWatchLogsExporter` or `FirehoseExporter`,
+enable its feature:
 
 ```toml
-aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs"] }
+aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs", "firehose"] }
 ```
 
-Both exporters write the `operationsByName` form of the record. Both
-truncate a record larger than 256,000 bytes. Truncation drops operation
+`LambdaLogExporter` and `CloudWatchLogsExporter` write the `operationsByName`
+form of the record and truncate a record larger than 256,000 bytes.
+`FirehoseExporter` writes the `operations` array by default and truncates a
+record larger than 1,000,000 bytes. Its builder sets another form with
+`operations_format` and another limit with `max_record_size_bytes`.
+Truncation drops operation
 results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
 dropped.
