@@ -47,6 +47,7 @@ standard output. Lambda sends standard output to the function's log group.
 | --- | --- | --- | --- |
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
 | `CloudWatchLogsExporter` | `cloudwatch-logs` | A log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
+| `AuroraExporter` | `aurora` | One row per execution in an Aurora PostgreSQL or MySQL table, through the RDS Data API | `rds-data:ExecuteStatement`, and `secretsmanager:GetSecretValue` on the secret |
 
 No cargo feature is on by default. An exporter that needs a service client
 is behind its own feature, so a build compiles only the clients of the
@@ -56,8 +57,10 @@ exporters it enables. To use `CloudWatchLogsExporter`, enable its feature:
 aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs"] }
 ```
 
-Both exporters write the `operationsByName` form of the record. Both
-truncate a record larger than 256,000 bytes. Truncation drops operation
+`LambdaLogExporter` and `CloudWatchLogsExporter` write the
+`operationsByName` form of the record. Both truncate a record larger than
+256,000 bytes. `AuroraExporter` stores the array form in the `record_json`
+column and truncates a record larger than 1,000,000 bytes. Truncation drops operation
 results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
 dropped.
@@ -122,7 +125,7 @@ let telemetry = DurableExecutionTelemetry::builder()
 ## Development
 
 The crate is its own cargo workspace. The SDK's dependency allowlist does
-not include `aws-sdk-cloudwatchlogs`, so the crate is not a member of the
+not include `aws-sdk-cloudwatchlogs` or `aws-sdk-rdsdata`, so the crate is not a member of the
 root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
 formatting, builds, lints, runs the tests and builds the docs. It lints,
 tests and builds the docs twice: with no feature and with every feature.
