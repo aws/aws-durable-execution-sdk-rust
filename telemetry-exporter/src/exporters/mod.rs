@@ -1,8 +1,10 @@
 //! The exporters this crate ships.
 
+#[cfg(feature = "cloudwatch-logs")]
 mod cloudwatch_logs;
 mod lambda_log;
 
+#[cfg(feature = "cloudwatch-logs")]
 pub use cloudwatch_logs::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
 pub use lambda_log::LambdaLogExporter;
 

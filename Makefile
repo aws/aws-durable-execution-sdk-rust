@@ -99,9 +99,17 @@ summary-order-consumer-test:
 # aws-sdk-cloudwatchlogs, which the SDK's dependency allowlist does not
 # include. So its tests and doc build run here, not in check-sdk.
 workspace-telemetry-exporter: telemetry-exporter-test
+#
+# Each exporter that needs a service client is behind a feature, and no
+# feature is on by default. The workspace-% rule above builds and lints
+# with no feature, so it does not compile those exporters. So the lint,
+# the tests and the doc build also run here with every feature.
 telemetry-exporter-test:
+	cd telemetry-exporter && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 	cd telemetry-exporter && cargo test --locked
+	cd telemetry-exporter && cargo test --locked --all-features
 	cd telemetry-exporter && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --locked
+	cd telemetry-exporter && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --locked --all-features
 
 # Targets that deploy to AWS. They need TEST_ACCOUNT_ID.
 test-role:

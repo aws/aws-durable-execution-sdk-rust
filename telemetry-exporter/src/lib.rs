@@ -32,9 +32,18 @@
 //! ```
 //!
 //! Without an exporter, the plugin writes each record to standard output
-//! with the [`LambdaLogExporter`]. [`CloudWatchLogsExporter`] writes to a
-//! log group of your choice. Implement [`TelemetryExporter`] for any other
-//! destination.
+//! with the [`LambdaLogExporter`]. Implement [`TelemetryExporter`] for any
+//! other destination.
+//!
+//! # Features
+//!
+//! No feature is on by default. An exporter that needs a service client is
+//! behind its own feature, so a build compiles only the clients of the
+//! exporters it enables.
+//!
+//! | Feature | Enables |
+//! | --- | --- |
+//! | `cloudwatch-logs` | `CloudWatchLogsExporter`, which writes to a log group of your choice |
 
 // Compiles the README's Rust examples as doctests, so a README example that
 // stops compiling fails `cargo test`.
@@ -58,10 +67,9 @@ pub use config::{
     ContentConfig, ContentSetting, EmitMode, OperationDetail, OperationOverride, Transform,
 };
 pub use exporter::{ExportFuture, TelemetryExporter};
-pub use exporters::{
-    CloudWatchLogsExporter, CloudWatchLogsExporterBuilder, DEFAULT_MAX_RECORD_SIZE_BYTES,
-    LambdaLogExporter,
-};
+#[cfg(feature = "cloudwatch-logs")]
+pub use exporters::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
+pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
     ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
@@ -77,6 +85,7 @@ pub use truncation::truncate_record;
 // dependency on `aws-sdk-cloudwatchlogs` to name it. The caller's version
 // of that crate could then differ from this crate's version. The two
 // `Client` types would not match.
+#[cfg(feature = "cloudwatch-logs")]
 pub use aws_sdk_cloudwatchlogs::Client as CloudWatchLogsClient;
 
 /// The `tracing` target of every event this crate logs.
