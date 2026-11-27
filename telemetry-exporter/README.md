@@ -47,19 +47,23 @@ standard output. Lambda sends standard output to the function's log group.
 | --- | --- | --- | --- |
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
 | `CloudWatchLogsExporter` | `cloudwatch-logs` | An existing log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
+| `EventBridgeExporter` | `eventbridge` | An event bus you choose, one event per record | `events:PutEvents` |
 
 `CloudWatchLogsExporter` does not create the log group. Create the group
 before the function runs.
 
 No cargo feature is on by default. An exporter that needs a service client
 is behind its own feature, so a build compiles only the clients of the
-exporters it enables. To use `CloudWatchLogsExporter`, enable its feature:
+exporters it enables. To use `CloudWatchLogsExporter` and
+`EventBridgeExporter`, enable their features:
 
 ```toml
-aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs"] }
+aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs", "eventbridge"] }
 ```
 
-Both exporters write the `operationsByName` form of the record. Both
+`LambdaLogExporter` and `CloudWatchLogsExporter` write the
+`operationsByName` form of the record. `EventBridgeExporter` writes the
+`operations` array unless you call `operations_format`. All three
 truncate a record larger than 256,000 bytes. Truncation drops operation
 results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
@@ -125,7 +129,8 @@ let telemetry = DurableExecutionTelemetry::builder()
 ## Development
 
 The crate is its own cargo workspace. The SDK's dependency allowlist does
-not include `aws-sdk-cloudwatchlogs`, so the crate is not a member of the
-root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
-formatting, builds, lints, runs the tests and builds the docs. It lints,
-tests and builds the docs twice: with no feature and with every feature.
+not include `aws-sdk-cloudwatchlogs` or `aws-sdk-eventbridge`, so the crate
+is not a member of the root workspace.
+`make workspaces WORKSPACES=telemetry-exporter` checks the formatting,
+builds, lints, runs the tests and builds the docs. It lints, tests and
+builds the docs twice: with no feature and with every feature.

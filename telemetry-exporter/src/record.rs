@@ -50,6 +50,16 @@ impl ExecutionStatus {
         }
     }
 
+    /// The status as the record's `status` field spells it.
+    #[cfg(feature = "eventbridge")]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "RUNNING",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+        }
+    }
+
     /// Whether the status is terminal: `Succeeded` or `Failed`.
     pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed)
