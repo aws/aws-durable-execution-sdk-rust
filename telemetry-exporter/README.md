@@ -46,8 +46,11 @@ standard output. Lambda sends standard output to the function's log group.
 | Exporter | Cargo feature | Destination | IAM permissions |
 | --- | --- | --- | --- |
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
-| `CloudWatchLogsExporter` | `cloudwatch-logs` | A log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
+| `CloudWatchLogsExporter` | `cloudwatch-logs` | An existing log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
 | `DynamoDbExporter` | `dynamodb` | A `DynamoDB` table you choose, one item per record | `dynamodb:PutItem` |
+
+`CloudWatchLogsExporter` does not create the log group. Create the group
+before the function runs.
 
 No cargo feature is on by default. An exporter that needs a service client
 is behind its own feature, so a build compiles only the clients of the

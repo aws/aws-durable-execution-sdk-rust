@@ -14,6 +14,6 @@ pub use cloudwatch_logs::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder}
 pub use dynamodb::{DynamoDbExporter, DynamoDbExporterBuilder};
 pub use lambda_log::LambdaLogExporter;
 
-/// The `CloudWatch` Logs limit on one log event, which `LambdaLogExporter` and
-/// `CloudWatchLogsExporter` use as their default record size limit.
+/// The default record size limit of `LambdaLogExporter` and
+/// `CloudWatchLogsExporter`.
 pub const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 256_000;
