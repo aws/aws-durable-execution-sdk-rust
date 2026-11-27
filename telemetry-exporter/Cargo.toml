@@ -3,8 +3,8 @@
 # examples/. The root workspace's direct-dependency allowlist
 # (scripts/check-direct-deps.sh) covers every root member, and this crate's
 # `cloudwatch-logs` and `eventbridge` features depend on
-# aws-sdk-cloudwatchlogs and aws-sdk-eventbridge, which are not on that list. A separate workspace keeps the SDK's dependency graph
-# unchanged.
+# aws-sdk-cloudwatchlogs and aws-sdk-eventbridge, which are not on that
+# list. A separate workspace keeps the SDK's dependency graph unchanged.
 members = ["."]
 resolver = "2"
 
