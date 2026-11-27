@@ -43,8 +43,7 @@ pub enum OtlpProtocol {
 /// version as its version. The log record's body is the record's JSON, as a
 /// string. The resource carries the function's name, region, account and
 /// qualifier. The log record's attributes carry the execution ARN, name,
-/// status and duration.
-/// The severity is 17 (`ERROR`) for a failed execution, 9 (`INFO`) for a
+/// status and duration. The severity is 17 (`ERROR`) for a failed execution, 9 (`INFO`) for a
 /// running or succeeded one.
 ///
 /// The size limit measures the whole request body, not only the record,

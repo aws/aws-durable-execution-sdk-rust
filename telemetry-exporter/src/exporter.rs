@@ -39,8 +39,9 @@ pub trait TelemetryExporter: Send + Sync + 'static {
         Box::pin(std::future::ready(Ok(())))
     }
 
-    /// The largest rendered record, in bytes, the exporter accepts. `None`
-    /// disables truncation. The default is `None`.
+    /// The largest size, in bytes, of the [`measured_text`](Self::measured_text)
+    /// that the exporter accepts. `None` disables truncation. The default is
+    /// `None`.
     fn max_record_size_bytes(&self) -> Option<usize> {
         None
     }
