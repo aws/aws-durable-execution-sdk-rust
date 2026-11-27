@@ -141,10 +141,10 @@ impl AuroraExporter {
     }
 
     /// The named parameters of the upsert statement for `record`.
-    fn parameters(record: &TelemetryRecord) -> Result<Vec<SqlParameter>, BoxError> {
-        // The scheduler truncated the record to the size of the array
-        // rendering. So the same format is rendered here.
-        let record_json = render_json(record, OperationsFormat::Array)?;
+    fn parameters(&self, record: &TelemetryRecord) -> Result<Vec<SqlParameter>, BoxError> {
+        // The scheduler truncated the record to the size of the
+        // `operations_format` rendering. So the same format is rendered here.
+        let record_json = render_json(record, self.operations_format())?;
         Ok(vec![
             parameter("execution_arn", text(&record.execution_arn)),
             // An empty name is stored as NULL.
@@ -170,7 +170,7 @@ impl AuroraExporter {
 
     /// Upserts `record` with one `ExecuteStatement` request.
     async fn upsert(&self, record: &TelemetryRecord) -> Result<(), BoxError> {
-        let parameters = Self::parameters(record)?;
+        let parameters = self.parameters(record)?;
         let client = self.client().await;
         client
             .execute_statement()
@@ -390,10 +390,19 @@ mod tests {
         );
         assert_eq!(exporter.max_record_size_bytes(), Some(10));
         assert_eq!(exporter.operations_format(), OperationsFormat::Array);
-        assert_eq!(exporter.region.as_deref(), Some("us-west-2"));
         assert_eq!(
             exporter_for(AuroraEngine::MySql).max_record_size_bytes(),
             Some(1_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn builds_a_client_from_the_default_chain() {
+        let exporter = must_build(builder(AuroraEngine::MySql).region("eu-west-1"));
+        let client = exporter.client().await;
+        assert_eq!(
+            client.config().region().map(ToString::to_string).as_deref(),
+            Some("eu-west-1")
         );
     }
 
@@ -572,8 +581,9 @@ mod tests {
                     _ => None,
                 };
                 json.is_some_and(|v| {
-                    v.get("operations").is_some_and(Value::is_array)
-                        && v.get("operationsByName").is_none()
+                    v.get("operations")
+                        .and_then(Value::as_array)
+                        .is_some_and(|operations| operations.len() == 1)
                 })
             })
             .then_output(|| ExecuteStatementOutput::builder().build());
