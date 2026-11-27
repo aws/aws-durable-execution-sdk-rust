@@ -37,9 +37,7 @@ const DEFAULT_LOG_STREAM_PREFIX: &str = "durable-execution-telemetry/";
 /// If a write fails because the stream no longer exists, the exporter
 /// creates the stream again and resends the record once.
 ///
-/// `CloudWatch` Logs can accept a write and still reject its log event. It
-/// rejects an event whose timestamp is more than 2 hours in the future,
-/// older than 14 days, or older than the log group's retention period.
+/// A `PutLogEvents` response can report that the log event was rejected.
 /// The export of that record then fails with an error that names the
 /// rejection.
 #[derive(Debug)]
@@ -153,11 +151,9 @@ impl CloudWatchLogsExporter {
             sent => sent,
         };
         let output = sent.map_err(|error| call_error("PutLogEvents", &error))?;
-        // `PutLogEvents` can succeed and still not store the event. The
-        // service does not store an event whose timestamp is outside the
-        // range it accepts. It names such an event in
-        // `rejected_log_events_info` and returns no error. Without this
-        // check the record would be lost with no warning. So a rejected
+        // A successful `PutLogEvents` response can set
+        // `rejected_log_events_info`. The event was then not stored. Without
+        // this check the record would be lost with no warning. So a rejected
         // event is an export error, which the scheduler logs.
         if let Some(rejected) = output.rejected_log_events_info() {
             return Err(format!("PutLogEvents rejected the log event: {rejected:?}").into());
