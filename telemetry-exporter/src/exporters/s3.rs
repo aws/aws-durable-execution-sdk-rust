@@ -39,10 +39,13 @@ pub enum S3Partitioning {
 /// The key is `{prefix}{partition}{name}.json`. The name is the record's
 /// `execution_name`, or its `execution_arn` when it has no name. Every
 /// character of the name outside `a-z`, `A-Z`, `0-9`, `.`, `_` and `-` is
-/// replaced with `_`. An execution keeps its name and its start time across
-/// invocations. So every later record of the execution overwrites the same
-/// object, and the object always holds the latest record. The `operations`
-/// field of the object is an array.
+/// replaced with `_`. An execution keeps its name across invocations. So
+/// a later record of the execution overwrites the same object, as long as
+/// the record's `start_time` is on the same UTC day. The plugin takes
+/// `start_time` from the execution start that the SDK reports. When the SDK
+/// reports none, `start_time` can differ between invocations. Under
+/// [`S3Partitioning::Date`], the execution's records then go to more than one
+/// date partition. The `operations` field of the object is an array.
 ///
 /// The function's role needs `s3:PutObject` on the objects under the prefix.
 #[derive(Debug)]
@@ -295,6 +298,15 @@ mod tests {
             exporter.key(&record(Vec::new())),
             "durable-execution-telemetry/year=2026/month=01/day=01/exec.json"
         );
+    }
+
+    #[test]
+    fn records_of_one_execution_on_different_start_days_have_different_keys() {
+        let exporter = S3Exporter::builder("b").build();
+        let first = record(Vec::new());
+        let mut second = record(Vec::new());
+        second.start_time = "2026-01-02T00:00:00.000Z".to_owned();
+        assert_ne!(exporter.key(&first), exporter.key(&second));
     }
 
     #[test]
