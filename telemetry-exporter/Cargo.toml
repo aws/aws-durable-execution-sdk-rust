@@ -1,9 +1,10 @@
 [workspace]
 # The telemetry exporter is its OWN cargo workspace, like conformance/ and
 # examples/. The root workspace's direct-dependency allowlist
-# (scripts/check-direct-deps.sh) covers every root member. Exporters that
-# need an AWS service client depend on crates that are not on that list. A
-# separate workspace keeps the SDK's dependency graph unchanged.
+# (scripts/check-direct-deps.sh) covers every root member, and this crate's
+# `cloudwatch-logs` feature depends on aws-sdk-cloudwatchlogs, which is not
+# on that list. A separate workspace keeps the SDK's dependency graph
+# unchanged.
 members = ["."]
 resolver = "2"
 
@@ -45,8 +46,26 @@ unsafe_code = "forbid"
 [lints]
 workspace = true
 
+# An exporter that needs a service client is behind its own feature, and no
+# feature is on by default. So a build compiles a service client only for
+# an exporter that the build enables.
+[features]
+# Enables `CloudWatchLogsExporter`.
+cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs"]
+
 [dependencies]
 aws-durable-execution-sdk = { path = ".." }
+# The same trim as the SDK's own AWS crates: no legacy hyper-0.14 /
+# rustls-0.21 chain. See the root Cargo.toml.
+aws-config = { version = "1", optional = true, default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-cloudwatchlogs = { version = "1", optional = true, default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.44", features = ["rt", "sync"] }
@@ -54,6 +73,12 @@ tracing = "0.1"
 
 [dev-dependencies]
 aws-durable-execution-sdk = { path = "..", features = ["test-util"] }
+# The CloudWatch Logs exporter tests mock the service client at the HTTP
+# layer. `mock_client!` requires the service crate's `test-util` feature.
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = [
+    "test-util",
+] }
+aws-smithy-mocks = "0.3"
 # Installs a test's tracing subscriber so that it receives an event
 # whichever thread reached the event's callsite first.
 test-tracing = { path = "../test-support/test-tracing" }

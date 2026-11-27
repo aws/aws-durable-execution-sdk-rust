@@ -43,12 +43,24 @@ standard output. Lambda sends standard output to the function's log group.
 
 ## Exporters
 
-| Exporter | Destination | IAM permissions |
-| --- | --- | --- |
-| `LambdaLogExporter` (default) | Standard output, one JSON line per record | None |
+| Exporter | Cargo feature | Destination | IAM permissions |
+| --- | --- | --- | --- |
+| `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
+| `CloudWatchLogsExporter` | `cloudwatch-logs` | An existing log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
 
-The exporter writes the `operationsByName` form of the record. It
-truncates a record larger than 256,000 bytes. Truncation drops operation
+`CloudWatchLogsExporter` does not create the log group. Create the group
+before the function runs.
+
+No cargo feature is on by default. An exporter that needs a service client
+is behind its own feature, so a build compiles only the clients of the
+exporters it enables. To use `CloudWatchLogsExporter`, enable its feature:
+
+```toml
+aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs"] }
+```
+
+Both exporters write the `operationsByName` form of the record. Both
+truncate a record larger than 256,000 bytes. Truncation drops operation
 results first, then whole operations, then the input, then the output. A
 truncated record carries `truncated: true` and the counts of what it
 dropped.
@@ -112,8 +124,8 @@ let telemetry = DurableExecutionTelemetry::builder()
 
 ## Development
 
-The crate is its own cargo workspace. Exporters that need an AWS service
-client depend on crates that the SDK's dependency allowlist does not
-include, so the crate is not a member of the root workspace.
-`make workspaces WORKSPACES=telemetry-exporter` checks the formatting,
-builds, lints, runs the tests and builds the docs.
+The crate is its own cargo workspace. The SDK's dependency allowlist does
+not include `aws-sdk-cloudwatchlogs`, so the crate is not a member of the
+root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
+formatting, builds, lints, runs the tests and builds the docs. It lints,
+tests and builds the docs twice: with no feature and with every feature.
