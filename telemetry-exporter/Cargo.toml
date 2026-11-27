@@ -2,8 +2,8 @@
 # The telemetry exporter is its OWN cargo workspace, like conformance/ and
 # examples/. The root workspace's direct-dependency allowlist
 # (scripts/check-direct-deps.sh) covers every root member, and this crate's
-# `cloudwatch-logs` feature depends on aws-sdk-cloudwatchlogs, which is not
-# on that list. A separate workspace keeps the SDK's dependency graph
+# `cloudwatch-logs` and `http` features depend on aws-sdk-cloudwatchlogs and
+# the aws-smithy HTTP crates, which are not on that list. A separate workspace keeps the SDK's dependency graph
 # unchanged.
 members = ["."]
 resolver = "2"
@@ -52,6 +52,17 @@ workspace = true
 [features]
 # Enables `CloudWatchLogsExporter`.
 cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs"]
+# Enables `HttpExporter`.
+http = ["http-client"]
+# Compiles the private HTTP sender in `src/http.rs`. It is not part of the
+# public API. An exporter that sends HTTP requests lists this feature, and no
+# other change enables the sender.
+http-client = [
+    "dep:aws-smithy-http-client",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+    "tokio/time",
+]
 
 [dependencies]
 aws-durable-execution-sdk = { path = ".." }
@@ -66,6 +77,18 @@ aws-sdk-cloudwatchlogs = { version = "1", optional = true, default-features = fa
     "default-https-client",
     "rt-tokio",
 ] }
+# The HTTP sender uses the same TLS stack as the AWS crates above:
+# `rustls` with `aws-lc`, the stack that their `default-https-client`
+# feature selects.
+aws-smithy-http-client = { version = "1", optional = true, default-features = false, features = [
+    "rustls-aws-lc",
+    "rt-tokio",
+] }
+aws-smithy-runtime-api = { version = "1", optional = true, default-features = false, features = [
+    "client",
+    "http-1x",
+] }
+aws-smithy-types = { version = "1", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.44", features = ["rt", "sync"] }
@@ -82,4 +105,4 @@ aws-smithy-mocks = "0.3"
 # Installs a test's tracing subscriber so that it receives an event
 # whichever thread reached the event's callsite first.
 test-tracing = { path = "../test-support/test-tracing" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }

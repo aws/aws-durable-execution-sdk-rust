@@ -47,20 +47,40 @@ standard output. Lambda sends standard output to the function's log group.
 | --- | --- | --- | --- |
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
 | `CloudWatchLogsExporter` | `cloudwatch-logs` | A log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
+| `HttpExporter` | `http` | An HTTP or HTTPS endpoint, one `POST` or `PUT` per record | None |
 
 No cargo feature is on by default. An exporter that needs a service client
 is behind its own feature, so a build compiles only the clients of the
-exporters it enables. To use `CloudWatchLogsExporter`, enable its feature:
+exporters it enables. To use `CloudWatchLogsExporter` or `HttpExporter`,
+enable its feature:
 
 ```toml
-aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs"] }
+aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs", "http"] }
 ```
 
-Both exporters write the `operationsByName` form of the record. Both
-truncate a record larger than 256,000 bytes. Truncation drops operation
-results first, then whole operations, then the input, then the output. A
-truncated record carries `truncated: true` and the counts of what it
-dropped.
+`CloudWatchLogsExporter` writes the `operationsByName` form of the record
+and truncates a record larger than 256,000 bytes. `HttpExporter` writes the
+`operations` array by default and never truncates unless you set
+`max_record_size_bytes`.
+
+`HttpExporter` sends each record as a JSON body. It has these builder
+methods:
+
+| Builder method | Default | Effect |
+| --- | --- | --- |
+| `method` | `HttpMethod::Post` | `Post` or `Put`. |
+| `header` | `Content-Type: application/json` | Adds a header. A header with the same name, ignoring case, replaces an earlier one, including the default `Content-Type`. |
+| `timeout_ms` | `10000` | Fails a request that does not finish in this time. |
+| `operations_format` | `OperationsFormat::Array` | `Array` sends `operations`. `ByName` sends `operationsByName`. |
+| `max_record_size_bytes` | No limit | Truncates a larger record before sending. |
+
+The endpoint must answer with a status from 200 to 299. Any other status is
+an export error that names the status. The exporter follows no redirects and
+does not retry.
+
+When a size limit applies, truncation drops operation results first, then
+whole operations, then the input, then the output. A truncated record
+carries `truncated: true` and the counts of what it dropped.
 
 Each size check serializes the whole record. So truncation does not check
 the size after every drop. Each phase binary searches the number of
@@ -122,7 +142,7 @@ let telemetry = DurableExecutionTelemetry::builder()
 ## Development
 
 The crate is its own cargo workspace. The SDK's dependency allowlist does
-not include `aws-sdk-cloudwatchlogs`, so the crate is not a member of the
+not include `aws-sdk-cloudwatchlogs` or the `aws-smithy` HTTP crates, so the crate is not a member of the
 root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
 formatting, builds, lints, runs the tests and builds the docs. It lints,
 tests and builds the docs twice: with no feature and with every feature.
