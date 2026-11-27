@@ -48,17 +48,18 @@ standard output. Lambda sends standard output to the function's log group.
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
 | `CloudWatchLogsExporter` | `cloudwatch-logs` | An existing log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
 | `HttpExporter` | `http` | An HTTP or HTTPS endpoint, one `POST` or `PUT` per record | None |
+| `OtelExporter` | `otel` | An OTLP/HTTP logs endpoint, one `POST` per record | None |
 
 `CloudWatchLogsExporter` does not create the log group. Create the group
 before the function runs.
 
 No cargo feature is on by default. An exporter that needs a service client
 is behind its own feature, so a build compiles only the clients of the
-exporters it enables. To use `CloudWatchLogsExporter` or `HttpExporter`,
-enable its feature:
+exporters it enables. To use `CloudWatchLogsExporter`, `HttpExporter` or
+`OtelExporter`, enable its feature:
 
 ```toml
-aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs", "http"] }
+aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs", "http", "otel"] }
 ```
 
 `LambdaLogExporter` and `CloudWatchLogsExporter` write the
@@ -81,6 +82,23 @@ methods:
 The endpoint must answer with a status from 200 to 299. Any other status is
 an export error that names the status. The exporter follows no redirects and
 does not retry.
+
+`OtelExporter` sends each record as one OTLP log record in an
+`ExportLogsServiceRequest` JSON body. The log body is the record's JSON as
+a string. The exporter supports JSON only: `build` returns an error for
+`OtlpProtocol::HttpProtobuf`. It has these builder methods:
+
+| Builder method | Default | Effect |
+| --- | --- | --- |
+| `header` | `Content-Type: application/json` | Adds a header, for example an API key. A header with the same name, ignoring case, replaces an earlier one, including the default `Content-Type`. |
+| `protocol` | `OtlpProtocol::HttpJson` | `HttpProtobuf` makes `build` return an error. |
+| `timeout_ms` | `10000` | Fails a request that does not finish in this time. |
+| `operations_format` | `OperationsFormat::Array` | `Array`, `ByName` or `Both` in the log body. |
+| `max_record_size_bytes` | `1000000` | Truncates a record whose whole request body is larger. `0` disables truncation. |
+
+The size limit of `OtelExporter` measures the whole request body, which
+embeds the record as an escaped string. An exporter measures a different
+text than the record's JSON by overriding `TelemetryExporter::measured_text`.
 
 When a size limit applies, truncation drops operation results first, then
 whole operations, then the input, then the output. A truncated record

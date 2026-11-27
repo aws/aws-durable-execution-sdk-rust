@@ -1,6 +1,7 @@
 //! Serializes exports and keeps only the latest record of each invocation.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -11,7 +12,7 @@ use tokio::sync::oneshot;
 use crate::contain::{contained, describe_error, log_contained};
 use crate::exporter::{ExportFuture, TelemetryExporter};
 use crate::record::TelemetryRecord;
-use crate::truncation::truncate_record;
+use crate::truncation::{Measure, truncate_measured};
 
 /// Locks a standard mutex. A panic while the lock was held leaves plain
 /// data that is still consistent, so a poisoned lock is used as is.
@@ -436,14 +437,39 @@ impl Scheduler {
         let records: Vec<Result<Cow<'_, TelemetryRecord>, String>> = self
             .exporters
             .iter()
-            .map(|exporter| {
-                contained(|| {
-                    (
-                        exporter.max_record_size_bytes(),
-                        exporter.operations_format(),
-                    )
-                })
-                .map(|(max_bytes, format)| truncate_record(record, max_bytes, format))
+            .enumerate()
+            .map(|(index, exporter)| {
+                let max_bytes = contained(|| exporter.max_record_size_bytes())?;
+                let panicked = Cell::new(false);
+                let text = |record: &TelemetryRecord| {
+                    // A panic in the measure marks the exporter as failed.
+                    // An error means the record cannot be measured.
+                    match contained(|| exporter.measured_text(record)) {
+                        Ok(Ok(text)) => Some(text.len()),
+                        Ok(Err(error)) => {
+                            let error = describe_error(error);
+                            log_contained(|| {
+                                tracing::warn!(
+                                    target: crate::TARGET,
+                                    exporter = index,
+                                    %error,
+                                    "telemetry record could not be measured"
+                                );
+                            });
+                            None
+                        }
+                        Err(_) => {
+                            panicked.set(true);
+                            None
+                        }
+                    }
+                };
+                let truncated = truncate_measured(record, max_bytes, Measure::Text(&text));
+                if panicked.get() {
+                    Err("panicked".to_owned())
+                } else {
+                    Ok(truncated)
+                }
             })
             .collect();
         let futures = self
@@ -488,7 +514,7 @@ mod tests {
         PanicsOnDisplay, PanicsOnDisplayAndDrop, PanicsOnDrop, PanicsOnEvent,
     };
     use crate::render::OperationsFormat;
-    use crate::render::tests::record;
+    use crate::render::tests::{op, record};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -871,6 +897,110 @@ mod tests {
         scheduler.drain(&slot).await;
         assert_eq!(*lock(&small.0), [true]);
         assert_eq!(*lock(&large.0), [false]);
+    }
+
+    type MeasureFn = fn(&TelemetryRecord) -> Result<String, aws_durable_execution_sdk::BoxError>;
+
+    /// An exporter whose size limit is 100 bytes and whose measured text
+    /// comes from `measure`. It records each exported record's
+    /// `truncated` flag and its operation count.
+    struct Measured {
+        exported: Mutex<Vec<(bool, usize)>>,
+        measure: MeasureFn,
+    }
+
+    impl Measured {
+        fn new(measure: MeasureFn) -> Arc<Self> {
+            Arc::new(Self {
+                exported: Mutex::default(),
+                measure,
+            })
+        }
+    }
+
+    impl TelemetryExporter for Measured {
+        fn export<'a>(&'a self, record: &'a TelemetryRecord) -> ExportFuture<'a> {
+            lock(&self.exported).push((record.truncated, record.operations.len()));
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn max_record_size_bytes(&self) -> Option<usize> {
+            Some(100)
+        }
+
+        fn measured_text(
+            &self,
+            record: &TelemetryRecord,
+        ) -> Result<String, aws_durable_execution_sdk::BoxError> {
+            (self.measure)(record)
+        }
+    }
+
+    async fn export_one(exporter: Arc<dyn TelemetryExporter>, record: TelemetryRecord) {
+        let scheduler = scheduler_of(exporter);
+        let slot = Arc::new(Slot::default());
+        scheduler.schedule(&slot, record);
+        scheduler.drain(&slot).await;
+    }
+
+    #[tokio::test]
+    async fn the_limit_is_measured_on_the_text_the_exporter_returns() {
+        // The record's own JSON is far over 100 bytes. The measured text
+        // is one byte per operation. So the record fits, and the same
+        // record with 101 operations does not.
+        let exporter = Measured::new(|record| Ok("x".repeat(record.operations.len())));
+        let ops = |count: usize| {
+            (0..count)
+                .map(|n| op(&format!("op{n}"), "SUCCEEDED"))
+                .collect()
+        };
+        export_one(exporter.clone(), record(ops(100))).await;
+        export_one(exporter.clone(), record(ops(101))).await;
+        // The second record drops its oldest operation to reach 100 bytes.
+        assert_eq!(*lock(&exporter.exported), [(false, 100), (true, 100)]);
+    }
+
+    #[tokio::test]
+    async fn a_default_exporter_is_measured_on_its_operations_format_json() {
+        struct Default100;
+        impl TelemetryExporter for Default100 {
+            fn export<'a>(&'a self, record: &'a TelemetryRecord) -> ExportFuture<'a> {
+                assert!(record.truncated);
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn max_record_size_bytes(&self) -> Option<usize> {
+                Some(100)
+            }
+        }
+        let expected = crate::render::render_json(&record(Vec::new()), OperationsFormat::Array)
+            .map(|json| json.len());
+        assert!(expected.is_ok_and(|size| size > 100));
+        export_one(Arc::new(Default100), record(Vec::new())).await;
+    }
+
+    #[tokio::test]
+    async fn a_record_that_cannot_be_measured_is_exported_unchanged() {
+        let exporter = Measured::new(|_| Err("no text".into()));
+        let ops = (0..5).map(|n| op(&format!("op{n}"), "SUCCEEDED")).collect();
+        export_one(exporter.clone(), record(ops)).await;
+        assert_eq!(*lock(&exporter.exported), [(false, 5)]);
+    }
+
+    #[tokio::test]
+    async fn a_measure_that_panics_skips_only_that_exporter() {
+        #[expect(
+            clippy::panic,
+            reason = "the test checks that a panicking measure is contained"
+        )]
+        fn panics(_: &TelemetryRecord) -> Result<String, aws_durable_execution_sdk::BoxError> {
+            panic!("measure panicked")
+        }
+        let panics = Measured::new(panics);
+        let recorder = Arc::new(Recorder::default());
+        let scheduler = Arc::new(Scheduler::new(vec![panics.clone(), recorder.clone()]));
+        export_two_slots(&scheduler).await;
+        assert_eq!(*lock(&panics.exported), []);
+        assert_eq!(*lock(&recorder.exported), ["a", "b"]);
     }
 
     #[tokio::test]
