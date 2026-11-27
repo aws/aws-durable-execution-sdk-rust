@@ -48,17 +48,18 @@ standard output. Lambda sends standard output to the function's log group.
 | `LambdaLogExporter` (default) | None | Standard output, one JSON line per record | None |
 | `CloudWatchLogsExporter` | `cloudwatch-logs` | An existing log group you choose, one stream per UTC day | `logs:CreateLogStream`, `logs:PutLogEvents` |
 | `HttpExporter` | `http` | An HTTP or HTTPS endpoint, one `POST` or `PUT` per record | None |
+| `OpenSearchExporter` | `opensearch` | An Amazon OpenSearch Service index, one document per execution | `es:ESHttpPut` on the index (with the default `SigV4` authentication) |
 
 `CloudWatchLogsExporter` does not create the log group. Create the group
 before the function runs.
 
 No cargo feature is on by default. An exporter that needs a service client
 is behind its own feature, so a build compiles only the clients of the
-exporters it enables. To use `CloudWatchLogsExporter` or `HttpExporter`,
-enable its feature:
+exporters it enables. To use `CloudWatchLogsExporter`, `HttpExporter` or
+`OpenSearchExporter`, enable its feature:
 
 ```toml
-aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs", "http"] }
+aws-durable-execution-sdk-telemetry-exporter = { path = "...", features = ["cloudwatch-logs", "http", "opensearch"] }
 ```
 
 `LambdaLogExporter` and `CloudWatchLogsExporter` write the
@@ -81,6 +82,24 @@ methods:
 The endpoint must answer with a status from 200 to 299. Any other status is
 an export error that names the status. The exporter follows no redirects and
 does not retry.
+
+`OpenSearchExporter` sends `PUT {endpoint}/{index}/_doc/{execution ARN}`
+with the `operations` array form of the record as the body. The ARN is
+percent-encoded. A later record of the same execution replaces the document.
+It truncates a record larger than 10,000,000 bytes. It has these builder
+methods:
+
+| Builder method | Default | Effect |
+| --- | --- | --- |
+| `index_name` | `durable-execution-telemetry` | The index to write to. |
+| `region` | The default region chain | The region of the `SigV4` signature. |
+| `basic_auth` | `SigV4` with the default credential chain and service name `es` | Sends HTTP basic authentication instead. |
+| `timeout_ms` | `10000` | Fails a request that does not finish in this time. |
+| `max_record_size_bytes` | `10000000` | Truncates a larger record before sending. |
+
+The exporter does not create the index. Any status outside 200 to 299 is an
+export error that names the status and includes the first 500 characters of
+the response body.
 
 When a size limit applies, truncation drops operation results first, then
 whole operations, then the input, then the output. A truncated record
@@ -146,7 +165,8 @@ let telemetry = DurableExecutionTelemetry::builder()
 ## Development
 
 The crate is its own cargo workspace. The SDK's dependency allowlist does
-not include `aws-sdk-cloudwatchlogs` or the `aws-smithy` HTTP crates, so
-the crate is not a member of the root workspace. `make workspaces WORKSPACES=telemetry-exporter` checks the
-formatting, builds, lints, runs the tests and builds the docs. It lints,
-tests and builds the docs twice: with no feature and with every feature.
+not include `aws-sdk-cloudwatchlogs`, `aws-sigv4` or the `aws-smithy` HTTP
+crates, so the crate is not a member of the root workspace.
+`make workspaces WORKSPACES=telemetry-exporter` checks the formatting,
+builds, lints, runs the tests and builds the docs. It lints, tests and
+builds the docs twice: with no feature and with every feature.

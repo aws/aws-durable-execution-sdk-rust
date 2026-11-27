@@ -121,8 +121,10 @@ name = "aws-durable-execution-sdk-telemetry-exporter"
 version = "0.1.0"
 dependencies = [
  "aws-config",
+ "aws-credential-types",
  "aws-durable-execution-sdk",
  "aws-sdk-cloudwatchlogs",
+ "aws-sigv4",
  "aws-smithy-http-client",
  "aws-smithy-mocks",
  "aws-smithy-runtime-api",

@@ -2,9 +2,10 @@
 # The telemetry exporter is its OWN cargo workspace, like conformance/ and
 # examples/. The root workspace's direct-dependency allowlist
 # (scripts/check-direct-deps.sh) covers every root member, and this crate's
-# `cloudwatch-logs` and `http` features depend on aws-sdk-cloudwatchlogs and
-# the aws-smithy HTTP crates, which are not on that list. A separate
-# workspace keeps the SDK's dependency graph unchanged.
+# `cloudwatch-logs`, `http` and `opensearch` features depend on
+# aws-sdk-cloudwatchlogs, the aws-smithy HTTP crates and aws-sigv4, which
+# are not on that list. A separate workspace keeps the SDK's dependency
+# graph unchanged.
 members = ["."]
 resolver = "2"
 
@@ -54,6 +55,13 @@ workspace = true
 cloudwatch-logs = ["dep:aws-config", "dep:aws-sdk-cloudwatchlogs"]
 # Enables `HttpExporter`.
 http = ["http-client"]
+# Enables `OpenSearchExporter`.
+opensearch = [
+    "http-client",
+    "dep:aws-config",
+    "dep:aws-credential-types",
+    "dep:aws-sigv4",
+]
 # Compiles the private HTTP sender in `src/http.rs`. It is not part of the
 # public API. An exporter that sends HTTP requests lists this feature, and no
 # other change enables the sender.
@@ -71,6 +79,11 @@ aws-durable-execution-sdk = { path = ".." }
 aws-config = { version = "1", optional = true, default-features = false, features = [
     "default-https-client",
     "rt-tokio",
+] }
+aws-credential-types = { version = "1", optional = true }
+# `sign-http` is the only feature of the signer that the exporter uses.
+aws-sigv4 = { version = "1", optional = true, default-features = false, features = [
+    "sign-http",
 ] }
 aws-sdk-cloudwatchlogs = { version = "1", optional = true, default-features = false, features = [
     "behavior-version-latest",

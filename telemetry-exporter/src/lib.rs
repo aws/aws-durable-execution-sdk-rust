@@ -45,6 +45,7 @@
 //! | --- | --- |
 //! | `cloudwatch-logs` | `CloudWatchLogsExporter`, which writes to a log group of your choice |
 //! | `http` | `HttpExporter`, which sends each record to an HTTP endpoint |
+//! | `opensearch` | `OpenSearchExporter`, which indexes each record in Amazon `OpenSearch` Service |
 
 // Compiles the README's Rust examples as doctests, so a README example that
 // stops compiling fails `cargo test`.
@@ -75,6 +76,8 @@ pub use exporters::{CloudWatchLogsExporter, CloudWatchLogsExporterBuilder};
 pub use exporters::{DEFAULT_MAX_RECORD_SIZE_BYTES, LambdaLogExporter};
 #[cfg(feature = "http")]
 pub use exporters::{HttpExporter, HttpExporterBuilder, HttpMethod};
+#[cfg(feature = "opensearch")]
+pub use exporters::{OpenSearchExporter, OpenSearchExporterBuilder};
 pub use plugin::{DurableExecutionTelemetry, DurableExecutionTelemetryBuilder};
 pub use record::{
     ErrorRecord, ExecutionStatus, OperationRecord, RECORD_TYPE, SCHEMA_VERSION, TelemetryRecord,
