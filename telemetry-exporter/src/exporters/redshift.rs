@@ -9,8 +9,9 @@ use crate::exporter::{ExportFuture, TelemetryExporter};
 use crate::record::{ExecutionStatus, TelemetryRecord};
 use crate::render::{OperationsFormat, render_json};
 
-/// The default record size limit, in bytes.
-const DEFAULT_MAX_RECORD_SIZE_BYTES: usize = 1_000_000;
+/// The default record size limit, in bytes. It differs from the crate-wide
+/// `DEFAULT_MAX_RECORD_SIZE_BYTES`, which is the `CloudWatch` Logs limit.
+const DEFAULT_REDSHIFT_MAX_RECORD_SIZE_BYTES: usize = 1_000_000;
 
 /// The default table name.
 const DEFAULT_TABLE: &str = "durable_execution_telemetry";
@@ -101,7 +102,7 @@ impl RedshiftExporter {
             table: DEFAULT_TABLE.to_owned(),
             schema: DEFAULT_SCHEMA.to_owned(),
             region: None,
-            max_record_size_bytes: DEFAULT_MAX_RECORD_SIZE_BYTES,
+            max_record_size_bytes: DEFAULT_REDSHIFT_MAX_RECORD_SIZE_BYTES,
             client: None,
         }
     }
