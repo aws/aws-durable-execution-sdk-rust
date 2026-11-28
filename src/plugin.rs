@@ -310,8 +310,11 @@ pub trait Plugin: Send + Sync {
     /// service accepted the `SUCCEED`, so they can come after the code
     /// that follows the step. They run inside the wraps and the `tracing`
     /// span current when the step wrote `SUCCEED`, as an awaited step's
-    /// end hooks do. They run before the end hook of the operation that
-    /// encloses the step, and before `on_invocation_end`. A `SUCCEED` the
+    /// end hooks do. They run before `on_invocation_end`, and before the
+    /// end hook of an enclosing operation that writes a checkpoint record.
+    /// A virtual child context writes no record and fires its end hook when
+    /// its body returns, so the step's end hooks can come after it. A
+    /// `SUCCEED` the
     /// service rejects, or one the invocation never sends, fires neither
     /// hook.
     ///
