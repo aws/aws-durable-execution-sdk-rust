@@ -85,13 +85,14 @@ where
     /// Creates a new step builder (internal). Taking the closure here keeps
     /// the field non-optional: a builder without a body is unrepresentable.
     pub(crate) fn new_internal(ctx: DurableContext, op_id: OperationId, closure: F) -> Self {
+        let semantics = ctx.default_step_semantics();
         Self {
             ctx,
             op_id,
             name: None,
             retry_strategy: None,
             serdes: JsonSerdes,
-            semantics: crate::step::StepSemantics::default(),
+            semantics,
             sub_type: None,
             closure,
             _marker: PhantomData,
@@ -218,14 +219,21 @@ where
     /// Controls how the SDK handles a replay where the previous attempt was
     /// interrupted (checkpoint status `Started` with no recorded outcome).
     ///
-    /// - [`StepSemantics::AtLeastOncePerRetry`](crate::StepSemantics::AtLeastOncePerRetry) (default): re-execute the
+    /// - [`StepSemantics::AtLeastOnce`](crate::StepSemantics::AtLeastOnce) (default): re-execute the
     ///   step body on replay. The body starts without waiting for the
     ///   `START` checkpoint. The outcome is written only after `START` is
     ///   acknowledged; if `START` fails, the outcome is not written and the
     ///   invocation fails.
-    /// - [`StepSemantics::AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry): treat the interruption as a
+    /// - [`StepSemantics::AtMostOnce`](crate::StepSemantics::AtMostOnce): treat the interruption as a
     ///   failure and consult the retry strategy without re-executing. The
     ///   body starts only after `START` is acknowledged.
+    /// - [`StepSemantics::AtLeastOnceAsync`](crate::StepSemantics::AtLeastOnceAsync) (experimental): as
+    ///   `AtLeastOnce`, but the step returns without waiting for the `START`
+    ///   or `SUCCEED` checkpoint.
+    ///
+    /// Without this call the step uses the execution's
+    /// [`default_step_semantics`](crate::OptionsBuilder::default_step_semantics),
+    /// which is `AtLeastOnce` unless set.
     ///
     /// This is a client-side configuration only: it does not affect the
     /// wire protocol.
@@ -242,7 +250,7 @@ where
     /// ) -> Result<String, durable::BoxError> {
     ///     let result = ctx.step(|_| async { Ok("done".to_owned()) })
     ///         .name("charge-card")
-    ///         .semantics(StepSemantics::AtMostOncePerRetry)
+    ///         .semantics(StepSemantics::AtMostOnce)
     ///         .await?;
     ///     Ok(result)
     /// }

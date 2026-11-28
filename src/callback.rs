@@ -1071,7 +1071,7 @@ where
         name: None,
         retry_strategy: submitter_retry,
         serdes: crate::serdes::JsonSerdes,
-        semantics: crate::step::StepSemantics::default(),
+        semantics: child_ctx.default_step_semantics(),
         sub_type: crate::OperationSubType::STEP,
         plugin_name: plugin_names.submitter,
         closure: move |step_ctx: StepContext| async move {

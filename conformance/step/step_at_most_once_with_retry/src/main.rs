@@ -1,4 +1,4 @@
-//! Conformance requirement 1-18: step with `AtMostOncePerRetry` (with retry, succeeds on second).
+//! Conformance requirement 1-18: step with `AtMostOnce` (with retry, succeeds on second).
 
 use aws_durable_execution_sdk as durable;
 use durable::StepSemantics;
@@ -37,7 +37,7 @@ async fn handler(
             }
             Ok("succeeded on second attempt".to_owned())
         })
-        .semantics(StepSemantics::AtMostOncePerRetry)
+        .semantics(StepSemantics::AtMostOnce)
         .retry_strategy(retry)
         .await?;
 

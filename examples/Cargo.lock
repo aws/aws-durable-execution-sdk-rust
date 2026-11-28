@@ -2029,6 +2029,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "step_default_semantics"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "step_named"
 version = "0.0.0"
 dependencies = [

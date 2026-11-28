@@ -250,6 +250,30 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** Rust language and Decision (2026-10-26): call a fresh clone of the closure for each attempt.
 - **Where:** `src/step.rs`, `StepExecution::run`.
 
+### Deprecated step semantics names
+
+- **JavaScript:** `AtLeastOncePerRetry` and `AtMostOncePerRetry` are deprecated aliases with the same enum values as `AtLeastOnce` and `AtMostOnce`.
+- **Rust:** They are deprecated variants. `==` treats each as equal to its new name, and the SDK compares semantics with `==`. A `match` arm and the `Debug` output still tell them apart. `StepSemantics::default()` is now `AtLeastOnce`, so a `match` arm written for `AtLeastOncePerRetry` does not match it.
+- **Why:** A Rust enum cannot give one variant two names.
+- **Decision:** Rust language.
+- **Where:** `src/step.rs`, `StepSemantics` and its `PartialEq`.
+
+### `AtLeastOnceAsync` end hooks
+
+- **JavaScript:** An `AtLeastOnceAsync` step fires `onOperationAttemptEnd` and `onOperationEnd` right after it queues `SUCCEED`, before the service answers. If that write fails and the next invocation runs the step again, a plugin sees a second successful end for the same step.
+- **Rust:** The step returns before the service answers its `SUCCEED`, as in JavaScript. `on_attempt_end` and `on_operation_end` fire only when the service accepted the `SUCCEED`, inside the wraps and the `tracing` span the step wrote it in, before `on_invocation_end`, and before the end hook of an enclosing operation that writes a checkpoint record. A virtual child context writes no record and fires its end hook when its body returns, so the step's end hooks can come after it. A failed `SUCCEED` fires neither hook. Java fires them at the same point.
+- **Why:** `Plugin::on_operation_end` says it runs after the checkpoint that records the outcome. Firing at the answer keeps that true for every step semantics, so a plugin never sees a success that was not saved.
+- **Decision:** Decision (2026-11-27): fire the end hooks when the service accepts the `SUCCEED`, as Java does.
+- **Where:** `src/step.rs`, `handle_success`; `src/checkpoint_coalescer.rs`, `PersistedHook`; `src/plugin.rs`, `InvocationPlugins::push_persisted` and `InvocationPlugins::after_write`.
+
+### Async steps in an abandoned batch item
+
+- **JavaScript:** An abandoned `map` item or `parallel` branch keeps running new `AtLeastOnceAsync` steps after the batch completes, with no record in the history.
+- **Rust:** The SDK aborts the abandoned item's task and rejects its writes, so an async step does not keep the item running. An async step whose `SUCCEED` is rejected waits on it as an awaited step does, so it never returns and fires no end hook.
+- **Why:** Rust stops an abandoned item whatever the step semantics (see "Items running at early completion").
+- **Decision:** Same capability in Rust form.
+- **Where:** `src/map_parallel.rs`, `produce_batch`; `src/checkpoint_coalescer.rs`, `Admission`; `src/step.rs`, `handle_success`.
+
 ### `pause_every` and the backoff
 
 - **JavaScript:** `pauseEvery` is an option of the exponential retry helper only.

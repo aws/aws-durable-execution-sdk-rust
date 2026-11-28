@@ -64,6 +64,19 @@ Resources:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
 
+  StepDefaultSemantics:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_default_semantics/
+      Handler: bootstrap
+      Description: 'Example: async default step semantics with an at-least-once key step'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
   WaitBasic:
     Type: AWS::Serverless::Function
     Metadata:

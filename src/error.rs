@@ -946,7 +946,7 @@ impl fmt::Display for OperationErrorKind {
     }
 }
 
-/// The wire `ErrorMessage` recorded for an interrupted `AtMostOncePerRetry`
+/// The wire `ErrorMessage` recorded for an interrupted `AtMostOnce`
 /// attempt, and the `source()` text of [`StepError::interrupted`]. It is the
 /// message the JS SDK records.
 pub(crate) const STEP_INTERRUPTED_MESSAGE: &str = "The step execution process was initiated but failed to reach completion due to an interruption.";
@@ -1021,7 +1021,7 @@ impl StepError {
     }
 
     /// Creates the error a retry strategy receives for an interrupted
-    /// `AtMostOncePerRetry` attempt.
+    /// `AtMostOnce` attempt.
     ///
     /// Its kind is [`StepErrorKind::Interrupted`], and its
     /// [`source()`](std::error::Error::source) displays the message the SDK
@@ -1089,7 +1089,7 @@ pub enum StepErrorKind {
     /// A serialization or deserialization error occurred.
     #[non_exhaustive]
     SerializationFailed,
-    /// An `AtMostOncePerRetry` attempt started but recorded no outcome.
+    /// An `AtMostOnce` attempt started but recorded no outcome.
     ///
     /// The SDK did not run the body again. It recorded the attempt as a
     /// failure with error type `StepInterruptedError` and asked the retry

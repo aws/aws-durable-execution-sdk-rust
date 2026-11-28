@@ -121,7 +121,7 @@ async fn at_most_once_start_in_withdrawn_request_not_rerun() {
                             }
                         })
                         .name("once")
-                        .semantics(StepSemantics::AtMostOncePerRetry)
+                        .semantics(StepSemantics::AtMostOnce)
                         .await?;
                     Ok::<u32, BoxError>(value)
                 }

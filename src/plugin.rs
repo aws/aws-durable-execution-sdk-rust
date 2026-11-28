@@ -303,6 +303,21 @@ pub trait Plugin: Send + Sync {
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
     ///
+    /// A step under
+    /// [`StepSemantics::AtLeastOnceAsync`](crate::StepSemantics::AtLeastOnceAsync)
+    /// returns before the service answers its `SUCCEED`. Its
+    /// `on_attempt_end` and `on_operation_end` still fire only once the
+    /// service accepted the `SUCCEED`, so they can come after the code
+    /// that follows the step. They run inside the wraps and the `tracing`
+    /// span current when the step wrote `SUCCEED`, as an awaited step's
+    /// end hooks do. They run before `on_invocation_end`, and before the
+    /// end hook of an enclosing operation that writes a checkpoint record.
+    /// A virtual child context writes no record and fires its end hook when
+    /// its body returns, so the step's end hooks can come after it. A
+    /// `SUCCEED` the
+    /// service rejects, or one the invocation never sends, fires neither
+    /// hook.
+    ///
     /// For a wait, a chained invoke and a callback:
     ///
     /// - a new operation fires `on_operation_start` with `is_replay`
@@ -364,7 +379,7 @@ pub trait Plugin: Send + Sync {
     ///   run without waiting for its response. So the hook of an input that
     ///   fires when its `START` is queued comes before the combinator's,
     ///   and the hook of an input that waits for its `START` response, a
-    ///   wait or a step under `AtMostOncePerRetry`, comes after it;
+    ///   wait or a step under `AtMostOnce`, comes after it;
     /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
     ///   fires `on_operation_start` with `is_replay` `true`, before the
     ///   body or the first item runs. A combinator fires it after its
@@ -429,7 +444,7 @@ pub trait Plugin: Send + Sync {
     /// start step runs on the caller's task before the call returns (see
     /// [`StepBuilder::spawn`](crate::builders::StepBuilder::spawn)). So when the operation's
     /// JS order is "queue `START`, then hook" (a step under
-    /// `AtLeastOncePerRetry` and every child-backed operation above), or
+    /// `AtLeastOnce` and every child-backed operation above), or
     /// when its record resumes work and fires the replay start hook, this
     /// hook runs on the caller's task before `.spawn()` returns. An
     /// operation that fires it after the `START` response fires it on the
@@ -526,7 +541,7 @@ pub trait Plugin: Send + Sync {
     ///   run without waiting for its response. So the hook of an input that
     ///   fires when its `START` is queued comes before the combinator's,
     ///   and the hook of an input that waits for its `START` response, a
-    ///   wait or a step under `AtMostOncePerRetry`, comes after it;
+    ///   wait or a step under `AtMostOnce`, comes after it;
     /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
     ///   fires `on_operation_start` with `is_replay` `true`, before the
     ///   body or the first item runs. A combinator fires it after its
@@ -694,7 +709,7 @@ pub trait Plugin: Send + Sync {
     ///
     /// Against [`on_operation_start`](Self::on_operation_start): a wait,
     /// `create_callback`, an invoke and a step under
-    /// `StepSemantics::AtMostOncePerRetry` call `on_operation_start` after
+    /// `StepSemantics::AtMostOnce` call `on_operation_start` after
     /// their `START` response, so the change that lists them `STARTED`
     /// comes first. A default step, `wait_for_condition` and every
     /// child-backed operation that writes a record, including a map, a
@@ -916,7 +931,7 @@ pub trait Plugin: Send + Sync {
     /// - a child context run again to rebuild a result that its record did
     ///   not store (`ReplayChildren`);
     /// - a step attempt interrupted under
-    ///   [`StepSemantics::AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry),
+    ///   [`StepSemantics::AtMostOnce`](crate::StepSemantics::AtMostOnce),
     ///   which the SDK records as failed;
     /// - a step waiting for its retry delay;
     /// - the `attempt-N` child contexts of a `with_retry` block, in either
@@ -2454,11 +2469,17 @@ pub(crate) struct InvocationPlugins {
     /// The panics of undelivered plugin values' destructors, which fail
     /// the invocation.
     undelivered: Arc<Mutex<Undelivered>>,
-    /// The work the operation hooks returned.
+    /// The work the operation hooks returned, and the tasks that wait for
+    /// an unawaited checkpoint write (see [`Self::after_write`]).
     work: Mutex<WorkState>,
+    /// Set when the invocation's checkpoint writes are over, before the
+    /// drain: a write that has not returned by then never returns `Ok`
+    /// (see [`Self::after_write`]).
+    writes_over: tokio::sync::watch::Sender<bool>,
     /// The change sets of the checkpoint responses not yet delivered to
-    /// `on_operation_change`, in response order.
-    change_queue: Mutex<std::collections::VecDeque<Vec<OperationInfo>>>,
+    /// `on_operation_change`, and the persisted hooks of their requests,
+    /// in response order.
+    change_queue: Mutex<std::collections::VecDeque<ChangeEntry>>,
     /// Whether a task is delivering the change sets of `change_queue`.
     draining: std::sync::atomic::AtomicBool,
     /// The number of change sets ever pushed to `change_queue`. It grows
@@ -2484,6 +2505,15 @@ type AfterRelease = Box<dyn FnMut(&InvocationPlugins) + Send>;
 /// The test hook of [`InvocationPlugins::set_before_push`].
 #[cfg(test)]
 type BeforePush = Box<dyn FnMut(&InvocationPlugins) + Send>;
+
+/// One entry of the change queue of [`InvocationPlugins`].
+enum ChangeEntry {
+    /// The change set of one checkpoint response, for
+    /// `on_operation_change`.
+    Changes(Vec<OperationInfo>),
+    /// The persisted hook of an update the response answered.
+    Persisted(crate::checkpoint_coalescer::PersistedHook),
+}
 
 /// The delivery progress of the change sets of one invocation.
 #[derive(Default)]
@@ -2591,7 +2621,22 @@ impl InvocationPlugins {
             .change_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.push_back(updated);
+        queue.push_back(ChangeEntry::Changes(updated));
+        self.changes_pushed
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Queues `hook`, the persisted hook of an update the service accepted,
+    /// after the change set of the response that answered it. The task
+    /// that delivers the change sets runs it in queue order, so before
+    /// every write answered by the same response or a later one returns
+    /// (see [`Self::poll_changes_delivered`]).
+    pub(crate) fn push_persisted(&self, hook: crate::checkpoint_coalescer::PersistedHook) {
+        let mut queue = self
+            .change_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.push_back(ChangeEntry::Persisted(hook));
         self.changes_pushed
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -2619,6 +2664,14 @@ impl InvocationPlugins {
             }
             let here = DrainingHere::enter(self);
             while let Some(entry) = self.pop_operation_change() {
+                let entry = match entry {
+                    ChangeEntry::Changes(entry) => entry,
+                    ChangeEntry::Persisted(hook) => {
+                        (hook.0)();
+                        self.finish_delivery();
+                        continue;
+                    }
+                };
                 let operations = {
                     let execution = self
                         .execution
@@ -2816,7 +2869,7 @@ impl InvocationPlugins {
     }
 
     /// Takes the oldest queued change set.
-    fn pop_operation_change(&self) -> Option<Vec<OperationInfo>> {
+    fn pop_operation_change(&self) -> Option<ChangeEntry> {
         self.change_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2940,6 +2993,9 @@ impl InvocationPlugins {
     ) -> Option<Payload> {
         let now = tokio::time::Instant::now();
         let by = |reserve: Duration| remaining.map(|left| now + left.saturating_sub(reserve));
+        // The end-of-invocation flush has run, so every write the SDK did
+        // not await has returned or never returns (see `after_write`).
+        self.writes_over.send_replace(true);
         self.drain(by(PLUGIN_DRAIN_RESERVE)).await;
         let drained = self.take_late_panic(late);
         let end = match &drained {
@@ -3212,6 +3268,41 @@ impl InvocationPlugins {
                     "plugin hook work could not be spawned; it is dropped"
                 );
             });
+        }
+    }
+
+    /// Polls `write` to completion on its own task. `write` is a
+    /// checkpoint write the operation does not await.
+    ///
+    /// An `AtLeastOnceAsync` step uses it for its `SUCCEED`, after the step
+    /// returned. The update carries the step's end hooks as a
+    /// [`PersistedHook`](crate::checkpoint_coalescer::PersistedHook), which
+    /// the response queues with its change set. A write delivers the
+    /// queued change sets before it returns, so this task runs the hooks
+    /// when no other task delivers them first. The task is hook work: it
+    /// holds neither the task cleanup nor the suspension decision, and the
+    /// invocation-end drain joins it, so the hooks and the work they
+    /// return finish before `on_invocation_end`. A write that has not
+    /// returned when the drain starts never returns, because the
+    /// end-of-invocation flush has run: a write the write-failure latch
+    /// dropped, or one a fault outcome never sent. The task then ends.
+    /// After the drain closed, nothing is spawned.
+    pub(crate) fn after_write(&self, write: impl Future<Output = ()> + Send + 'static) {
+        let mut over = self.writes_over.subscribe();
+        let task = async move {
+            tokio::select! {
+                biased;
+                () = write => {}
+                _ = over.wait_for(|over| *over) => {}
+            }
+        };
+        let mut state = self.lock_work();
+        let WorkState::Open(list) = &mut *state else {
+            return;
+        };
+        list.retain(|handle| !handle.is_finished());
+        if let Ok(handle) = crate::task::spawn_plugin_work(task) {
+            list.push(handle);
         }
     }
 
@@ -3608,6 +3699,7 @@ pub(crate) fn create_plugins(
         execution: Mutex::new(execution),
         undelivered: Arc::new(Mutex::new(Undelivered::Kept(error_drop_panics))),
         work: Mutex::new(WorkState::Open(Vec::new())),
+        writes_over: tokio::sync::watch::Sender::new(false),
         change_queue: Mutex::new(std::collections::VecDeque::new()),
         draining: std::sync::atomic::AtomicBool::new(false),
         changes_pushed: std::sync::atomic::AtomicU64::new(0),

@@ -385,7 +385,7 @@ pub enum RetryDecision {
         /// - Only a step whose body failed in the current invocation
         ///   pauses. This includes the submitter step of
         ///   `wait_for_callback`. An interrupted
-        ///   [`AtMostOncePerRetry`](StepSemantics::AtMostOncePerRetry)
+        ///   [`AtMostOnce`](StepSemantics::AtMostOnce)
         ///   attempt retries without a pause. A `with_retry` block ignores
         ///   this field.
         /// - The pause does not change how many attempts run.
@@ -1251,6 +1251,7 @@ where
         checkpoint_delay,
         plugins,
         plugin_child_operations_depth,
+        default_step_semantics,
     } = options;
     // The checkpoint buffer window: a configured delay is the coalescing
     // window; without one, writes batch behind the single-writer lock with
@@ -1267,6 +1268,7 @@ where
         ClientProvider::new(preset_client),
         checkpoint_buffer_window,
         plugin_child_operations_depth,
+        default_step_semantics,
         plugins.into(),
     )
 }
@@ -1282,6 +1284,7 @@ fn wrap_with_provider<F, E, Fut, O>(
     provider: ClientProvider,
     checkpoint_buffer_window: Duration,
     plugin_child_operations_depth: u32,
+    default_step_semantics: StepSemantics,
     plugin_factories: std::sync::Arc<plugin::Factories>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
 where
@@ -1393,7 +1396,8 @@ where
                 checkpoint_buffer_window,
                 plugin_child_operations_depth,
                 plugins.clone(),
-            );
+            )
+            .with_default_step_semantics(default_step_semantics);
 
             // Retained past the handler move so the post-outcome flush can
             // drain the checkpoint coalescing buffer (a cheap Arc clone).
@@ -2466,6 +2470,7 @@ mod tests {
             ClientProvider::new(Some(client)),
             Duration::ZERO,
             0,
+            StepSemantics::default(),
             std::sync::Arc::from(Vec::new()),
         );
         let payload = serde_json::json!({

@@ -19,7 +19,7 @@ use crate::builders::{
     WithRetryBuilder,
 };
 use crate::checkpoint_coalescer::{
-    Admission, BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate,
+    Admission, BatchLimits, CheckpointBatch, CheckpointCoalescer, PersistedHook, TrackedUpdate,
     split_into_requests,
 };
 use crate::client::{
@@ -69,6 +69,8 @@ pub(crate) struct SubmittedWrite {
     /// when its result is ready (see [`Self::reported_by`]). `None` without
     /// plugins, and once delivered.
     report: Option<Box<WriteReport>>,
+    /// Whether admission rejected the write (see [`Self::rejected`]).
+    rejected: bool,
 }
 
 /// What a [`SubmittedWrite`] needs to deliver the change sets through its
@@ -99,6 +101,7 @@ impl SubmittedWrite {
             #[cfg(test)]
             first_poll: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             report: None,
+            rejected: false,
         }
     }
 
@@ -136,7 +139,17 @@ impl SubmittedWrite {
     /// A rejected write: nothing is sent, and the result never resolves.
     /// The rejected caller's task is being cancelled (see [`Admission`]).
     fn rejected() -> Self {
-        Self::new(std::future::pending())
+        Self {
+            rejected: true,
+            ..Self::new(std::future::pending())
+        }
+    }
+
+    /// Whether admission rejected the write: nothing is sent, and the
+    /// result never resolves. A caller that does not await the write
+    /// awaits a rejected one, so it stops as an awaiting caller does.
+    pub(crate) fn is_rejected(&self) -> bool {
+        self.rejected
     }
 }
 
@@ -485,6 +498,10 @@ struct Inner {
     /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth),
     /// copied into every derived context.
     preserve_child_depth: u32,
+    /// The invocation's
+    /// [`default_step_semantics`](crate::OptionsBuilder::default_step_semantics),
+    /// copied into every derived context.
+    default_step_semantics: crate::StepSemantics,
     /// True inside a body that runs again to rebuild the result of a
     /// recorded success (`ReplayChildren`). Copied into every derived context.
     rebuilding: bool,
@@ -601,6 +618,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
@@ -643,6 +661,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
@@ -685,6 +704,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
@@ -737,10 +757,28 @@ impl DurableContext {
                 plugins,
                 nesting_level: 0,
                 preserve_child_depth,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
         }
+    }
+
+    /// Sets the semantics of every step that sets none, in this root
+    /// context and every context derived from it (see
+    /// [`default_step_semantics`](crate::OptionsBuilder::default_step_semantics)).
+    pub(crate) fn with_default_step_semantics(mut self, semantics: crate::StepSemantics) -> Self {
+        #[expect(clippy::expect_used)]
+        // reason: the caller sets it on a new root context, before any clone
+        // or derived context holds its `Inner`.
+        let inner = Arc::get_mut(&mut self.inner).expect("a new root context is not shared");
+        inner.default_step_semantics = semantics;
+        self
+    }
+
+    /// The semantics of a step that sets none.
+    pub(crate) fn default_step_semantics(&self) -> crate::StepSemantics {
+        self.inner.default_step_semantics
     }
 
     /// Test-only root with an empty log, an in-memory client and the
@@ -815,6 +853,7 @@ impl DurableContext {
                 plugins: None,
                 nesting_level: 0,
                 preserve_child_depth: 0,
+                default_step_semantics: crate::StepSemantics::default(),
                 rebuilding: false,
             }),
             awaited: None,
@@ -881,6 +920,7 @@ impl DurableContext {
                 plugins: self.inner.plugins.clone(),
                 nesting_level: self.inner.nesting_level.saturating_add(1),
                 preserve_child_depth: self.inner.preserve_child_depth,
+                default_step_semantics: self.inner.default_step_semantics,
                 rebuilding: self.inner.rebuilding || rebuilding,
             }),
             awaited: None,
@@ -933,6 +973,7 @@ impl DurableContext {
                 plugins: self.inner.plugins.clone(),
                 nesting_level: self.inner.nesting_level,
                 preserve_child_depth: self.inner.preserve_child_depth,
+                default_step_semantics: self.inner.default_step_semantics,
                 rebuilding: self.inner.rebuilding,
             }),
             awaited: None,
@@ -1178,6 +1219,7 @@ impl DurableContext {
                 plugins: self.inner.plugins.clone(),
                 nesting_level: self.inner.nesting_level,
                 preserve_child_depth: self.inner.preserve_child_depth,
+                default_step_semantics: self.inner.default_step_semantics,
                 rebuilding: self.inner.rebuilding,
             }),
             awaited: None,
@@ -1980,6 +2022,22 @@ impl DurableContext {
         self.checkpoint_with_urgency(updates, false)
     }
 
+    /// [`Self::submit_checkpoint_updates`] for one update, with `persisted`
+    /// run once the service accepted it (see [`PersistedHook`]). A write
+    /// that fails, or is never sent, drops `persisted`.
+    pub(crate) fn submit_checkpoint_update_then(
+        &self,
+        update: OperationUpdate,
+        persisted: impl FnOnce() + Send + 'static,
+    ) -> SubmittedWrite {
+        let mut tracked = self.track_updates(vec![update]);
+        if let Some(first) = tracked.first_mut() {
+            first.persisted = Some(PersistedHook(Box::new(persisted)));
+        }
+        self.write_with_urgency(tracked, false, None)
+            .reported_by(self)
+    }
+
     /// Checkpoints operation updates, flushing the coalescing buffer
     /// immediately instead of waiting out the delay window.
     ///
@@ -2220,23 +2278,32 @@ impl DurableContext {
     ) -> Result<CheckpointOutput, WriteError> {
         let mut updates = Vec::with_capacity(tracked.len());
         let mut events = Vec::with_capacity(tracked.len());
-        for TrackedUpdate { update, event } in tracked {
+        let mut hooks = Vec::new();
+        for TrackedUpdate {
+            update,
+            event,
+            persisted,
+        } in tracked
+        {
             updates.push(update);
             events.extend(event);
+            hooks.extend(persisted);
         }
-        self.write_unchecked(updates, &events, None).await
+        self.write_unchecked(updates, &events, hooks, None).await
     }
 
     /// Writes updates that skip the admission check: those of a flushed
-    /// batch and of the write after the drive. `refresh_id` is the batch's
-    /// (see [`Self::checkpoint_refresh`]).
+    /// batch and of the write after the drive. `hooks` are the updates'
+    /// [`PersistedHook`]s. `refresh_id` is the batch's (see
+    /// [`Self::checkpoint_refresh`]).
     async fn write_unchecked(
         &self,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
+        hooks: Vec<PersistedHook>,
         refresh_id: Option<&str>,
     ) -> Result<CheckpointOutput, WriteError> {
-        self.checkpoint_direct_with_events(updates, events, refresh_id)
+        self.checkpoint_direct_with_events(updates, events, hooks, refresh_id)
             .await
     }
 
@@ -2354,7 +2421,7 @@ impl DurableContext {
         if updates.is_empty() {
             // A refresh joins with no update, and its request carries none.
             return self
-                .write_unchecked(Vec::new(), &[], refresh_id.as_deref())
+                .write_unchecked(Vec::new(), &[], Vec::new(), refresh_id.as_deref())
                 .await;
         }
         let mut last = None;
@@ -2466,6 +2533,7 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
+        hooks: Vec<PersistedHook>,
         refresh_id: Option<&str>,
     ) -> Result<CheckpointOutput, WriteError> {
         #[cfg(test)]
@@ -2493,19 +2561,22 @@ impl DurableContext {
             drop(token_guard);
             return Err(WriteError::Failed(err));
         };
-        self.write_locked(client, token_guard, updates, events, &failure_id)
+        self.write_locked(client, token_guard, updates, events, hooks, &failure_id)
             .await
     }
 
     /// The write of [`Self::checkpoint_direct_with_events`], with the
     /// checkpoint-token lock held. A failed call or a failed state read
     /// after it is recorded for `failure_id` before the lock is released.
+    /// `hooks` are queued after the response's change set when the write
+    /// succeeds, and dropped otherwise (see [`PersistedHook`]).
     async fn write_locked(
         &self,
         client: &Arc<dyn ExecutionClient>,
         mut token_guard: tokio::sync::MutexGuard<'_, String>,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
+        hooks: Vec<PersistedHook>,
         failure_id: &str,
     ) -> Result<CheckpointOutput, WriteError> {
         let retried = wfc_retries(&updates);
@@ -2627,7 +2698,13 @@ impl DurableContext {
         }
         // Still under the token lock, so change sets queue in response
         // order. No hook runs here: a drain point delivers them later.
+        // The persisted hooks of the request queue after its change set.
         self.queue_changes(change_set);
+        if let Some(plugins) = self.plugins() {
+            for hook in hooks {
+                plugins.push_persisted(hook);
+            }
+        }
         drop(publication);
 
         // A `wait_for_condition` RETRY the response did not carry: the log
@@ -3605,7 +3682,7 @@ impl DurableContext {
     /// then, so its first checkpoint comes before the combinator's, and a
     /// start hook it fires when it queues `START` runs before the
     /// combinator's. A start hook that waits for the `START` response (a
-    /// wait, a step under `AtMostOncePerRetry`) keeps that timing. A lazy
+    /// wait, a step under `AtMostOnce`) keeps that timing. A lazy
     /// invoke or `wait_for_condition` is polled once, in input order,
     /// before the combinator's start step, but the combinator does not wait
     /// for its `START`. The combinator then queues its own `START`, fires
@@ -3713,7 +3790,7 @@ impl DurableContext {
     /// then, so its first checkpoint comes before the combinator's, and a
     /// start hook it fires when it queues `START` runs before the
     /// combinator's. A start hook that waits for the `START` response (a
-    /// wait, a step under `AtMostOncePerRetry`) keeps that timing. A lazy
+    /// wait, a step under `AtMostOnce`) keeps that timing. A lazy
     /// invoke or `wait_for_condition` is polled once, in input order,
     /// before the combinator's start step, but the combinator does not wait
     /// for its `START`. The combinator then queues its own `START`, fires
@@ -3816,7 +3893,7 @@ impl DurableContext {
     /// then, so its first checkpoint comes before the combinator's, and a
     /// start hook it fires when it queues `START` runs before the
     /// combinator's. A start hook that waits for the `START` response (a
-    /// wait, a step under `AtMostOncePerRetry`) keeps that timing. A lazy
+    /// wait, a step under `AtMostOnce`) keeps that timing. A lazy
     /// invoke or `wait_for_condition` is polled once, in input order,
     /// before the combinator's start step, but the combinator does not wait
     /// for its `START`. The combinator then queues its own `START`, fires
@@ -3918,7 +3995,7 @@ impl DurableContext {
     /// then, so its first checkpoint comes before the combinator's, and a
     /// start hook it fires when it queues `START` runs before the
     /// combinator's. A start hook that waits for the `START` response (a
-    /// wait, a step under `AtMostOncePerRetry`) keeps that timing. A lazy
+    /// wait, a step under `AtMostOnce`) keeps that timing. A lazy
     /// invoke or `wait_for_condition` is polled once, in input order,
     /// before the combinator's start step, but the combinator does not wait
     /// for its `START`. The combinator then queues its own `START`, fires
@@ -4240,6 +4317,25 @@ mod tests {
             ),
         ] {
             assert_eq!((level(&ctx), ctx.inner.preserve_child_depth), (0, 0));
+        }
+    }
+
+    /// Every derived context keeps the root's default step semantics.
+    #[test]
+    fn derived_contexts_keep_default_step_semantics() {
+        use crate::StepSemantics;
+        let (root, _client) = DurableContext::test_context_with_depth(0);
+        assert_eq!(root.default_step_semantics(), StepSemantics::AtLeastOnce);
+        let root = root.with_default_step_semantics(StepSemantics::AtLeastOnceAsync);
+        let batch = root.new_child("1", None);
+        let normal = batch.new_child("1-1", None);
+        let flat = batch.new_flat_child("1-2", "parent", None);
+        let virtual_child = root.new_virtual_child("2", None);
+        for ctx in [&root, &batch, &normal, &flat, &virtual_child] {
+            assert_eq!(
+                ctx.default_step_semantics(),
+                StepSemantics::AtLeastOnceAsync
+            );
         }
     }
 
@@ -4699,10 +4795,10 @@ mod tests {
         // request at a time, so the race calls `write_unchecked`, which
         // takes the token lock directly.
         let (r1, r2, r3, r4) = tokio::join!(
-            ctx.write_unchecked(Vec::new(), &[], None),
-            ctx.write_unchecked(Vec::new(), &[], None),
-            ctx.write_unchecked(Vec::new(), &[], None),
-            ctx.write_unchecked(Vec::new(), &[], None),
+            ctx.write_unchecked(Vec::new(), &[], Vec::new(), None),
+            ctx.write_unchecked(Vec::new(), &[], Vec::new(), None),
+            ctx.write_unchecked(Vec::new(), &[], Vec::new(), None),
+            ctx.write_unchecked(Vec::new(), &[], Vec::new(), None),
         );
         assert!(r1.is_ok(), "checkpoint 1 failed: {r1:?}");
         assert!(r2.is_ok(), "checkpoint 2 failed: {r2:?}");
@@ -9767,7 +9863,12 @@ mod withdrawal_write_tests {
         let ctx = DurableContext::test_context();
         ctx.coordinator().withdraw("arn:test", "req", || {});
         let written = ctx
-            .checkpoint_direct_with_events(vec![update("a", OperationAction::Start)], &[], None)
+            .checkpoint_direct_with_events(
+                vec![update("a", OperationAction::Start)],
+                &[],
+                Vec::new(),
+                None,
+            )
             .await;
         assert!(matches!(written, Err(WriteError::Stopped)), "{written:?}");
         assert!(!ctx.coordinator().write_failed());

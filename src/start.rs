@@ -23,13 +23,13 @@
 //! The order of the `START` write and `on_operation_start` follows JS for
 //! each kind ([`StartOrder`]):
 //!
-//! - A step under `AtLeastOncePerRetry` and `wait_for_condition` queue
+//! - A step under `AtLeastOnce` and `wait_for_condition` queue
 //!   `START`, fire `on_operation_start`, and do not wait for the response.
 //!   The `START` is reserved (see
 //!   [`ReservedWrite`](crate::context::ReservedWrite)) until the hook
 //!   dispatch returns, so the hook returns before the request is sent on
 //!   any runtime, as JS's `setImmediate` send runs after the hook.
-//! - A step under `AtMostOncePerRetry`, a wait and a callback queue
+//! - A step under `AtMostOnce`, a wait and a callback queue
 //!   `START` here, and the rest of the operation awaits the response
 //!   before it fires `on_operation_start`, as JS awaits the `START`
 //!   promise before the hook. A callback's `START` is urgent: it flushes
@@ -345,9 +345,10 @@ mod tests {
         semantics: StepSemantics,
     ) -> Result<StartStep, OperationError> {
         let op_id = ctx.mint_id();
-        let order = match semantics {
-            StepSemantics::AtLeastOncePerRetry => StartOrder::QueueThenHook,
-            StepSemantics::AtMostOncePerRetry => StartOrder::AwaitResponse,
+        let order = if semantics == StepSemantics::AtMostOnce {
+            StartOrder::AwaitResponse
+        } else {
+            StartOrder::QueueThenHook
         };
         start_step(
             ctx,
@@ -413,7 +414,7 @@ mod tests {
     async fn start_step_queues_start_before_returning() {
         let client = in_memory();
         let ctx = context(Vec::new(), client.clone(), Duration::ZERO, None);
-        let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
+        let started = step_start(&ctx, StepSemantics::AtLeastOnce).expect("no error");
         assert!(matches!(started, StartStep::Queued(_)));
         assert_eq!(
             ctx.queued_update_ids(),
@@ -436,7 +437,7 @@ mod tests {
             Duration::ZERO,
             None,
         );
-        let started = step_start(&ctx, StepSemantics::AtMostOncePerRetry).expect("no error");
+        let started = step_start(&ctx, StepSemantics::AtMostOnce).expect("no error");
         let StartStep::Recorded(view) = started else {
             panic!("a STARTED record queues no START");
         };
@@ -451,7 +452,7 @@ mod tests {
         let child = root.new_child("1", None);
         root.admission()
             .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
-        let started = step_start(&child, StepSemantics::AtLeastOncePerRetry).expect("no error");
+        let started = step_start(&child, StepSemantics::AtLeastOnce).expect("no error");
         assert!(matches!(started, StartStep::Refused));
         assert_eq!(child.queued_update_ids(), Vec::<String>::new());
 
@@ -463,7 +464,7 @@ mod tests {
             name: Some("b".to_owned()),
             retry_strategy: None,
             serdes: crate::JsonSerdes,
-            semantics: StepSemantics::AtLeastOncePerRetry,
+            semantics: StepSemantics::AtLeastOnce,
             sub_type: crate::OperationSubType::STEP,
             plugin_name: None,
             closure: |_| async { Ok(1_u32) },
@@ -482,7 +483,7 @@ mod tests {
     async fn start_step_fires_live_hook_only_for_queue_then_hook() {
         let hooks = OpHooks::default();
         let ctx = context(Vec::new(), in_memory(), Duration::ZERO, Some(&hooks));
-        let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
+        let started = step_start(&ctx, StepSemantics::AtLeastOnce).expect("no error");
         assert!(matches!(started, StartStep::Queued(_)));
         assert_eq!(
             starts(&hooks),
@@ -510,7 +511,7 @@ mod tests {
             Duration::ZERO,
             Some(&hooks),
         );
-        let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
+        let started = step_start(&ctx, StepSemantics::AtLeastOnce).expect("no error");
         assert!(matches!(started, StartStep::Recorded(_)));
         assert_eq!(
             starts(&hooks),
@@ -555,7 +556,7 @@ mod tests {
             Duration::ZERO,
             None,
         );
-        let Err(err) = step_start(&ctx, StepSemantics::AtLeastOncePerRetry) else {
+        let Err(err) = step_start(&ctx, StepSemantics::AtLeastOnce) else {
             panic!("a record of another type fails the replay identity check");
         };
         assert!(err.to_string().contains("non_deterministic"), "{err}");
@@ -578,7 +579,7 @@ mod tests {
                 Duration::ZERO,
                 Some(&hooks),
             );
-            let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
+            let started = step_start(&ctx, StepSemantics::AtLeastOnce).expect("no error");
             assert_eq!(
                 starts(&hooks),
                 [true],
@@ -600,7 +601,7 @@ mod tests {
             Duration::ZERO,
             Some(&hooks),
         );
-        let started = step_start(&ctx, StepSemantics::AtLeastOncePerRetry).expect("no error");
+        let started = step_start(&ctx, StepSemantics::AtLeastOnce).expect("no error");
         assert!(matches!(started, StartStep::Recorded(_)));
         assert_eq!(ctx.queued_update_ids(), Vec::<String>::new());
     }
@@ -672,7 +673,7 @@ mod tests {
             name: Some("a".to_owned()),
             retry_strategy: None,
             serdes: crate::JsonSerdes,
-            semantics: StepSemantics::AtMostOncePerRetry,
+            semantics: StepSemantics::AtMostOnce,
             sub_type: crate::OperationSubType::STEP,
             plugin_name: None,
             closure: |_| async { Ok(1_u32) },

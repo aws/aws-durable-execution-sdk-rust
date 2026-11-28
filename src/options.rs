@@ -97,6 +97,8 @@ pub struct Options {
     /// How many levels of finished child contexts keep their children
     /// visible to later invocations. 0 (the default) keeps none.
     pub(crate) plugin_child_operations_depth: u32,
+    /// The semantics of every step that sets none.
+    pub(crate) default_step_semantics: crate::StepSemantics,
 }
 
 impl Default for Options {
@@ -118,6 +120,7 @@ impl Default for Options {
             checkpoint_delay: None,
             plugins: Vec::new(),
             plugin_child_operations_depth: 0,
+            default_step_semantics: crate::StepSemantics::default(),
         }
     }
 }
@@ -152,6 +155,7 @@ impl std::fmt::Debug for Options {
                 "plugin_child_operations_depth",
                 &self.plugin_child_operations_depth,
             )
+            .field("default_step_semantics", &self.default_step_semantics)
             .finish()
     }
 }
@@ -198,6 +202,7 @@ pub struct OptionsBuilder {
     checkpoint_delay: Option<Duration>,
     plugins: PluginFactories,
     plugin_child_operations_depth: u32,
+    default_step_semantics: crate::StepSemantics,
 }
 
 // Written by hand: `Arc<dyn ExecutionClient>` and `Arc<dyn PluginFactory>`
@@ -217,6 +222,7 @@ impl std::fmt::Debug for OptionsBuilder {
                 "plugin_child_operations_depth",
                 &self.plugin_child_operations_depth,
             )
+            .field("default_step_semantics", &self.default_step_semantics)
             .finish()
     }
 }
@@ -494,6 +500,35 @@ impl OptionsBuilder {
         self
     }
 
+    /// Sets the semantics of every step in the execution that does not set
+    /// its own with [`StepBuilder::semantics`](crate::builders::StepBuilder::semantics).
+    ///
+    /// It applies to the steps of every context: the root, child contexts,
+    /// `map` items, `parallel` branches, and the submitter step of
+    /// `wait_for_callback`. A step's own semantics wins. The default is
+    /// [`StepSemantics::AtLeastOnce`](crate::StepSemantics::AtLeastOnce).
+    ///
+    /// Before you set
+    /// [`AtLeastOnceAsync`](crate::StepSemantics::AtLeastOnceAsync) here,
+    /// read its documentation. A step whose result becomes an idempotency
+    /// key for a later step needs its own `AtLeastOnce`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::{Options, StepSemantics};
+    ///
+    /// let opts = Options::builder()
+    ///     .default_step_semantics(StepSemantics::AtLeastOnceAsync)
+    ///     .build()
+    ///     .expect("valid config");
+    /// # drop(opts);
+    /// ```
+    pub fn default_step_semantics(mut self, semantics: crate::StepSemantics) -> Self {
+        self.default_step_semantics = semantics;
+        self
+    }
+
     /// Builds the [`Options`] from the configured values.
     ///
     /// # Errors
@@ -549,6 +584,7 @@ impl OptionsBuilder {
             checkpoint_delay: self.checkpoint_delay,
             plugins: self.plugins,
             plugin_child_operations_depth: self.plugin_child_operations_depth,
+            default_step_semantics: self.default_step_semantics,
         })
     }
 }
@@ -612,6 +648,25 @@ mod tests {
         assert!(
             options_debug.contains("plugin_child_operations_depth: 3"),
             "{options_debug}"
+        );
+    }
+
+    #[test]
+    fn default_step_semantics_is_stored() {
+        use crate::StepSemantics;
+        assert_eq!(
+            Options::default().default_step_semantics,
+            StepSemantics::AtLeastOnce
+        );
+        let built = Options::builder().build().expect("valid config");
+        assert_eq!(built.default_step_semantics, StepSemantics::AtLeastOnce);
+        let built = Options::builder()
+            .default_step_semantics(StepSemantics::AtLeastOnceAsync)
+            .build()
+            .expect("valid config");
+        assert_eq!(
+            built.default_step_semantics,
+            StepSemantics::AtLeastOnceAsync
         );
     }
 

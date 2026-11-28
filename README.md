@@ -516,10 +516,10 @@ A step is the unit of checkpointing. Its output needs
 Once a step succeeds and the service records its result, replay returns that
 result without re-running the body. Between the moment the SDK starts a step
 and the moment the service records the outcome, an interruption (function
-timeout, runtime crash) can occur. Under the default `AtLeastOncePerRetry`
+timeout, runtime crash) can occur. Under the default `AtLeastOnce`
 semantics the SDK re-executes the body on resume, so the body may run more
 than once per retry attempt if an interruption occurs in that window. Design
-step bodies to be idempotent, or use `StepSemantics::AtMostOncePerRetry` to
+step bodies to be idempotent, or use `StepSemantics::AtMostOnce` to
 treat an interrupted attempt as a failure rather than re-executing it.
 
 A step body is `FnOnce + Clone`. The SDK keeps the original closure and calls
@@ -572,7 +572,7 @@ let result = ctx
             RetryDecision::retry(Duration::from_secs(u64::from(attempt)))
         }
     })
-    .semantics(StepSemantics::AtMostOncePerRetry)
+    .semantics(StepSemantics::AtMostOnce)
     .await?;
 ```
 
@@ -584,15 +584,45 @@ fills the fields it leaves unset as JS `createRetryStrategy` does, with 3
 attempts and a 300 second cap, and its `retry_if(predicate)` retries only the
 errors for which the predicate returns `true`.
 
-`StepSemantics::AtLeastOncePerRetry` is the default: the SDK re-executes the
+`StepSemantics::AtLeastOnce` is the default: the SDK re-executes the
 body on resume if the previous attempt started but recorded no outcome.
 The body starts without waiting for the `START` checkpoint. The outcome is
 written only after `START` is acknowledged; if `START` fails, the outcome is
 not written and the invocation fails.
-`AtMostOncePerRetry` treats that interruption as a failure and consults the
+`AtMostOnce` treats that interruption as a failure and consults the
 retry strategy, so a non-idempotent body never runs twice for the same
 attempt. The strategy sees `StepErrorKind::Interrupted`, and the recorded
 failure carries the error type `StepInterruptedError`.
+`AtLeastOnceAsync` (experimental) is like `AtLeastOnce`, but the step returns
+without waiting for the service to save its `START` or its result. It queues
+the result behind `START`. So the step has lower latency.
+The SDK sends checkpoints in order, and a failed checkpoint stops every later
+one, so the result is never saved without `START`. It writes every pending
+checkpoint before the invocation ends. If a retryable save fails, or the invocation ends
+before the save, the step runs again on replay. A permanent checkpoint failure
+fails the execution. When the step runs again, later steps run again too, and
+the step can return a different value. So do not use it for a step whose result becomes an
+idempotency key for a later step. The plugin end hooks of the step fire when
+the service has saved the result, so they can fire after the code that
+follows the step. A failed save fires no end hook. This value is experimental. It may change
+or be removed in a future release.
+
+The deprecated names `AtLeastOncePerRetry` and `AtMostOncePerRetry` behave as
+`AtLeastOnce` and `AtMostOnce` and compare equal to them with `==`.
+
+To change the default for every step in the execution, set
+`default_step_semantics`. A step's own `.semantics(...)` still wins:
+
+```rust no_run
+use aws_durable_execution_sdk::{Options, StepSemantics};
+
+let options = Options::builder()
+    .default_step_semantics(StepSemantics::AtLeastOnceAsync)
+    .build()
+    .expect("valid options");
+```
+
+Pass the options to `durable::run_with_options` or `durable::wrap`.
 
 #### Pause after repeated failures (experimental)
 
@@ -643,7 +673,7 @@ let value = ctx
 
 - The pause does not change how many attempts run. A `Stop` never pauses.
 - Only a body that failed in the current invocation pauses, including the
-  submitter of `wait_for_callback`. An interrupted `AtMostOncePerRetry`
+  submitter of `wait_for_callback`. An interrupted `AtMostOnce`
   attempt retries without a pause. A `with_retry` block ignores `pause`.
 - After the service accepts the pause, the step runs no further attempt in
   the invocation, even when other work keeps the invocation running past the
@@ -1295,7 +1325,7 @@ that already run. A step, a wait, a child context, a `with_retry`, a `map`, a
 first checkpoint comes before the combinator's, and a start hook it fires
 when it queues `START` runs before the combinator's. A start hook that waits
 for the `START` response, that of a wait or of a step under
-`AtMostOncePerRetry`, keeps that timing and runs after the combinator's. A
+`AtMostOnce`, keeps that timing and runs after the combinator's. A
 lazy invoke or `wait_for_condition` is polled once, in input order, before
 the combinator's start step, and the combinator does not wait for its
 `START`. The combinator then queues its own `START`, fires its start hook,

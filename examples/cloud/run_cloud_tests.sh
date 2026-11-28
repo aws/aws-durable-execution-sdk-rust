@@ -82,6 +82,7 @@ basics|hello_world|SUCCEEDED|||
 basics|step_basic|SUCCEEDED|||
 basics|step_named|SUCCEEDED|{"data":"cloud"}||
 basics|step_with_retry|SUCCEEDED|||
+basics|step_default_semantics|SUCCEEDED|||
 basics|wait_basic|SUCCEEDED|||
 basics|wait_named|SUCCEEDED|||
 basics|multiple_waits|SUCCEEDED|||
