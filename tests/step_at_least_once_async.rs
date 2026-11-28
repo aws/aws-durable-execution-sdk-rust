@@ -545,3 +545,158 @@ async fn handler_error_with_execution_succeed_failure_fails_the_execution() {
         Some("CheckpointUnrecoverableExecutionError")
     );
 }
+
+std::thread_local! {
+    /// Set while a `wrap_invocation` of a [`Context`] plugin runs on this
+    /// thread.
+    static IN_INVOCATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Records, for each end hook of a step or a child context, the hook,
+/// the operation kind, whether a `wrap_invocation` was entered and the
+/// name of the current `tracing` span.
+#[derive(Clone, Default)]
+struct Context(Arc<Mutex<Vec<Seen>>>);
+
+/// One end hook [`Context`] saw: the hook, the operation kind, whether a
+/// `wrap_invocation` was entered and the current span's name.
+type Seen = (&'static str, String, bool, Option<&'static str>);
+
+impl Context {
+    fn record(&self, hook: &'static str, info: &OperationInfo) {
+        let kind = match info.kind() {
+            Some(durable::OperationKind::Step) => "step",
+            Some(durable::OperationKind::Context) => "context",
+            _ => return,
+        };
+        let span = tracing::Span::current()
+            .metadata()
+            .map(tracing::Metadata::name);
+        self.0.lock().expect("lock").push((
+            hook,
+            kind.to_owned(),
+            IN_INVOCATION.with(std::cell::Cell::get),
+            span,
+        ));
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.0.lock().expect("lock").clone()
+    }
+}
+
+impl Plugin for Context {
+    fn wrap_invocation(&self, _info: &InvocationInfo, next: &mut dyn FnMut()) {
+        let outer = IN_INVOCATION.with(|flag| flag.replace(true));
+        next();
+        IN_INVOCATION.with(|flag| flag.set(outer));
+    }
+
+    fn on_attempt_end(&self, info: &durable::plugin::AttemptEndInfo) -> HookWork {
+        self.record("attempt_end", info.operation());
+        Ok(None)
+    }
+
+    fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+        self.record("operation_end", info);
+        Ok(None)
+    }
+}
+
+impl PluginFactory for Context {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(self.clone())))
+    }
+}
+
+/// The end hooks of an async step run inside `wrap_invocation` and inside
+/// the SDK's `tracing` span, as an awaited step's do. Current-thread, so
+/// the thread-local subscriber and flag see every task.
+#[tokio::test]
+async fn end_hooks_run_inside_the_wraps_and_the_span() {
+    let _guard = test_tracing::install_test_subscriber(tracing_subscriber::registry());
+    let seen = Context::default();
+    let (result, _) = run_async_step(
+        LocalRunner::new()
+            .checkpoint_latency(Duration::from_millis(50))
+            .options(
+                durable::Options::builder()
+                    .plugin(seen.clone())
+                    .build()
+                    .expect("valid options"),
+            ),
+        Duration::ZERO,
+    )
+    .await;
+    assert!(result.is_success(), "{result:?}");
+    assert_eq!(
+        seen.seen(),
+        [
+            (
+                "attempt_end",
+                "step".to_owned(),
+                true,
+                Some("durable_execution")
+            ),
+            (
+                "operation_end",
+                "step".to_owned(),
+                true,
+                Some("durable_execution")
+            ),
+        ]
+    );
+}
+
+/// A child context holds an async step, and one response answers the
+/// step's `SUCCEED` and the context's `SUCCEED`. The wait makes the next
+/// invocation resume the context, which then writes no `START`, and the
+/// coalescing window puts both `SUCCEED`s in one request. The step's end
+/// hooks fire before the context's.
+#[tokio::test]
+async fn async_step_end_hooks_precede_the_child_context_end_hook() {
+    let seen = Context::default();
+    let result = LocalRunner::new()
+        .options(
+            durable::Options::builder()
+                .checkpoint_delay(Duration::from_millis(200))
+                .plugin(seen.clone())
+                .build()
+                .expect("valid options"),
+        )
+        .run(
+            |_event: serde_json::Value, ctx: durable::DurableContext| async move {
+                let value = ctx
+                    .run_in_child_context(|child| async move {
+                        child.wait(Duration::from_secs(1)).name("w").await?;
+                        let value = child
+                            .step(|_| async { Ok(1_u32) })
+                            .name("s")
+                            .semantics(StepSemantics::AtLeastOnceAsync)
+                            .await?;
+                        Ok(value)
+                    })
+                    .name("child")
+                    .await?;
+                Ok::<_, BoxError>(value)
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{result:?}");
+    assert_eq!(result.invocation_count(), 2);
+    let order: Vec<(&'static str, String)> = seen
+        .seen()
+        .into_iter()
+        .map(|(hook, kind, _, _)| (hook, kind))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("attempt_end", "step".to_owned()),
+            ("operation_end", "step".to_owned()),
+            ("operation_end", "context".to_owned()),
+        ]
+    );
+}

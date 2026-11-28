@@ -19,7 +19,7 @@ use crate::builders::{
     WithRetryBuilder,
 };
 use crate::checkpoint_coalescer::{
-    Admission, BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate,
+    Admission, BatchLimits, CheckpointBatch, CheckpointCoalescer, PersistedHook, TrackedUpdate,
     split_into_requests,
 };
 use crate::client::{
@@ -2022,6 +2022,22 @@ impl DurableContext {
         self.checkpoint_with_urgency(updates, false)
     }
 
+    /// [`Self::submit_checkpoint_updates`] for one update, with `persisted`
+    /// run once the service accepted it (see [`PersistedHook`]). A write
+    /// that fails, or is never sent, drops `persisted`.
+    pub(crate) fn submit_checkpoint_update_then(
+        &self,
+        update: OperationUpdate,
+        persisted: impl FnOnce() + Send + 'static,
+    ) -> SubmittedWrite {
+        let mut tracked = self.track_updates(vec![update]);
+        if let Some(first) = tracked.first_mut() {
+            first.persisted = Some(PersistedHook(Box::new(persisted)));
+        }
+        self.write_with_urgency(tracked, false, None)
+            .reported_by(self)
+    }
+
     /// Checkpoints operation updates, flushing the coalescing buffer
     /// immediately instead of waiting out the delay window.
     ///
@@ -2262,23 +2278,32 @@ impl DurableContext {
     ) -> Result<CheckpointOutput, WriteError> {
         let mut updates = Vec::with_capacity(tracked.len());
         let mut events = Vec::with_capacity(tracked.len());
-        for TrackedUpdate { update, event } in tracked {
+        let mut hooks = Vec::new();
+        for TrackedUpdate {
+            update,
+            event,
+            persisted,
+        } in tracked
+        {
             updates.push(update);
             events.extend(event);
+            hooks.extend(persisted);
         }
-        self.write_unchecked(updates, &events, None).await
+        self.write_unchecked(updates, &events, hooks, None).await
     }
 
     /// Writes updates that skip the admission check: those of a flushed
-    /// batch and of the write after the drive. `refresh_id` is the batch's
-    /// (see [`Self::checkpoint_refresh`]).
+    /// batch and of the write after the drive. `hooks` are the updates'
+    /// [`PersistedHook`]s. `refresh_id` is the batch's (see
+    /// [`Self::checkpoint_refresh`]).
     async fn write_unchecked(
         &self,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
+        hooks: Vec<PersistedHook>,
         refresh_id: Option<&str>,
     ) -> Result<CheckpointOutput, WriteError> {
-        self.checkpoint_direct_with_events(updates, events, refresh_id)
+        self.checkpoint_direct_with_events(updates, events, hooks, refresh_id)
             .await
     }
 
@@ -2396,7 +2421,7 @@ impl DurableContext {
         if updates.is_empty() {
             // A refresh joins with no update, and its request carries none.
             return self
-                .write_unchecked(Vec::new(), &[], refresh_id.as_deref())
+                .write_unchecked(Vec::new(), &[], Vec::new(), refresh_id.as_deref())
                 .await;
         }
         let mut last = None;
@@ -2508,6 +2533,7 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
+        hooks: Vec<PersistedHook>,
         refresh_id: Option<&str>,
     ) -> Result<CheckpointOutput, WriteError> {
         #[cfg(test)]
@@ -2535,19 +2561,22 @@ impl DurableContext {
             drop(token_guard);
             return Err(WriteError::Failed(err));
         };
-        self.write_locked(client, token_guard, updates, events, &failure_id)
+        self.write_locked(client, token_guard, updates, events, hooks, &failure_id)
             .await
     }
 
     /// The write of [`Self::checkpoint_direct_with_events`], with the
     /// checkpoint-token lock held. A failed call or a failed state read
     /// after it is recorded for `failure_id` before the lock is released.
+    /// `hooks` are queued after the response's change set when the write
+    /// succeeds, and dropped otherwise (see [`PersistedHook`]).
     async fn write_locked(
         &self,
         client: &Arc<dyn ExecutionClient>,
         mut token_guard: tokio::sync::MutexGuard<'_, String>,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
+        hooks: Vec<PersistedHook>,
         failure_id: &str,
     ) -> Result<CheckpointOutput, WriteError> {
         let retried = wfc_retries(&updates);
@@ -2669,7 +2698,13 @@ impl DurableContext {
         }
         // Still under the token lock, so change sets queue in response
         // order. No hook runs here: a drain point delivers them later.
+        // The persisted hooks of the request queue after its change set.
         self.queue_changes(change_set);
+        if let Some(plugins) = self.plugins() {
+            for hook in hooks {
+                plugins.push_persisted(hook);
+            }
+        }
         drop(publication);
 
         // A `wait_for_condition` RETRY the response did not carry: the log
@@ -4760,10 +4795,10 @@ mod tests {
         // request at a time, so the race calls `write_unchecked`, which
         // takes the token lock directly.
         let (r1, r2, r3, r4) = tokio::join!(
-            ctx.write_unchecked(Vec::new(), &[], None),
-            ctx.write_unchecked(Vec::new(), &[], None),
-            ctx.write_unchecked(Vec::new(), &[], None),
-            ctx.write_unchecked(Vec::new(), &[], None),
+            ctx.write_unchecked(Vec::new(), &[], Vec::new(), None),
+            ctx.write_unchecked(Vec::new(), &[], Vec::new(), None),
+            ctx.write_unchecked(Vec::new(), &[], Vec::new(), None),
+            ctx.write_unchecked(Vec::new(), &[], Vec::new(), None),
         );
         assert!(r1.is_ok(), "checkpoint 1 failed: {r1:?}");
         assert!(r2.is_ok(), "checkpoint 2 failed: {r2:?}");
@@ -9828,7 +9863,12 @@ mod withdrawal_write_tests {
         let ctx = DurableContext::test_context();
         ctx.coordinator().withdraw("arn:test", "req", || {});
         let written = ctx
-            .checkpoint_direct_with_events(vec![update("a", OperationAction::Start)], &[], None)
+            .checkpoint_direct_with_events(
+                vec![update("a", OperationAction::Start)],
+                &[],
+                Vec::new(),
+                None,
+            )
             .await;
         assert!(matches!(written, Err(WriteError::Stopped)), "{written:?}");
         assert!(!ctx.coordinator().write_failed());

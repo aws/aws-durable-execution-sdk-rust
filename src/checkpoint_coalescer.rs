@@ -95,6 +95,25 @@ pub(crate) struct TrackedUpdate {
     /// The lifecycle event to emit once the update is persisted, or `None`
     /// for an update that emits none.
     pub(crate) event: Option<PendingTransitionEvent>,
+    /// The code to run once the service accepted the update, or `None`
+    /// (see [`PersistedHook`]).
+    pub(crate) persisted: Option<PersistedHook>,
+}
+
+/// Code that runs once the service accepted an update.
+///
+/// The write that persists the update queues it with the change set of
+/// the response, under the checkpoint-token lock, so in response order.
+/// The task that delivers the change sets runs it (see
+/// [`InvocationPlugins::drain_operation_changes`](crate::plugin::InvocationPlugins::drain_operation_changes)).
+/// So it runs before any write answered by the same response or a later
+/// one returns its result. A write that fails, or is never sent, drops it.
+pub(crate) struct PersistedHook(pub(crate) Box<dyn FnOnce() + Send>);
+
+impl std::fmt::Debug for PersistedHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PersistedHook")
+    }
 }
 
 impl TrackedUpdate {
@@ -104,7 +123,11 @@ impl TrackedUpdate {
     /// not from the flush task.
     pub(crate) fn capture(update: OperationUpdate, attempt: u32) -> Self {
         let event = Some(PendingTransitionEvent::capture(&update, attempt));
-        Self { update, event }
+        Self {
+            update,
+            event,
+            persisted: None,
+        }
     }
 
     /// An update that emits no lifecycle event: the execution's own update,
@@ -113,6 +136,7 @@ impl TrackedUpdate {
         Self {
             update,
             event: None,
+            persisted: None,
         }
     }
 }

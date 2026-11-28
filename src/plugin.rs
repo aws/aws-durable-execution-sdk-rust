@@ -308,9 +308,12 @@ pub trait Plugin: Send + Sync {
     /// returns before the service answers its `SUCCEED`. Its
     /// `on_attempt_end` and `on_operation_end` still fire only once the
     /// service accepted the `SUCCEED`, so they can come after the code
-    /// that follows the step. They run on a task of the SDK, not on the
-    /// step's task, and before `on_invocation_end`. A `SUCCEED` the service
-    /// rejects, or one the invocation never sends, fires neither hook.
+    /// that follows the step. They run inside the wraps and the `tracing`
+    /// span current when the step wrote `SUCCEED`, as an awaited step's
+    /// end hooks do. They run before the end hook of the operation that
+    /// encloses the step, and before `on_invocation_end`. A `SUCCEED` the
+    /// service rejects, or one the invocation never sends, fires neither
+    /// hook.
     ///
     /// For a wait, a chained invoke and a callback:
     ///
@@ -2471,8 +2474,9 @@ pub(crate) struct InvocationPlugins {
     /// (see [`Self::after_write`]).
     writes_over: tokio::sync::watch::Sender<bool>,
     /// The change sets of the checkpoint responses not yet delivered to
-    /// `on_operation_change`, in response order.
-    change_queue: Mutex<std::collections::VecDeque<Vec<OperationInfo>>>,
+    /// `on_operation_change`, and the persisted hooks of their requests,
+    /// in response order.
+    change_queue: Mutex<std::collections::VecDeque<ChangeEntry>>,
     /// Whether a task is delivering the change sets of `change_queue`.
     draining: std::sync::atomic::AtomicBool,
     /// The number of change sets ever pushed to `change_queue`. It grows
@@ -2498,6 +2502,15 @@ type AfterRelease = Box<dyn FnMut(&InvocationPlugins) + Send>;
 /// The test hook of [`InvocationPlugins::set_before_push`].
 #[cfg(test)]
 type BeforePush = Box<dyn FnMut(&InvocationPlugins) + Send>;
+
+/// One entry of the change queue of [`InvocationPlugins`].
+enum ChangeEntry {
+    /// The change set of one checkpoint response, for
+    /// `on_operation_change`.
+    Changes(Vec<OperationInfo>),
+    /// The persisted hook of an update the response answered.
+    Persisted(crate::checkpoint_coalescer::PersistedHook),
+}
 
 /// The delivery progress of the change sets of one invocation.
 #[derive(Default)]
@@ -2605,7 +2618,22 @@ impl InvocationPlugins {
             .change_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.push_back(updated);
+        queue.push_back(ChangeEntry::Changes(updated));
+        self.changes_pushed
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Queues `hook`, the persisted hook of an update the service accepted,
+    /// after the change set of the response that answered it. The task
+    /// that delivers the change sets runs it in queue order, so before
+    /// every write answered by the same response or a later one returns
+    /// (see [`Self::poll_changes_delivered`]).
+    pub(crate) fn push_persisted(&self, hook: crate::checkpoint_coalescer::PersistedHook) {
+        let mut queue = self
+            .change_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.push_back(ChangeEntry::Persisted(hook));
         self.changes_pushed
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -2633,6 +2661,14 @@ impl InvocationPlugins {
             }
             let here = DrainingHere::enter(self);
             while let Some(entry) = self.pop_operation_change() {
+                let entry = match entry {
+                    ChangeEntry::Changes(entry) => entry,
+                    ChangeEntry::Persisted(hook) => {
+                        (hook.0)();
+                        self.finish_delivery();
+                        continue;
+                    }
+                };
                 let operations = {
                     let execution = self
                         .execution
@@ -2830,7 +2866,7 @@ impl InvocationPlugins {
     }
 
     /// Takes the oldest queued change set.
-    fn pop_operation_change(&self) -> Option<Vec<OperationInfo>> {
+    fn pop_operation_change(&self) -> Option<ChangeEntry> {
         self.change_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3232,34 +3268,29 @@ impl InvocationPlugins {
         }
     }
 
-    /// Calls `fire` once `write` returns `true`, on its own task. `write`
-    /// is a checkpoint write the operation does not await, and returns
-    /// whether the service accepted it.
+    /// Polls `write` to completion on its own task. `write` is a
+    /// checkpoint write the operation does not await.
     ///
-    /// An `AtLeastOnceAsync` step uses it to fire its end hooks when the
-    /// service acknowledges its `SUCCEED`, after the step returned. The
-    /// task is hook work: it holds neither the task cleanup nor the
-    /// suspension decision, and the invocation-end drain joins it, so
-    /// `fire` and the work its hooks return finish before
-    /// `on_invocation_end`. A write that has not returned when the drain
-    /// starts never returns `Ok`, because the end-of-invocation flush has
-    /// run: a write the write-failure latch dropped, or one a fault
-    /// outcome never sent. The task then ends without calling `fire`.
+    /// An `AtLeastOnceAsync` step uses it for its `SUCCEED`, after the step
+    /// returned. The update carries the step's end hooks as a
+    /// [`PersistedHook`](crate::checkpoint_coalescer::PersistedHook), which
+    /// the response queues with its change set. A write delivers the
+    /// queued change sets before it returns, so this task runs the hooks
+    /// when no other task delivers them first. The task is hook work: it
+    /// holds neither the task cleanup nor the suspension decision, and the
+    /// invocation-end drain joins it, so the hooks and the work they
+    /// return finish before `on_invocation_end`. A write that has not
+    /// returned when the drain starts never returns, because the
+    /// end-of-invocation flush has run: a write the write-failure latch
+    /// dropped, or one a fault outcome never sent. The task then ends.
     /// After the drain closed, nothing is spawned.
-    pub(crate) fn after_write(
-        &self,
-        write: impl Future<Output = bool> + Send + 'static,
-        fire: impl FnOnce() + Send + 'static,
-    ) {
+    pub(crate) fn after_write(&self, write: impl Future<Output = ()> + Send + 'static) {
         let mut over = self.writes_over.subscribe();
         let task = async move {
-            let accepted = tokio::select! {
+            tokio::select! {
                 biased;
-                accepted = write => accepted,
-                _ = over.wait_for(|over| *over) => false,
-            };
-            if accepted {
-                fire();
+                () = write => {}
+                _ = over.wait_for(|over| *over) => {}
             }
         };
         let mut state = self.lock_work();

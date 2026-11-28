@@ -982,11 +982,47 @@ async fn handle_success<O, S: Serdes<O>>(
 
     // Checkpoint SUCCEED with payload.
     let update = build_succeed_update(wire_id, name, sub_type, ctx.parent_wire_id(), &serialized);
-    let write = ctx.submit_checkpoint_updates(vec![update]);
     // An async step does not await `START` or `SUCCEED`: each write keeps
     // its place in the write order and goes on, so `SUCCEED` is sent after
     // `START`. A failed write fails the invocation, and
     // every invocation end waits for pending writes before it reports.
+    //
+    // Its end hooks travel with the update and run once the service
+    // accepted it, as for an awaited step, after the step returned. The
+    // response queues them with its change set, so they run before any
+    // write answered by the same response or a later one returns: before
+    // the end hook of the operation that encloses the step. They run
+    // inside the plugin frames and the `tracing` span current here, the
+    // ones an awaited step's end hooks run in. A failed write, or one that
+    // is never sent, fires none.
+    let plugins = ctx.shared_plugins().filter(|_| asynchronous);
+    let write = match &plugins {
+        Some(plugins) => {
+            let task_cx = crate::task::TaskContext::current();
+            let plugins = std::sync::Arc::clone(plugins);
+            let hook_ctx = ctx.clone();
+            let wire_id = wire_id.to_owned();
+            let sub_type = sub_type.to_owned();
+            let name = name.map(str::to_owned);
+            let plugin_name = plugin_name.map(str::to_owned);
+            let result = serialized.clone();
+            ctx.submit_checkpoint_update_then(update, move || {
+                task_cx.enter(|| {
+                    succeeded_hooks(
+                        &plugins,
+                        &hook_ctx,
+                        &wire_id,
+                        &sub_type,
+                        name.as_deref(),
+                        plugin_name.as_deref(),
+                        &result,
+                        attempt,
+                    );
+                });
+            })
+        }
+        None => ctx.submit_checkpoint_updates(vec![update]),
+    };
     // A write that admission rejected is awaited, so the step stops there
     // as an awaited step does: the scope it runs in was abandoned, or the
     // invocation recorded a fatal error.
@@ -994,7 +1030,7 @@ async fn handle_success<O, S: Serdes<O>>(
         if let Err(err) = write.await {
             return ctx.checkpoint_failure_unrecoverable(err).await;
         }
-        if let Some(plugins) = ctx.plugins() {
+        if !asynchronous && let Some(plugins) = ctx.plugins() {
             succeeded_hooks(
                 plugins,
                 ctx,
@@ -1006,28 +1042,11 @@ async fn handle_success<O, S: Serdes<O>>(
                 attempt,
             );
         }
-    } else if let Some(plugins) = ctx.shared_plugins() {
-        // The end hooks fire when the service acknowledges the `SUCCEED`,
-        // as for an awaited step, after the step returned. A failed write
-        // fires none.
-        let hook_plugins = std::sync::Arc::clone(&plugins);
-        let ctx = ctx.clone();
-        let wire_id = wire_id.to_owned();
-        let sub_type = sub_type.to_owned();
-        let name = name.map(str::to_owned);
-        let plugin_name = plugin_name.map(str::to_owned);
-        let result = serialized.clone();
-        plugins.after_write(async move { write.await.is_ok() }, move || {
-            succeeded_hooks(
-                &hook_plugins,
-                &ctx,
-                &wire_id,
-                &sub_type,
-                name.as_deref(),
-                plugin_name.as_deref(),
-                &result,
-                attempt,
-            );
+    } else if let Some(plugins) = plugins {
+        // A task polls the write, so the hooks run before
+        // `on_invocation_end` even when no later write delivers them.
+        plugins.after_write(async move {
+            drop(write.await);
         });
     }
 
